@@ -1,141 +1,155 @@
-# NBA Street V3 — port nativo para PC (PS2Recomp + render de PCSX2)
+# NBA Street V3 — native PC port (PS2Recomp + PCSX2 renderer)
 
-Recompilación estática de **NBA Street V3 (PS2, NTSC-U, SLUS-21126)** a un ejecutable nativo de
-Windows x64 con [PS2Recomp](https://github.com/ran-j/PS2Recomp), con el render por GPU del GS de
-[PCSX2](https://github.com/PCSX2/pcsx2) (Vulkan / Direct3D / OpenGL), resolución interna hasta 8x,
-VU1 en microVU y paquetes de texturas HD compatibles con PCSX2.
+**English** | [Español](README.es.md)
 
-> **Este repositorio NO contiene nada del juego**: ni ISO, ni ELF, ni código generado a partir de él,
-> ni texturas. Necesitas **tu propia copia** de NBA Street V3 (SLUS-21126). El código C++ del juego se
-> genera en tu PC a partir de tu ELF.
+Static recompilation of **NBA Street V3 (PS2, NTSC-U, SLUS-21126)** into a native Windows x64
+executable with [PS2Recomp](https://github.com/ran-j/PS2Recomp), rendered on the GPU by the GS of
+[PCSX2](https://github.com/PCSX2/pcsx2) (Vulkan / Direct3D / OpenGL), with up to 8x internal
+resolution, VU1 on microVU, PCSX2-compatible HD texture packs and working **online play**.
 
-Contenido:
+> **This repository contains NOTHING from the game**: no ISO, no ELF, no code generated from it, no
+> textures. You need **your own copy** of NBA Street V3 (SLUS-21126). The game's C++ code is generated
+> on your PC from your own ELF.
 
-| Ruta | Qué es |
+Contents:
+
+| Path | What it is |
 |---|---|
-| `patches/ps2recomp.patch` | Cambios sobre PS2Recomp `2c5fbb9` (recompilador, runtime, IOP, red DEV9, SPU2...) |
-| `patches/pcsx2.patch` | Cambios sobre PCSX2 `d073d75` (`pcsx2-gsrunner -live`: render en tiempo real del juego) |
-| `game/config/` | Configuración del recompilador para SLUS-21126 (lista de funciones y direcciones) |
-| `game/overrides/` | Ajustes específicos del juego (`nba_street_v3_overrides.cpp`) |
-| `gshost/nba_street.ini` | Opciones gráficas por defecto |
-| `tools/` | Scripts de preparación, compilación, depuración y texturas |
-| `docs/PORTING_NOTES.md` | Notas técnicas: todos los bugs encontrados y cómo se arreglaron |
-| `Jugar.cmd` | Lanzador |
+| `Launcher.cmd` / `Launcher.ps1` | Launcher: pick your ISO, prepare the game once, play |
+| `tools/install.ps1` | One-step installer used by the launcher (tools, sources, build) |
+| `patches/ps2recomp.patch` | Changes on top of PS2Recomp `2c5fbb9` (recompiler, runtime, IOP, DEV9 network, SPU2...) |
+| `patches/pcsx2.patch` | Changes on top of PCSX2 `d073d75` (`pcsx2-gsrunner -live`: real-time renderer for the game) |
+| `game/config/` | Recompiler configuration for SLUS-21126 (function list and addresses only) |
+| `game/overrides/` | Game-specific fixes (`nba_street_v3_overrides.cpp`) |
+| `game/mc0_netcnf/` | Network configuration for the emulated memory card (online) |
+| `gshost/nba_street.ini` | Default graphics settings |
+| `tools/` | Setup, build, debugging and texture scripts |
+| `docs/PORTING_NOTES.md` | Technical notes (Spanish): every bug found and how it was fixed |
+| `Jugar.cmd` | Plain launcher script (no UI) |
 
-## Para jugar (lo fácil)
+## Playing (the easy way)
 
-1. Descarga el zip de la última versión en **Releases** y descomprímelo donde quieras.
-2. Abre **`Launcher.cmd`**, elige tu ISO de NBA Street V3 (NTSC-U, SLUS-21126) y pulsa **Preparar juego**.
-   La primera vez instala las herramientas de compilación (Visual Studio Build Tools, CMake, Git)
-   y compila el juego en tu PC: descarga ~6 GB y puede tardar 1-2 horas. Solo se hace una vez.
-3. Pulsa **JUGAR**. Desde el launcher eliges resolución, renderizador, pantalla completa, texturas HD
-   y el modo **online** (activado por defecto contra el servidor de la comunidad).
+1. Download the zip of the latest version from **Releases** and unzip it anywhere.
+2. Open **`Launcher.cmd`**, choose your NBA Street V3 ISO (NTSC-U, SLUS-21126) and click
+   **Preparar juego** ("prepare game"). The first time it installs the build tools (Visual Studio
+   Build Tools, CMake, Git) and compiles the game on your PC: ~6 GB of downloads and it can take
+   1-2 hours. This happens only once.
+3. Click **JUGAR** ("play"). From the launcher you choose internal resolution, renderer, fullscreen,
+   HD textures and **online** mode (enabled by default, against the community server).
 
-¿Por qué hay que compilar? El ejecutable final contiene el código del juego traducido a C++; no se
-puede distribuir. Lo que sí se distribuye (render de PCSX2, parches, herramientas) va en el zip.
+Why compile? The final executable contains the game's code translated to C++, so it cannot be
+distributed. Everything that can be distributed (PCSX2 renderer, patches, tools) is in the zip.
 
-**Online**: en el juego, PLAY ONLINE -> YES -> "1 - NBA Street Online (DHCP)" -> crear cuenta EA
-(usuario de 4+ letras) -> crear persona -> crear baller online -> PLAY -> PICKUP GAMES -> PLAY NOW.
-No uses "New/Edit" en la pantalla de configuración de red. El tráfico de los partidos pasa por el
-servidor (relay), así que no hay que abrir puertos en el router.
+**Online**: in the game, PLAY ONLINE -> YES -> "1 - NBA Street Online (DHCP)" -> create an EA account
+(user name of 4+ letters) -> create a persona -> create an online baller -> PLAY -> PICKUP GAMES ->
+PLAY NOW. Do not use "New/Edit" on the network configuration screen. Match traffic is relayed by the
+server, so no router ports need to be opened.
 
-## Requisitos (compilar a mano)
+## Requirements (building by hand)
 
-- Windows 10/11 x64, GPU con Vulkan (o Direct3D 11/12), ~40 GB libres, 16 GB de RAM recomendados.
-- **Visual Studio 2022 Build Tools** con "Desarrollo para el escritorio con C++" (MSVC v143 + Windows SDK).
-- Las rutas están fijadas a **`C:\NBAStreetRecomp`**: el proyecto debe vivir ahí.
-- Herramientas portables en `C:\NBAStreetRecomp\tools\` (los scripts las buscan en estas carpetas):
+- Windows 10/11 x64, a GPU with Vulkan (or Direct3D 11/12), ~40 GB free, 16 GB RAM recommended.
+- **Visual Studio 2022 Build Tools** with "Desktop development with C++" (MSVC v143 + Windows SDK).
+- Paths are fixed to **`C:\NBAStreetRecomp`**: the project must live there.
+- Portable tools in `C:\NBAStreetRecomp\tools\` (the scripts look for them in these folders):
 
-| Carpeta | Herramienta |
+| Folder | Tool |
 |---|---|
-| `tools\mingit\` | [MinGit](https://github.com/git-for-windows/git/releases) (o Git instalado en el PATH) |
+| `tools\mingit\` | [MinGit](https://github.com/git-for-windows/git/releases) (or Git on the PATH) |
 | `tools\cmake\cmake-4.4.4-windows-x86_64\` | [CMake 4.x](https://cmake.org/download/) (zip) |
-| `tools\llvm\clang+llvm-20.1.8-x86_64-pc-windows-msvc\` | [LLVM 20](https://github.com/llvm/llvm-project/releases) (clang-cl, para PCSX2) |
+| `tools\llvm\clang+llvm-20.1.8-x86_64-pc-windows-msvc\` | [LLVM 20](https://github.com/llvm/llvm-project/releases) (clang-cl, for PCSX2) |
 | `tools\ninja\` | [Ninja](https://github.com/ninja-build/ninja/releases) |
-| `tools\python\` | Python 3 embebible (lo pide el build de dependencias de PCSX2) |
-| `tools\portablegit\` | [PortableGit](https://github.com/git-for-windows/git/releases) (aporta `bash`/`patch` para las dependencias de PCSX2) |
+| `tools\python\` | Embeddable Python 3 (needed by the PCSX2 dependency build) |
+| `tools\portablegit\` | [PortableGit](https://github.com/git-for-windows/git/releases) (provides `bash`/`patch` for the PCSX2 dependencies) |
 | `tools\7zip\` | [7-Zip](https://www.7-zip.org/) extra (`x64\7za.exe`) |
 
-Si prefieres herramientas instaladas en el sistema, edita las rutas al principio de los `.cmd` de `tools\`.
+LLVM, Ninja, Python, PortableGit and 7-Zip are only needed to build the renderer yourself
+(step 6); the release zip ships it prebuilt. If you prefer tools installed system-wide, edit the
+paths at the top of the `.cmd` files in `tools\`.
 
-## Compilar
+## Building
 
-Todo desde `C:\NBAStreetRecomp`. Clona este repositorio en `C:\NBAStreetRecomp\nbastreet-v3-recomp`
-y copia el contenido de su carpeta `tools\` a `C:\NBAStreetRecomp\tools\` (junto a las herramientas portables).
+Everything from `C:\NBAStreetRecomp`. Clone this repository into
+`C:\NBAStreetRecomp\nbastreet-v3-recomp` and copy its `tools\` folder into `C:\NBAStreetRecomp\tools\`
+(next to the portable tools).
 
-**1. Tu juego.** Extrae tu ISO con 7-Zip en `C:\NBAStreetRecomp\game\iso\` (debe quedar
-`game\iso\SLUS_211.26`) y copia la propia ISO como `C:\NBAStreetRecomp\game\NBAStreetV3.iso`
-(el juego lee sectores del disco directamente).
+**1. Your game.** Extract your ISO with 7-Zip into `C:\NBAStreetRecomp\game\iso\` (you must end up
+with `game\iso\SLUS_211.26`) and copy the ISO itself to `C:\NBAStreetRecomp\game\NBAStreetV3.iso`
+(the game reads disc sectors directly).
 
-**2. Fuentes de PS2Recomp y PCSX2 con los parches:**
+**2. PS2Recomp and PCSX2 sources with the patches applied:**
 ```bat
 powershell -ExecutionPolicy Bypass -File nbastreet-v3-recomp\tools\setup_sources.ps1
 ```
 
-**3. Compilar el recompilador:**
+**3. Build the recompiler:**
 ```bat
 tools\cmake\cmake-4.4.4-windows-x86_64\bin\cmake -S PS2Recomp -B PS2Recomp\out\build
 tools\build_recomp.cmd
 ```
 
-**4. Generar el código del juego** desde tu ELF (unos minutos; ~100.000 archivos .cpp):
+**4. Generate the game code** from your ELF (a few minutes; ~100,000 .cpp files):
 ```bat
 powershell -ExecutionPolicy Bypass -File nbastreet-v3-recomp\tools\generate_game.ps1
 ```
 
-**5. Compilar el juego** (la primera vez tarda mucho: es el ejecutable completo del juego en C++):
+**5. Build the game** (slow the first time: it is the whole game as C++):
 ```bat
 tools\build_runner.cmd
 ```
-Resultado: `PS2Recomp\out\build\ps2xRuntime\Release\ps2EntryRunner.exe`. Las siguientes veces,
-`tools\build_runner_only.cmd` (incremental). Log en `logs\`.
+Output: `PS2Recomp\out\build\ps2xRuntime\Release\ps2EntryRunner.exe`. Afterwards use
+`tools\build_runner_only.cmd` (incremental). Logs go to `logs\`.
 
-**6. Compilar el render (PCSX2 `pcsx2-gsrunner`, sin Qt):**
+**6. Build the renderer (PCSX2 `pcsx2-gsrunner`, no Qt):**
 ```bat
 tools\build_pcsx2_deps.bat
 tools\build_pcsx2.cmd pcsx2-gsrunner
 powershell -ExecutionPolicy Bypass -File nbastreet-v3-recomp\tools\setup_gshost.ps1
 ```
-Las dependencias (SDL3, shaderc, etc.) solo se compilan una vez. `setup_gshost.ps1` monta
-`C:\NBAStreetRecomp\gshost` con el exe, las DLL, `resources` y la configuración gráfica.
+The dependencies (SDL3, shaderc, etc.) are built only once. `setup_gshost.ps1` assembles
+`C:\NBAStreetRecomp\gshost` with the exe, DLLs, `resources` and the graphics settings.
 
-**7. Jugar:** `nbastreet-v3-recomp\Jugar.cmd` (cópialo donde quieras).
+**7. Play:** `nbastreet-v3-recomp\Launcher.cmd` or `Jugar.cmd`.
 
-## Uso
+## Usage
 
-- **Controles**: mando Xbox/compatible (XInput) o teclado (flechas, WASD, Z/X/C/V, Q/E, 1/3, Enter = START).
-- **Menú gráfico** (resolución interna, filtro, renderizador, texturas HD): **F1**, **Back+Start** o
-  **mantener START 1,5 s**. Se guarda en `gshost\nba_street.ini`.
-- **Pantalla completa**: Alt+Enter o F11.
-- **Partidas guardadas**: `game\iso\mc0\` (memory card emulada).
-- **Texturas HD**: formato de PCSX2, en `Documentos\PCSX2\textures\SLUS-21126\replacements`.
-  Ver `tools\texturas_preparar.ps1` / `texturas_instalar.ps1`: apartan solas las texturas que no se
-  deben reemplazar (capturas dinámicas de pantalla y páginas invisibles), que estropean la imagen.
+- **Controls**: Xbox-compatible gamepad (XInput) or keyboard (arrows, WASD, Z/X/C/V, Q/E, 1/3,
+  Enter = START). The gamepad only drives the window in front.
+- **Graphics menu** (internal resolution, filtering, renderer, HD textures): **F1**, **Back+Start** or
+  **hold START for 1.5 s**. Saved to `gshost\nba_street.ini`.
+- **Fullscreen**: Alt+Enter or F11.
+- **Saves**: `game\iso\mc0\` (emulated memory card).
+- **HD textures**: PCSX2 format, in `Documents\PCSX2\textures\SLUS-21126\replacements`.
+  See `tools\texturas_preparar.ps1` / `texturas_instalar.ps1`: they automatically set aside textures
+  that must not be replaced (dynamic screen captures and invisible pages), which break the image.
 
-## Estado
+## Status
 
-Jugable de principio a fin en offline: menús, vídeos, Create Baller, partidos a 60 fps con física
-correcta, audio (SPU2 emulado) y memory card. El modo online existe en el código (adaptador de red
-DEV9 emulado) y se conecta al servidor de la comunidad; el código del servidor no forma parte de este repositorio.
+Playable from start to finish offline: menus, videos, Create Baller, 60 fps matches with correct
+physics, audio (emulated SPU2) and memory card. Online works through the emulated DEV9 network
+adapter and the community server (accounts, online ballers and courts, PLAY NOW matches relayed
+through the server); the server code is not part of this repository.
 
-Los bugs del recompilador encontrados (y corregidos en `patches/ps2recomp.patch`) están en
-`docs/PORTING_NOTES.md`; varios afectan a cualquier juego de PS2 portado con PS2Recomp
-(SQRT.S, saltos BLTZ/BGEZ de 64 bits, MMI, VU0...).
+Known issues: occasional dropped frames (57-58 fps instead of 60) caused by synchronous VU1
+round-trips between the game and the renderer process; being worked on.
 
-## Contribuir
+The recompiler bugs found (and fixed in `patches/ps2recomp.patch`) are documented in
+`docs/PORTING_NOTES.md`; several affect any PS2 game ported with PS2Recomp (SQRT.S, 64-bit
+BLTZ/BGEZ branches, MMI, VU0...).
 
-Issues y pull requests bienvenidos. Antes de nada lee `docs/PORTING_NOTES.md`: explica la
-arquitectura (runtime + host de PCSX2 por un anillo de memoria compartida), las herramientas de
-depuración (`tools\run_scripted.ps1` para pruebas automáticas sin tocar el escritorio,
-`PS2X_IOP_RAM_DUMP`, `tools\decomp.cmd` con Ghidra, etc.) y cada problema resuelto.
+## Contributing
 
-**Nunca** subas archivos del juego (ISO, ELF, código generado en `game\output` o
-`ps2xRuntime\src\runner`, texturas extraídas, partidas). Para cambios en PS2Recomp o PCSX2, regenera el
-parche correspondiente con `git diff` sobre el commit fijado.
+Issues and pull requests are welcome. First read `docs/PORTING_NOTES.md` (Spanish): it explains the
+architecture (runtime + PCSX2 host over a shared-memory ring), the debugging tools
+(`tools\run_scripted.ps1` for automated tests without touching the desktop, `PS2X_IOP_RAM_DUMP`,
+`tools\decomp.cmd` with Ghidra, etc.) and every issue solved.
 
-## Licencia y créditos
+**Never** commit game files (ISO, ELF, generated code in `game\output` or `ps2xRuntime\src\runner`,
+extracted textures, saves). For changes to PS2Recomp or PCSX2, regenerate the corresponding patch
+with `git diff` against the pinned commit.
 
-GPL-3.0 (igual que PS2Recomp y PCSX2). Basado en
-[PS2Recomp](https://github.com/ran-j/PS2Recomp) de ran-j y colaboradores y en
-[PCSX2](https://github.com/PCSX2/pcsx2) (GS, microVU, DEV9). NBA Street V3 es propiedad de
-Electronic Arts; este proyecto no está afiliado a EA y no distribuye ningún contenido del juego.
+## License and credits
+
+GPL-3.0 (same as PS2Recomp and PCSX2). Based on [PS2Recomp](https://github.com/ran-j/PS2Recomp) by
+ran-j and contributors and on [PCSX2](https://github.com/PCSX2/pcsx2) (GS, microVU, DEV9).
+NBA Street V3 is the property of Electronic Arts; this project is not affiliated with EA and does
+not distribute any game content.
