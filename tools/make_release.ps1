@@ -23,7 +23,7 @@ foreach ($f in $files) {
     Copy-Item (Join-Path $Repo $f) $dst
 }
 if (Test-Path $GsHostZip) { Copy-Item $GsHostZip (Join-Path $stage 'gshost-win64.zip') }
-else { Write-Warning "Sin $GsHostZip: el instalador tendra que compilar PCSX2" }
+else { Write-Warning "Sin ${GsHostZip}: el instalador tendra que compilar PCSX2" }
 
 $zip = Join-Path $OutDir "$name.zip"
 if (Test-Path $zip) { cmd /c del /q "$zip" }
