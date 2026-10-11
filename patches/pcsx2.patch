@@ -1,0 +1,1962 @@
+diff --git a/common/CrashHandler.cpp b/common/CrashHandler.cpp
+index a44f07a..80506fe 100644
+--- a/common/CrashHandler.cpp
++++ b/common/CrashHandler.cpp
+@@ -10,6 +10,9 @@
+ #include <cstdio>
+ #include <ctime>
+ 
++CrashHandler::Note CrashHandler::g_note = {};
++CrashHandler::TransferNote CrashHandler::g_transfer_note = {};
++
+ #if defined(_WIN32)
+ #include "RedtapeWindows.h"
+ 
+@@ -113,6 +116,45 @@ static void WriteMinidumpAndCallstack(PEXCEPTION_POINTERS exi)
+ 		std::snprintf(line, std::size(line), "Exception 0x%08X at 0x%p\n", static_cast<unsigned>(exi->ExceptionRecord->ExceptionCode),
+ 			exi->ExceptionRecord->ExceptionAddress);
+ 		WriteFile(hFile, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
++
++		// PS2Recomp: the minidump writer can hang; first record exe-relative addresses found on
++		// the faulting stack (candidate return addresses), resolvable with the PDB.
++		const uintptr_t exe_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
++		const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(exe_base);
++		const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(exe_base + dos->e_lfanew);
++		const uintptr_t exe_end = exe_base + nt->OptionalHeader.SizeOfImage;
++		const CONTEXT* ctx = exi->ContextRecord;
++		std::snprintf(line, std::size(line), "thread %lu rip exe+0x%llX rsp 0x%llX\n", GetCurrentThreadId(),
++			static_cast<unsigned long long>(ctx->Rip >= exe_base && ctx->Rip < exe_end ? ctx->Rip - exe_base : ctx->Rip),
++			static_cast<unsigned long long>(ctx->Rsp));
++		WriteFile(hFile, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
++		const unsigned long long* stack = reinterpret_cast<const unsigned long long*>(ctx->Rsp);
++		for (int i = 0; i < 512; i++)
++		{
++			MEMORY_BASIC_INFORMATION mbi;
++			if (VirtualQuery(&stack[i], &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT)
++				break;
++			const unsigned long long value = stack[i];
++			if (value >= exe_base && value < exe_end)
++			{
++				std::snprintf(line, std::size(line), "  [rsp+0x%X] exe+0x%llX\n", i * 8, static_cast<unsigned long long>(value - exe_base));
++				WriteFile(hFile, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
++			}
++		}
++		std::snprintf(line, std::size(line),
++			"rax=%llX rbx=%llX rcx=%llX rdx=%llX rsi=%llX rdi=%llX rbp=%llX\nr8=%llX r9=%llX r10=%llX r11=%llX r12=%llX r13=%llX r14=%llX r15=%llX\n",
++			ctx->Rax, ctx->Rbx, ctx->Rcx, ctx->Rdx, ctx->Rsi, ctx->Rdi, ctx->Rbp, ctx->R8, ctx->R9, ctx->R10, ctx->R11,
++			ctx->R12, ctx->R13, ctx->R14, ctx->R15);
++		WriteFile(hFile, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
++		const CrashHandler::Note note = CrashHandler::g_note;
++		std::snprintf(line, std::size(line), "gs note: cmd=%u offset=0x%X size=0x%X path=%u buffer=%p buffsize=0x%X\n",
++			note.command, note.offset, note.size, note.path, note.buffer, note.buffer_size);
++		WriteFile(hFile, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
++		const CrashHandler::TransferNote tnote = CrashHandler::g_transfer_note;
++		std::snprintf(line, std::size(line), "gs transfer: index=%d mem=%p qwc=0x%X fault_addr=%p\n", tnote.index, tnote.mem, tnote.size,
++			exi->ExceptionRecord->NumberParameters >= 2 ? reinterpret_cast<void*>(exi->ExceptionRecord->ExceptionInformation[1]) : nullptr);
++		WriteFile(hFile, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
++		FlushFileBuffers(hFile);
+ 	}
+ 
+ 	GenerateCrashFilename(filename, std::size(filename), s_write_directory.empty() ? nullptr : s_write_directory.c_str(), L"dmp");
+diff --git a/common/CrashHandler.h b/common/CrashHandler.h
+index 7bf5bfc..2d0df41 100644
+--- a/common/CrashHandler.h
++++ b/common/CrashHandler.h
+@@ -1,6 +1,8 @@
+ // SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+ // SPDX-License-Identifier: GPL-3.0+
+ 
++#pragma once
++
+ #include <string_view>
+ 
+ #ifndef _WIN32
+@@ -9,6 +11,23 @@
+ 
+ namespace CrashHandler
+ {
++	// PS2Recomp: what the GS thread was transferring (written to the crash report).
++	struct Note
++	{
++		unsigned command, offset, size, path;
++		const void* buffer;
++		unsigned buffer_size;
++	};
++	extern Note g_note;
++	// Last GSState::Transfer call (index, data pointer, qword count).
++	struct TransferNote
++	{
++		int index;
++		const void* mem;
++		unsigned size;
++	};
++	extern TransferNote g_transfer_note;
++
+ 	bool Install();
+ 	void SetWriteDirectory(std::string_view dump_directory);
+ 	void WriteDumpForCaller();
+diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
+index de624db..c2503bd 100644
+--- a/pcsx2-gsrunner/Main.cpp
++++ b/pcsx2-gsrunner/Main.cpp
+@@ -6,11 +6,17 @@
+ #include <csignal>
+ #include <cstdlib>
+ #include <condition_variable>
++#include <algorithm>
++#include <cstdio>
++#include <functional>
+ #include <mutex>
++#include <string>
+ #include <thread>
++#include <vector>
+ 
+ #ifdef _WIN32
+ #include "common/RedtapeWindows.h"
++#include <Xinput.h>
+ #endif
+ 
+ #include "fmt/format.h"
+@@ -79,7 +85,12 @@ static MemorySettingsInterface s_settings_interface;
+ static std::string s_output_prefix;
+ static s32 s_loop_count = 1;
+ static std::optional<bool> s_use_window;
++static bool s_start_fullscreen = false; // -fullscreen (PS2Recomp live window)
++#ifdef _WIN32
++static void ToggleFullscreen(HWND hwnd);
++#endif
+ static bool s_no_console = false;
++static bool s_live = false; // PS2Recomp live GS stream (-live)
+ 
+ // Owned by the GS thread.
+ static u32 s_dump_frame_number = 0;
+@@ -107,6 +118,9 @@ static u64 s_total_barriers_rov = 0;
+ static u32 s_total_frames = 0;
+ static u32 s_total_drawn_frames = 0;
+ 
++// ps2recomp live mode: the -ini file the options menu (F1) saves back to.
++static std::string s_live_ini_path = "nba_street.ini";
++
+ static bool s_perf_enable = false;
+ static float s_perf_updates = 0.0f;
+ static float s_perf_sum_fps = 0.0f;
+@@ -370,9 +384,26 @@ void Host::OnSaveStateSaved(const std::string_view filename)
+ {
+ }
+ 
++// Work for the CPU thread (the dump replayer loop), run from Host::PumpMessagesOnCPUThread at
++// every vsync. Used by the PS2Recomp live options menu (settings must change on that thread).
++static std::mutex s_cpu_queue_mutex;
++static std::vector<std::function<void()>> s_cpu_queue;
++
+ void Host::RunOnCPUThread(std::function<void()> function, bool block /* = false */)
+ {
+-	pxFailRel("Not implemented");
++	std::lock_guard lock(s_cpu_queue_mutex);
++	s_cpu_queue.push_back(std::move(function));
++}
++
++static void RunCPUThreadQueue()
++{
++	std::vector<std::function<void()>> work;
++	{
++		std::lock_guard lock(s_cpu_queue_mutex);
++		work.swap(s_cpu_queue);
++	}
++	for (auto& fn : work)
++		fn();
+ }
+ 
+ void Host::RefreshGameListAsync(bool invalidate_cache)
+@@ -749,6 +780,7 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
+ 
+ 				for (const auto& [key, value] : si_ini.GetKeyValueList("EmuCore/GS"))
+ 					s_settings_interface.SetStringValue("EmuCore/GS", key.c_str(), value.c_str());
++				s_live_ini_path = path; // the options menu saves back to this file
+ 
+ 				continue;
+ 			}
+@@ -785,12 +817,28 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
+ 				s_settings_interface.SetBoolValue("EmuCore/GS", "DisableShaderCache", true);
+ 				continue;
+ 			}
++			else if (CHECK_ARG("-live"))
++			{
++				s_live = true;
++				continue;
++			}
+ 			else if (CHECK_ARG("-window"))
+ 			{
+ 				Console.WriteLn("Creating window");
+ 				s_use_window = true;
+ 				continue;
+ 			}
++			else if (CHECK_ARG_PARAM("-livering"))
++			{
++				GSDumpReplayer::SetLiveRingSuffix(argv[++i]);
++				continue;
++			}
++			else if (CHECK_ARG("-fullscreen"))
++			{
++				s_use_window = true;
++				s_start_fullscreen = true;
++				continue;
++			}
+ 			else if (CHECK_ARG("-surfaceless"))
+ 			{
+ 				Console.WriteLn("Running surfaceless");
+@@ -829,6 +877,35 @@ bool GSRunner::ParseCommandLineArgs(int argc, char* argv[], VMBootParameters& pa
+ 		params.filename += argv[i];
+ 	}
+ 
++	if (s_live && params.filename.empty())
++	{
++		Error error;
++		if (!GSDumpReplayer::AttachLiveRing(&error))
++		{
++			Console.ErrorFmt("Live mode: {}", error.GetDescription());
++			return false;
++		}
++		// One boot dump per host process: two game instances (online tests, two accounts on one PC)
++		// writing the same file made the second host fail at start (exit code 1). Leftovers older
++		// than an hour are removed (never a file another host may be loading right now).
++		{
++			FileSystem::FindResultsArray old;
++			FileSystem::FindFiles(EmuFolders::DataRoot.c_str(), "ps2recomp_live*.gs", FILESYSTEM_FIND_FILES, &old);
++			const std::time_t now = std::time(nullptr);
++			for (const FILESYSTEM_FIND_DATA& file : old)
++				if (file.ModificationTime != 0 && now - file.ModificationTime > 3600)
++					FileSystem::DeleteFilePath(file.FileName.c_str());
++		}
++		params.filename = Path::Combine(EmuFolders::DataRoot, fmt::format("ps2recomp_live_{}.gs", GetCurrentProcessId()));
++		if (!GSDumpReplayer::WriteLiveBootDump(params.filename, &error))
++		{
++			Console.ErrorFmt("Live mode: {}", error.GetDescription());
++			return false;
++		}
++		if (!s_use_window.has_value())
++			s_use_window = true;
++	}
++
+ 	if (params.filename.empty())
+ 	{
+ 		Console.Error("No dump filename provided.");
+@@ -895,9 +972,16 @@ void GSRunner::SettingsOverride()
+ 	s_settings_interface.SetBoolValue("Logging", "EnableVerbose", true);
+ 
+ 	// and show some stats :)
++	const bool live_show_fps = s_settings_interface.GetBoolValue("EmuCore/GS", "OsdShowFPS", false); // live: from the INI/menu
+ 	s_settings_interface.SetBoolValue("EmuCore/GS", "OsdShowFPS", true);
+ 	s_settings_interface.SetBoolValue("EmuCore/GS", "OsdShowResolution", true);
+-	s_settings_interface.SetBoolValue("EmuCore/GS", "OsdShowGSStats", true);
++	s_settings_interface.SetBoolValue("EmuCore/GS", "OsdShowGSStats", !s_live);
++	if (s_live)
++	{
++		s_settings_interface.SetBoolValue("EmuCore/GS", "OsdShowFPS", live_show_fps);
++		s_settings_interface.SetBoolValue("EmuCore/GS", "OsdShowResolution", false);
++		s_settings_interface.SetBoolValue("Logging", "EnableVerbose", false);
++	}
+ 
+ 	// remove memory cards, so we don't have sharing violations
+ 	for (u32 i = 0; i < 2; i++)
+@@ -1006,8 +1090,53 @@ int main(int argc, char* argv[])
+ 	return thread_ret.load();
+ }
+ 
++#ifdef _WIN32
++static void LiveMenuPollGamepad();
++#endif
++
++// PS2X_SHOT_TIMES="98,104.5,110" (seconds since the host started) + PS2X_SHOT_DIR=<dir>: the host
++// saves its own rendered frame as <dir>\shot_<n>.png at those times. Used by automated tests
++// instead of desktop captures (no window focus, nothing else on screen gets captured).
++static void LiveTimedSnapshots()
++{
++	// PS2X_TEST_T0 (Unix ms) shares the time base with the game's PS2X_PAD_SCRIPT.
++	static const double t0 = [] {
++		const char* value = std::getenv("PS2X_TEST_T0");
++		if (value && *value)
++			return std::atof(value) / 1000.0;
++		return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
++	}();
++	static std::vector<double> times = [] {
++		std::vector<double> result;
++		if (const char* value = std::getenv("PS2X_SHOT_TIMES"))
++		{
++			for (const std::string_view item : StringUtil::SplitString(value, ',', true))
++				result.push_back(StringUtil::FromChars<double>(item).value_or(-1.0));
++		}
++		return result;
++	}();
++	static size_t next = 0;
++	if (next >= times.size())
++		return;
++	const double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count() - t0;
++	if (now < times[next])
++		return;
++	const char* dir = std::getenv("PS2X_SHOT_DIR");
++	const std::string path = Path::Combine(dir && *dir ? dir : EmuFolders::DataRoot.c_str(), fmt::format("shot_{}.png", next + 1));
++	GSQueueSnapshot(path);
++	next++;
++}
++
+ void Host::PumpMessagesOnCPUThread()
+ {
++	RunCPUThreadQueue();
++#ifdef _WIN32
++	if (s_live)
++	{
++		LiveMenuPollGamepad();
++		LiveTimedSnapshots();
++	}
++#endif
+ 	// update GS thread copy of frame number
+ 	MTGS::RunOnGSThread([frame_number = GSDumpReplayer::GetFrameNumber()]() { s_dump_frame_number = frame_number; });
+ 	MTGS::RunOnGSThread([loop_number = GSDumpReplayer::GetLoopCount()]() { s_loop_number = loop_number; });
+@@ -1075,17 +1204,33 @@ bool GSRunner::CreatePlatformWindow()
+ 		return false;
+ 	}
+ 
+-	s_hwnd = CreateWindowExW(WS_EX_CLIENTEDGE, WINDOW_CLASS_NAME, L"PCSX2 GS Runner",
+-		WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_MINIMIZEBOX | WS_SYSMENU | WS_SIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT, WINDOW_WIDTH,
+-		WINDOW_HEIGHT, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
++	// Live mode: a 4:3 game window at twice the PS2 resolution by default, scaled by the monitor's
++	// DPI (the process is per-monitor DPI aware) so it keeps that size on 4K screens.
++	UINT dpi = 96;
++	if (HMODULE user32 = GetModuleHandleW(L"user32.dll"))
++	{
++		using GetDpiForSystemFn = UINT(WINAPI*)();
++		if (auto get_dpi = reinterpret_cast<GetDpiForSystemFn>(GetProcAddress(user32, "GetDpiForSystem")))
++			dpi = get_dpi();
++	}
++	RECT live_rect = {0, 0, MulDiv(1280, static_cast<int>(dpi), 96), MulDiv(960, static_cast<int>(dpi), 96)};
++	AdjustWindowRectEx(&live_rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
++	s_hwnd = CreateWindowExW(s_live ? 0 : WS_EX_CLIENTEDGE, WINDOW_CLASS_NAME, s_live ? L"NBA Street V3" : L"PCSX2 GS Runner",
++		WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_MINIMIZEBOX | WS_SYSMENU | WS_SIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
++		s_live ? (live_rect.right - live_rect.left) : WINDOW_WIDTH, s_live ? (live_rect.bottom - live_rect.top) : WINDOW_HEIGHT,
++		nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+ 	if (!s_hwnd)
+ 	{
+ 		Console.Error("CreateWindowEx failed.");
+ 		return false;
+ 	}
+ 
+-	ShowWindow(s_hwnd, SW_SHOW);
++	// PS2X_HOST_NOACTIVATE=1 (automated tests): show the window without taking the focus.
++	const char* no_activate = std::getenv("PS2X_HOST_NOACTIVATE");
++	ShowWindow(s_hwnd, (no_activate && *no_activate == '1') ? SW_SHOWNOACTIVATE : SW_SHOW);
+ 	UpdateWindow(s_hwnd);
++	if (s_start_fullscreen)
++		ToggleFullscreen(s_hwnd);
+ 
+ 	// make sure all messages are processed before returning
+ 	PumpPlatformMessages();
+@@ -1150,13 +1295,491 @@ void GSRunner::StopPlatformMessagePump()
+ 	PostThreadMessageW(MainThreadID, SHUTDOWN_MSG, 0, 0);
+ }
+ 
++// Live mode keyboard -> PS2 pad (same keys as the PS2Recomp runtime window): arrows = D-pad,
++// Z/X/C/V = square/cross/circle/triangle, Q/E = L1/R1, 1/3 = L2/R2, Enter = START,
++// Right Shift/Backspace = SELECT, Ctrl = L3, WASD = left stick. Alt+Enter / F11 = fullscreen.
++static u32 s_live_keys = 0;
++static u32 s_live_stick = 0; // bit0 left, bit1 right, bit2 up, bit3 down
++static bool s_fullscreen = false;
++static RECT s_windowed_rect = {};
++
++static void LivePublishPad()
++{
++	const u32 lx = (s_live_stick & 1) ? 0x00 : ((s_live_stick & 2) ? 0xFF : 0x80);
++	const u32 ly = (s_live_stick & 4) ? 0x00 : ((s_live_stick & 8) ? 0xFF : 0x80);
++	GSDumpReplayer::SetLivePad(s_live_keys, lx | (ly << 8) | (0x80u << 16) | (0x80u << 24));
++}
++
++static void LiveKey(WPARAM vk, LPARAM lParam, bool down)
++{
++	u32 bit = 0;
++	u32 stick = 0;
++	switch (vk)
++	{
++		case VK_UP: bit = 1u << 4; break;
++		case VK_RIGHT: bit = 1u << 5; break;
++		case VK_DOWN: bit = 1u << 6; break;
++		case VK_LEFT: bit = 1u << 7; break;
++		case 'Z': bit = 1u << 15; break;
++		case 'X': bit = 1u << 14; break;
++		case 'C': bit = 1u << 13; break;
++		case 'V': bit = 1u << 12; break;
++		case 'Q': bit = 1u << 10; break;
++		case 'E': bit = 1u << 11; break;
++		case '1': bit = 1u << 8; break;
++		case '3': bit = 1u << 9; break;
++		case VK_RETURN: bit = 1u << 3; break;
++		case VK_BACK: bit = 1u << 0; break;
++		case VK_SHIFT:
++			if (MapVirtualKeyW((lParam >> 16) & 0xFF, MAPVK_VSC_TO_VK_EX) == VK_RSHIFT)
++				bit = 1u << 0;
++			break;
++		case VK_CONTROL: bit = 1u << 1; break;
++		case 'A': stick = 1; break;
++		case 'D': stick = 2; break;
++		case 'W': stick = 4; break;
++		case 'S': stick = 8; break;
++		default: return;
++	}
++	if (down)
++	{
++		s_live_keys |= bit;
++		s_live_stick |= stick;
++	}
++	else
++	{
++		s_live_keys &= ~bit;
++		s_live_stick &= ~stick;
++	}
++	LivePublishPad();
++}
++
++static void ToggleFullscreen(HWND hwnd)
++{
++	s_fullscreen = !s_fullscreen;
++	if (s_fullscreen)
++	{
++		GetWindowRect(hwnd, &s_windowed_rect);
++		MONITORINFO mi = {sizeof(mi)};
++		GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi);
++		SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
++		SetWindowPos(hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right - mi.rcMonitor.left,
++			mi.rcMonitor.bottom - mi.rcMonitor.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
++	}
++	else
++	{
++		SetWindowLongPtrW(hwnd, GWL_STYLE, WS_OVERLAPPEDWINDOW | WS_VISIBLE);
++		SetWindowPos(hwnd, nullptr, s_windowed_rect.left, s_windowed_rect.top, s_windowed_rect.right - s_windowed_rect.left,
++			s_windowed_rect.bottom - s_windowed_rect.top, SWP_FRAMECHANGED | SWP_NOZORDER | SWP_SHOWWINDOW);
++	}
++}
++
++// ---- Options menu (PS2Recomp live) ----
++// F1, gamepad Back+Start or holding START 1.5 s opens it; arrows / D-pad navigate and change values, Enter/A
++// accepts, Esc/B closes. Changes apply at once (VMManager::ApplySettings) and are saved to
++// nba_street.ini next to the host. All menu state lives on the CPU thread.
++enum class LiveMenuAction
++{
++	Toggle,
++	Up,
++	Down,
++	Left,
++	Right,
++	Accept,
++	Close
++};
++
++namespace
++{
++	struct LiveMenuOption
++	{
++		const char* label;
++		std::vector<const char*> names;
++		int index = 0;
++	};
++
++	enum LiveMenuItem
++	{
++		MENU_RENDERER,
++		MENU_RES,
++		MENU_ANISO,
++		MENU_FILTER,
++		MENU_FXAA,
++		MENU_CAS,
++		MENU_ASPECT,
++		MENU_FULLSCREEN,
++		MENU_FPS,
++		MENU_TEXTURES,
++		MENU_CLOSE,
++	};
++
++	constexpr float kMenuUpscale[] = {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f, 8.0f};
++	constexpr int kMenuAniso[] = {0, 2, 4, 8, 16};
++	constexpr int kMenuCasSharpness[] = {0, 40, 70, 100};
++	constexpr const char* kMenuAspect[] = {"Auto 4:3/3:2", "4:3", "16:9", "Stretch"};
++	constexpr GSRendererType kMenuRenderer[] = {GSRendererType::VK, GSRendererType::OGL, GSRendererType::DX11, GSRendererType::DX12};
++	// The renderer can not be switched while the live window is open (the swap chain is tied to
++	// it): the choice is saved and used on the next start.
++	int s_menu_pending_renderer = -1;
++
++	std::atomic<bool> s_menu_open{false};
++	int s_menu_selected = 0;
++	std::vector<LiveMenuOption> s_menu;
++} // namespace
++
++template <typename T, size_t N>
++static int LiveMenuFind(const T (&values)[N], T value)
++{
++	for (size_t i = 0; i < N; i++)
++		if (values[i] == value)
++			return static_cast<int>(i);
++	return 0;
++}
++
++static void LiveMenuInit()
++{
++	if (!s_menu.empty())
++		return;
++	const float upscale = s_settings_interface.GetFloatValue("EmuCore/GS", "upscale_multiplier", 1.0f);
++	int res = 0;
++	for (int i = 0; i < static_cast<int>(std::size(kMenuUpscale)); i++)
++		if (upscale >= kMenuUpscale[i] - 0.01f)
++			res = i;
++	const std::string aspect = s_settings_interface.GetStringValue("EmuCore/GS", "AspectRatio", "Auto 4:3/3:2");
++	int aspect_index = 0;
++	for (int i = 0; i < static_cast<int>(std::size(kMenuAspect)); i++)
++		if (aspect == kMenuAspect[i])
++			aspect_index = i;
++	const int cas = s_settings_interface.GetIntValue("EmuCore/GS", "CASMode", 0) == 0 ? 0 :
++		std::max(1, LiveMenuFind(kMenuCasSharpness, s_settings_interface.GetIntValue("EmuCore/GS", "CASSharpness", 40)));
++
++	s_menu = {
++		{"Renderizador (al reiniciar)", {"Vulkan", "OpenGL", "DirectX 11", "DirectX 12"},
++			LiveMenuFind(kMenuRenderer, static_cast<GSRendererType>(s_settings_interface.GetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::VK))))},
++		{"Resolucion interna", {"Nativa PS2 (640x448)", "2x (720p)", "3x (1080p)", "4x (1440p)", "5x", "6x (4K)", "8x (5K)"}, res},
++		{"Filtrado anisotropico", {"Desactivado", "2x", "4x", "8x", "16x"},
++			LiveMenuFind(kMenuAniso, s_settings_interface.GetIntValue("EmuCore/GS", "MaxAnisotropy", 0))},
++		{"Filtrado de texturas", {"Cercano (pixelado)", "Bilineal forzado", "Bilineal PS2 (recomendado)", "Bilineal salvo sprites"},
++			std::clamp(s_settings_interface.GetIntValue("EmuCore/GS", "filter", 2), 0, 3)},
++		{"Antialiasing FXAA", {"Desactivado", "Activado"}, s_settings_interface.GetBoolValue("EmuCore/GS", "fxaa", false) ? 1 : 0},
++		{"Nitidez (CAS)", {"Desactivada", "Baja", "Media", "Alta"}, cas},
++		{"Relacion de aspecto", {"Automatica (4:3)", "4:3", "16:9 (estirada)", "Llenar ventana"}, aspect_index},
++		{"Pantalla completa", {"No", "Si"}, s_fullscreen ? 1 : 0},
++		{"Mostrar FPS", {"No", "Si"}, s_settings_interface.GetBoolValue("EmuCore/GS", "OsdShowFPS", false) ? 1 : 0},
++		{"Texturas HD (packs PCSX2)", {"Desactivadas", "Activadas", "Activadas + volcar originales"},
++			!s_settings_interface.GetBoolValue("EmuCore/GS", "LoadTextureReplacements", false) ? 0 :
++			(s_settings_interface.GetBoolValue("EmuCore/GS", "DumpReplaceableTextures", false) ? 2 : 1)},
++		{"Cerrar menu", {}, 0},
++	};
++}
++
++static void LiveMenuPublish()
++{
++	if (!s_menu_open.load())
++	{
++		GSDumpReplayer::SetLiveMenu({}, {}, -1, {});
++		return;
++	}
++	std::vector<std::string> lines;
++	for (const LiveMenuOption& opt : s_menu)
++	{
++		if (opt.names.empty())
++			lines.emplace_back(opt.label);
++		else
++			lines.push_back(fmt::format("{}\t<  {}  >", opt.label, opt.names[opt.index])); // tab = value column
++	}
++	GSDumpReplayer::SetLiveMenu("Opciones graficas", std::move(lines), s_menu_selected,
++		"Flechas/cruceta: elegir y cambiar   Enter/A: aceptar   Esc/B o F1: cerrar");
++}
++
++static void LiveMenuSave()
++{
++	if (std::FILE* fp = std::fopen(s_live_ini_path.c_str(), "w"))
++	{
++		std::fprintf(fp, "; Opciones graficas de NBA Street V3 (menu F1 / Back+Start / mantener START). Se reescribe al cambiar.\n[EmuCore/GS]\n");
++		std::fprintf(fp, "Renderer = %d\n", s_menu_pending_renderer >= 0 ? s_menu_pending_renderer :
++			s_settings_interface.GetIntValue("EmuCore/GS", "Renderer", static_cast<int>(GSRendererType::VK)));
++		std::fprintf(fp, "upscale_multiplier = %g\n", s_settings_interface.GetFloatValue("EmuCore/GS", "upscale_multiplier", 1.0f));
++		std::fprintf(fp, "MaxAnisotropy = %d\n", s_settings_interface.GetIntValue("EmuCore/GS", "MaxAnisotropy", 0));
++		std::fprintf(fp, "filter = %d\n", s_settings_interface.GetIntValue("EmuCore/GS", "filter", 2));
++		std::fprintf(fp, "fxaa = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "fxaa", false) ? "true" : "false");
++		std::fprintf(fp, "CASMode = %d\n", s_settings_interface.GetIntValue("EmuCore/GS", "CASMode", 0));
++		std::fprintf(fp, "CASSharpness = %d\n", s_settings_interface.GetIntValue("EmuCore/GS", "CASSharpness", 40));
++		std::fprintf(fp, "AspectRatio = %s\n", s_settings_interface.GetStringValue("EmuCore/GS", "AspectRatio", "Auto 4:3/3:2").c_str());
++		std::fprintf(fp, "OsdShowFPS = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "OsdShowFPS", false) ? "true" : "false");
++		// Texture packs: Documents\PCSX2\textures\SLUS-21126\replacements (same layout as PCSX2).
++		std::fprintf(fp, "LoadTextureReplacements = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "LoadTextureReplacements", false) ? "true" : "false");
++		std::fprintf(fp, "LoadTextureReplacementsAsync = true\n");
++		std::fprintf(fp, "DumpReplaceableTextures = %s\n", s_settings_interface.GetBoolValue("EmuCore/GS", "DumpReplaceableTextures", false) ? "true" : "false");
++		std::fclose(fp);
++	}
++}
++
++static void LiveMenuApply(int item)
++{
++	const int index = s_menu[item].index;
++	switch (item)
++	{
++		case MENU_RENDERER:
++			s_menu_pending_renderer = static_cast<int>(kMenuRenderer[index]);
++			LiveMenuSave();
++			return;
++		case MENU_TEXTURES:
++			s_settings_interface.SetBoolValue("EmuCore/GS", "LoadTextureReplacements", index >= 1);
++			s_settings_interface.SetBoolValue("EmuCore/GS", "LoadTextureReplacementsAsync", true);
++			s_settings_interface.SetBoolValue("EmuCore/GS", "DumpReplaceableTextures", index == 2);
++			break;
++		case MENU_RES:
++			s_settings_interface.SetFloatValue("EmuCore/GS", "upscale_multiplier", kMenuUpscale[index]);
++			break;
++		case MENU_ANISO:
++			s_settings_interface.SetIntValue("EmuCore/GS", "MaxAnisotropy", kMenuAniso[index]);
++			break;
++		case MENU_FILTER:
++			s_settings_interface.SetIntValue("EmuCore/GS", "filter", index);
++			break;
++		case MENU_FXAA:
++			s_settings_interface.SetBoolValue("EmuCore/GS", "fxaa", index == 1);
++			break;
++		case MENU_CAS:
++			s_settings_interface.SetIntValue("EmuCore/GS", "CASMode", index == 0 ? 0 : 1);
++			s_settings_interface.SetIntValue("EmuCore/GS", "CASSharpness", kMenuCasSharpness[index]);
++			break;
++		case MENU_ASPECT:
++			s_settings_interface.SetStringValue("EmuCore/GS", "AspectRatio", kMenuAspect[index]);
++			break;
++		case MENU_FULLSCREEN:
++			if ((index == 1) != s_fullscreen)
++				ToggleFullscreen(s_hwnd);
++			return;
++		case MENU_FPS:
++			s_settings_interface.SetBoolValue("EmuCore/GS", "OsdShowFPS", index == 1);
++			break;
++		default:
++			return;
++	}
++	VMManager::ApplySettings();
++	LiveMenuSave();
++}
++
++static void LiveMenuDo(LiveMenuAction action)
++{
++	LiveMenuInit();
++	const bool open = s_menu_open.load();
++	if (action == LiveMenuAction::Toggle || (open && action == LiveMenuAction::Close))
++	{
++		s_menu_open.store(action == LiveMenuAction::Toggle ? !open : false);
++		s_menu[MENU_FULLSCREEN].index = s_fullscreen ? 1 : 0;
++		GSDumpReplayer::SetLiveMenuOpen(s_menu_open.load());
++		LiveMenuPublish();
++		return;
++	}
++	if (!open)
++		return;
++	const int count = static_cast<int>(s_menu.size());
++	LiveMenuOption& opt = s_menu[s_menu_selected];
++	switch (action)
++	{
++		case LiveMenuAction::Up:
++			s_menu_selected = (s_menu_selected + count - 1) % count;
++			break;
++		case LiveMenuAction::Down:
++			s_menu_selected = (s_menu_selected + 1) % count;
++			break;
++		case LiveMenuAction::Left:
++		case LiveMenuAction::Right:
++			if (!opt.names.empty())
++			{
++				const int n = static_cast<int>(opt.names.size());
++				opt.index = (opt.index + (action == LiveMenuAction::Right ? 1 : n - 1)) % n;
++				LiveMenuApply(s_menu_selected);
++			}
++			break;
++		case LiveMenuAction::Accept:
++			if (opt.names.empty())
++			{
++				LiveMenuDo(LiveMenuAction::Close);
++				return;
++			}
++			opt.index = (opt.index + 1) % static_cast<int>(opt.names.size());
++			LiveMenuApply(s_menu_selected);
++			break;
++		default:
++			break;
++	}
++	LiveMenuPublish();
++}
++
++// Gamepad (XInput, polled at every vsync on the CPU thread): Back+Start or a long START toggles the menu.
++static void LiveMenuPollGamepad()
++{
++	using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
++	static XInputGetStateFn get_state = [] {
++		HMODULE mod = LoadLibraryW(L"xinput1_4.dll");
++		if (!mod)
++			mod = LoadLibraryW(L"xinput9_1_0.dll");
++		return mod ? reinterpret_cast<XInputGetStateFn>(GetProcAddress(mod, "XInputGetState")) : nullptr;
++	}();
++	static WORD s_prev = 0;
++	if (!get_state)
++		return;
++	// Only the focused window reacts: XInput is global, and several instances (or a test run next
++	// to the player's game) must not open/drive each other's menus.
++	static const bool s_no_gamepad = [] {
++		const char* value = std::getenv("PS2X_NO_GAMEPAD"); // automated test runs
++		return value && *value && *value != '0';
++	}();
++	if (s_no_gamepad || GetForegroundWindow() != s_hwnd)
++	{
++		s_prev = 0;
++		return;
++	}
++	WORD buttons = 0;
++	for (DWORD pad = 0; pad < 4; pad++)
++	{
++		XINPUT_STATE state = {};
++		if (get_state(pad, &state) == ERROR_SUCCESS)
++		{
++			buttons = state.Gamepad.wButtons;
++			break;
++		}
++	}
++	const WORD pressed = buttons & ~s_prev;
++	s_prev = buttons;
++	constexpr WORD combo = XINPUT_GAMEPAD_BACK | XINPUT_GAMEPAD_START;
++	if ((buttons & combo) == combo && (pressed & combo))
++	{
++		LiveMenuDo(LiveMenuAction::Toggle);
++		return;
++	}
++	// Holding START alone for 1.5 s also toggles it (pads without a handy Back button). Fires once
++	// per hold; the short press still reaches the game as its normal pause.
++	static ULONGLONG s_start_since = 0;
++	static bool s_start_fired = false;
++	if (buttons == XINPUT_GAMEPAD_START)
++	{
++		const ULONGLONG now = GetTickCount64();
++		if (pressed & XINPUT_GAMEPAD_START)
++		{
++			s_start_since = now;
++			s_start_fired = false;
++		}
++		else if (!s_start_fired && s_start_since && now - s_start_since >= 1500)
++		{
++			s_start_fired = true;
++			LiveMenuDo(LiveMenuAction::Toggle);
++			return;
++		}
++	}
++	else
++	{
++		s_start_since = 0;
++	}
++	if (!s_menu_open.load())
++		return;
++	if (pressed & XINPUT_GAMEPAD_DPAD_UP)
++		LiveMenuDo(LiveMenuAction::Up);
++	if (pressed & XINPUT_GAMEPAD_DPAD_DOWN)
++		LiveMenuDo(LiveMenuAction::Down);
++	if (pressed & XINPUT_GAMEPAD_DPAD_LEFT)
++		LiveMenuDo(LiveMenuAction::Left);
++	if (pressed & XINPUT_GAMEPAD_DPAD_RIGHT)
++		LiveMenuDo(LiveMenuAction::Right);
++	if (pressed & XINPUT_GAMEPAD_A)
++		LiveMenuDo(LiveMenuAction::Accept);
++	if (pressed & XINPUT_GAMEPAD_B)
++		LiveMenuDo(LiveMenuAction::Close);
++}
++
++// Keyboard from the window thread: queued to the CPU thread. True when the key was the menu's.
++static bool LiveMenuKey(WPARAM vk)
++{
++	LiveMenuAction action;
++	if (vk == VK_F1)
++		action = LiveMenuAction::Toggle;
++	else if (!s_menu_open.load())
++		return false;
++	else if (vk == VK_UP)
++		action = LiveMenuAction::Up;
++	else if (vk == VK_DOWN)
++		action = LiveMenuAction::Down;
++	else if (vk == VK_LEFT)
++		action = LiveMenuAction::Left;
++	else if (vk == VK_RIGHT)
++		action = LiveMenuAction::Right;
++	else if (vk == VK_RETURN || vk == VK_SPACE)
++		action = LiveMenuAction::Accept;
++	else if (vk == VK_ESCAPE || vk == VK_BACK)
++		action = LiveMenuAction::Close;
++	else
++		return true; // the menu owns the keyboard while open
++	Host::RunOnCPUThread([action]() { LiveMenuDo(action); });
++	return true;
++}
++
+ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+ {
++	if (s_live)
++	{
++		switch (msg)
++		{
++			case WM_KEYDOWN:
++			case WM_SYSKEYDOWN:
++				if ((wParam == VK_RETURN && (lParam & (1 << 29))) || wParam == VK_F11)
++				{
++					if (!(lParam & (1 << 30)))
++						ToggleFullscreen(hwnd);
++					return 0;
++				}
++				if (!(lParam & (1 << 30)) && LiveMenuKey(wParam))
++				{
++					// Opening the menu releases whatever the pad was holding.
++					s_live_keys = 0;
++					s_live_stick = 0;
++					LivePublishPad();
++					return 0;
++				}
++				if (s_menu_open.load())
++					return 0;
++				LiveKey(wParam, lParam, true);
++				return 0;
++			case WM_KEYUP:
++			case WM_SYSKEYUP:
++				LiveKey(wParam, lParam, false);
++				return 0;
++			case WM_KILLFOCUS:
++				s_live_keys = 0;
++				s_live_stick = 0;
++				LivePublishPad();
++				break;
++			case WM_SIZE:
++				if (VMManager::HasValidVM() && wParam != SIZE_MINIMIZED)
++				{
++					const u32 width = LOWORD(lParam), height = HIWORD(lParam);
++					if (MTGS::IsOpen())
++						MTGS::ResizeDisplayWindow(width, height, 1.0f);
++				}
++				break;
++			case WM_CLOSE:
++				GSDumpReplayer::SetLiveQuit();
++				Host::RequestVMShutdown(false, false, false);
++				return 0;
++		}
++	}
+ 	return DefWindowProcW(hwnd, msg, wParam, lParam);
+ }
+ 
+ int wmain(int argc, wchar_t** argv)
+ {
++	// Render at the monitor's real resolution: without this, Windows display scaling (e.g. 200%
++	// on a 4K screen) makes the window 1080p internally and stretches it, blurring the image.
++	if (HMODULE user32 = GetModuleHandleW(L"user32.dll"))
++	{
++		using SetDpiContextFn = BOOL(WINAPI*)(HANDLE);
++		if (auto set_dpi = reinterpret_cast<SetDpiContextFn>(GetProcAddress(user32, "SetProcessDpiAwarenessContext")))
++			set_dpi(reinterpret_cast<HANDLE>(-4)); // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
++	}
++
+ 	std::vector<std::string> u8_args;
+ 	u8_args.reserve(static_cast<size_t>(argc));
+ 	for (int i = 0; i < argc; i++)
+diff --git a/pcsx2/GS/GSLocalMemoryMultiISA.cpp b/pcsx2/GS/GSLocalMemoryMultiISA.cpp
+index 4e16a7c..a0cd7f4 100644
+--- a/pcsx2/GS/GSLocalMemoryMultiISA.cpp
++++ b/pcsx2/GS/GSLocalMemoryMultiISA.cpp
+@@ -478,17 +478,23 @@ void GSLocalMemoryFunctions::WriteImage(GSLocalMemory& mem, int& tx, int& ty, co
+ 	// GT3 demo, Jak 2 Japanese subtitles, and the BG Dark Alliance minimap do this.
+ 	if (trbpp == 4 && (TRXREG.RRW & 0x1))
+ 	{
+-		int count = 0;
+-		const int t = TRXPOS.DSAY;
+-		const int b = t + (int)TRXREG.RRH;
+-		for (int y = t; y < b; y++)
++		// Only the len bytes given, continuing from (tx, ty): a partial transfer (flushed when
++		// BITBLTBUF changes) must not read past its data.
++		const int b = (int)TRXPOS.DSAY + (int)TRXREG.RRH;
++		const int pixels = len * 2;
++		int x = tx, y = ty, count = 0;
++		while (count < pixels && y < b)
+ 		{
+-			for (int x = l; x < r; x++)
++			mem.WritePixel4(x, y, src[count >> 1] >> ((count & 1) << 2), BITBLTBUF.DBP, BITBLTBUF.DBW);
++			count++;
++			if (++x >= r)
+ 			{
+-				mem.WritePixel4(x, y, src[count >> 1] >> ((count & 1) << 2), BITBLTBUF.DBP, BITBLTBUF.DBW);
+-				count++;
++				x = l;
++				y++;
+ 			}
+ 		}
++		tx = x;
++		ty = y;
+ 		return;
+ 	}
+ 
+diff --git a/pcsx2/GS/GSState.cpp b/pcsx2/GS/GSState.cpp
+index e8b9f37..9c6e1e2 100644
+--- a/pcsx2/GS/GSState.cpp
++++ b/pcsx2/GS/GSState.cpp
+@@ -8,6 +8,7 @@
+ #include "GS/GSUtil.h"
+ 
+ #include "common/Console.h"
++#include "common/CrashHandler.h"
+ #include "common/BitUtils.h"
+ #include "common/Path.h"
+ #include "common/StringUtil.h"
+@@ -3349,6 +3350,7 @@ template <int index>
+ void GSState::Transfer(const u8* mem, u32 size)
+ {
+ 	const u8* start = mem;
++	CrashHandler::g_transfer_note = {index, mem, size};
+ 
+ 	GIFPath& path = m_path[index];
+ 
+@@ -3396,6 +3398,17 @@ void GSState::Transfer(const u8* mem, u32 size)
+ 
+ 					total = path.nloop * path.nreg;
+ 
++					// A packet resumed mid-loop (reg != 0) may finish the tag above (nothing left), or
++					// run out of data before the loop ends: the do/while loops below would underflow
++					// --total / size-- and run off the buffer.
++					if (total == 0)
++					{
++						path.nloop = 0;
++						break;
++					}
++					if (size == 0)
++						break;
++
+ 					if (size >= total)
+ 					{
+ 						size -= total;
+diff --git a/pcsx2/GS/Renderers/HW/GSTextureCache.cpp b/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
+index 440e279..a5108c3 100644
+--- a/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
++++ b/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
+@@ -7983,6 +7983,12 @@ void GSTextureCache::Target::Update(bool cannot_scale)
+ 
+ 		const GSVector4i read_r = m_dirty.GetDirtyRect(i, m_TEX0, total_rect, true);
+ 		const GSVector4i t_r(read_r - t_offset);
++		// The unswizzle buffer is 9 MB: a bigger dirty rect (bogus TBW/size) would overflow it.
++		if (static_cast<size_t>(VectorAlign(read_r.width() * sizeof(u32))) * static_cast<size_t>(read_r.height()) > 9 * 1024 * 1024)
++		{
++			Console.Warning("GS: skipping %dx%d target update (too large)", read_r.width(), read_r.height());
++			continue;
++		}
+ 		if (mapped)
+ 		{
+ 			if ((m_TEX0.PSM & 0xf) != PSMCT24 && m_dirty[i].rgba.c.a && bpp >= 16)
+diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
+index 9c31bb8..397b342 100644
+--- a/pcsx2/GSDumpReplayer.cpp
++++ b/pcsx2/GSDumpReplayer.cpp
+@@ -1,19 +1,22 @@
+-// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
++﻿// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
+ // SPDX-License-Identifier: GPL-3.0+
+ 
+ #include "GS.h"
+ #include "GS/GSLzma.h"
++#include "GS/GSDump.h"
+ #include "GSDumpReplayer.h"
+ #include "GameList.h"
+ #include "Gif.h"
+ #include "Gif_Unit.h"
+ #include "Host.h"
++#include "PerformanceMetrics.h"
+ #include "ImGui/ImGuiManager.h"
+ #include "ImGui/ImGuiOverlays.h"
+ #include "R3000A.h"
+ #include "R5900.h"
+ #include "VMManager.h"
+ #include "VUmicro.h"
++#include "Vif_Dma.h"
+ 
+ #include "imgui.h"
+ 
+@@ -21,12 +24,23 @@
+ 
+ #include "common/Error.h"
+ #include "common/FileSystem.h"
++#include "common/FPControl.h"
+ #include "common/Path.h"
+ #include "common/StringUtil.h"
+ #include "common/Threading.h"
+ #include "common/Timer.h"
+ 
+ #include <atomic>
++#include <cfloat>
++#include <cmath>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#ifdef _WIN32
++#include "common/RedtapeWindows.h"
++#include "Ps2LiveRing.h"
++#endif
+ 
+ static void GSDumpReplayerCpuReserve();
+ static void GSDumpReplayerCpuShutdown();
+@@ -60,6 +74,103 @@ R5900cpu GSDumpReplayerCpu = {
+ static InterpVU0 gsDumpVU0;
+ static InterpVU1 gsDumpVU1;
+ 
++#ifdef _WIN32
++namespace
++{
++	bool s_live_mode_early = false; // set by AttachLiveRing, before the VM picks its CPUs
++}
++#endif
++
++// A live recompiled game streams its VIF1 data here, so VU1 runs on PCSX2's microVU
++// recompiler (the dump replayer otherwise never executes VU code).
++BaseVUmicroCPU* GSDumpReplayer::GetLiveVU1()
++{
++#if defined(_WIN32) && defined(_M_X86)
++	const char* interp = std::getenv("PS2X_HOST_VU_INTERP");
++	if (s_live_mode_early && EmuConfig.Cpu.Recompiler.EnableVU1 && !(interp && interp[0] == '1'))
++		return &CpuMicroVU1;
++	if (s_live_mode_early)
++		return &CpuIntVU1;
++#endif
++	return &gsDumpVU1;
++}
++
++// PS2Recomp live mode (see GSDumpReplayer::AttachLiveRing).
++#ifdef _WIN32
++namespace
++{
++	struct LiveSource
++	{
++		HANDLE mapping = nullptr;
++		HANDLE data_event = nullptr;
++		HANDLE space_event = nullptr;
++		HANDLE producer_process = nullptr; // the game (its pid is the ring suffix)
++		ps2live::RingHeader* header = nullptr;
++		u8* data = nullptr;
++		u64 capacity = 0;
++		bool stream_header_done = false;
++		std::vector<u8> buffer;
++	};
++	LiveSource s_live;
++	bool s_live_mode = false;
++
++	// Blocks until size bytes of the stream are available; false when playback stops.
++	bool LiveRead(void* dst, size_t size)
++	{
++		u8* out = static_cast<u8*>(dst);
++		while (size > 0)
++		{
++			const s64 r = s_live.header->readPos;
++			const s64 w = s_live.header->writePos;
++			const u64 avail = static_cast<u64>(w - r);
++			if (avail == 0)
++			{
++				if (!s_dump_running)
++					return false;
++				// The game exited (or was killed without clearing producerAlive): close too.
++				if (!s_live.header->producerAlive ||
++					(s_live.producer_process && WaitForSingleObject(s_live.producer_process, 0) == WAIT_OBJECT_0))
++				{
++					Host::RequestVMShutdown(false, false, false);
++					return false;
++				}
++				WaitForSingleObject(s_live.data_event, 10);
++				continue;
++			}
++			MemoryBarrier();
++			const u64 offset = static_cast<u64>(r) % s_live.capacity;
++			const size_t chunk = static_cast<size_t>(std::min<u64>({static_cast<u64>(size), avail, s_live.capacity - offset}));
++			std::memcpy(out, s_live.data + offset, chunk);
++			MemoryBarrier();
++			s_live.header->readPos = r + static_cast<s64>(chunk);
++			SetEvent(s_live.space_event);
++			out += chunk;
++			size -= chunk;
++		}
++		return true;
++	}
++
++	template <typename T>
++	bool LiveReadValue(T* value)
++	{
++		return LiveRead(value, sizeof(T));
++	}
++
++	bool LiveSkip(size_t size)
++	{
++		u8 scratch[4096];
++		while (size > 0)
++		{
++			const size_t chunk = std::min(size, sizeof(scratch));
++			if (!LiveRead(scratch, chunk))
++				return false;
++			size -= chunk;
++		}
++		return true;
++	}
++} // namespace
++#endif
++
+ bool GSDumpReplayer::IsReplayingDump()
+ {
+ 	return static_cast<bool>(s_dump_file);
+@@ -106,7 +217,7 @@ bool GSDumpReplayer::Initialize(const char* filename, Error* error)
+ 	Cpu = &GSDumpReplayerCpu;
+ 	psxCpu = &psxInt;
+ 	CpuVU0 = &gsDumpVU0;
+-	CpuVU1 = &gsDumpVU1;
++	CpuVU1 = GetLiveVU1();
+ 
+ 	// loop infinitely by default
+ 	s_dump_loop_count = -1;
+@@ -204,6 +315,10 @@ static void GSDumpReplayerLoadInitialState()
+ 	std::memcpy(PS2MEM_GS, s_dump_file->GetRegsData().data(),
+ 		std::min(Ps2MemSize::GSregs, static_cast<u32>(s_dump_file->GetRegsData().size())));
+ 
++	// Dumps recorded by PS2Recomp start from boot with a fresh GS and carry no saved state.
++	if (s_dump_file->GetStateData().empty())
++		return;
++
+ 	// load GS state
+ 	freezeData fd = {static_cast<int>(s_dump_file->GetStateData().size()),
+ 		const_cast<u8*>(s_dump_file->GetStateData().data())};
+@@ -219,6 +334,17 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
+ 
+ 	const u32 truncated_length = static_cast<u32>(length);
+ 
++#ifdef _WIN32
++	// Live mode with remote VU1: the GIF unit also carries PATH1/PATH2 (VIF1 + microVU here),
++	// so PATH3 goes through it too (arbitration and path buffers as on the real GIF).
++	static const bool s_gif_unit_path3 = [] { const char* e = std::getenv("PS2X_HOST_GIF_PATH3"); return e && e[0] == '1'; }();
++	if (s_live_mode && s_gif_unit_path3 && path == GIF_PATH_3 && gifUnit.CanDoPath3())
++	{
++		gifUnit.TransferGSPacketData(GIF_TRANS_DMA, const_cast<u8*>(data), truncated_length);
++		return;
++	}
++#endif
++
+ 	Gif_Path& gifPath = gifUnit.gifPath[path];
+ 	gifPath.CopyGSPacketData(const_cast<u8*>(data), truncated_length);
+ 
+@@ -226,6 +352,16 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
+ 	gsPack.offset = gifPath.curOffset;
+ 	gsPack.size = truncated_length;
+ 	gifPath.curOffset += length;
++#ifdef _WIN32
++	static const bool s_raw_path3 = [] { const char* e = std::getenv("PS2X_HOST_RAW_PATH3"); return e && e[0] == '1'; }();
++	if (s_live_mode && path == GIF_PATH_3 && s_raw_path3)
++	{
++		// The game's PATH3 chunks are DMA slices, not whole GIF packets, and the GIF unit's
++		// PATH1/PATH2 output (remote VU1) can come between them: give them their own GS path.
++		Gif_AddRawPath3GSPacket(gsPack);
++		return;
++	}
++#endif
+ 	Gif_AddCompletedGSPacket(gsPack, path);
+ }
+ 
+@@ -256,6 +392,201 @@ static void GSDumpReplayerFrameLimit()
+ 	s_next_frame_time = std::max(now, s_next_frame_time + s_frame_ticks);
+ }
+ 
++#ifdef _WIN32
++// Live packet carrying the game's VIF1 stream (DMA payload, VIFcodes + data, in order).
++static constexpr u8 kLivePacketVif1 = 0x10;
++// Live packet: the game wrote a VIF1 register (u32 address, u32 value): FBRST, ERR, MARK.
++static constexpr u8 kLivePacketVif1Reg = 0x11;
++
++// Runs a chunk of the game's VIF1 stream through PCSX2's VIF1: UNPACK/MPG fill VU1 memory,
++// MSCAL runs microVU1, XGKICK and DIRECT reach the GS through the GIF unit. Interrupts and
++// i-bit stalls belong to the game (handled on its side), so they are acknowledged here and
++// the stream continues; a waiting VU/GIF is drained before retrying.
++static void GSDumpReplayerLiveVif1(u8* data, u32 size)
++{
++	// The game boots without the BIOS, which leaves VIF1 CYCLE configured; with CL=WL=0 an
++	// UNPACK would consume no data and its payload would be parsed as VIFcodes.
++	static bool s_cycle_initialized = false;
++	if (!s_cycle_initialized)
++	{
++		s_cycle_initialized = true;
++		if (vif1Regs.cycle.cl == 0 && vif1Regs.cycle.wl == 0)
++		{
++			vif1Regs.cycle.cl = 1;
++			vif1Regs.cycle.wl = 1;
++		}
++	}
++
++	u32* words = reinterpret_cast<u32*>(data);
++	int remaining = static_cast<int>(size / 4);
++	int noProgress = 0;
++	while (remaining > 0)
++	{
++		vif1ch.chcr.STR = true; // let VIF stall instead of spinning on a busy GIF/VU
++		vif1.vifstalled.enabled = false;
++		vif1.irq = 0;
++		VIF1transfer(words, remaining, true);
++		const int consumed = remaining - static_cast<int>(vif1.vifpacketsize);
++		words += consumed;
++		remaining -= consumed;
++		if (vif1.vifstalled.enabled)
++		{
++			vu1Finish(false);
++			if (vif1Regs.stat.VGW)
++				gifUnit.Execute(false, true);
++			vifExecQueue(1);
++		}
++		if (consumed > 0)
++			noProgress = 0;
++		else if (++noProgress > 64)
++		{
++			Console.WarningFmt("(GSDumpReplayer) VIF1 stuck (cmd {:02x}), dropping {} words", vif1.cmd, remaining);
++			vif1.cmd = 0;
++			vif1.pass = 0;
++			break;
++		}
++	}
++	vif1ch.chcr.STR = false;
++	vif1.vifstalled.enabled = false;
++	vif1.irq = 0;
++	// INSTANT_VU1: queued programs run at the end of the transfer; make sure nothing is left.
++	vifExecQueue(1);
++}
++
++static void GSDumpReplayerLiveStep()
++{
++	if (!s_live.stream_header_done)
++	{
++		// Same layout as a .gs file: crc, header size, header (+serial), state, registers.
++		u32 crc = 0, header_size = 0;
++		if (!LiveReadValue(&crc) || !LiveReadValue(&header_size))
++			return;
++		u32 state_size = header_size;
++		if (crc == 0xFFFFFFFFu)
++		{
++			std::vector<u8> header(header_size);
++			if (!LiveRead(header.data(), header.size()))
++				return;
++			GSDumpHeader dump_header = {};
++			std::memcpy(&dump_header, header.data(), std::min<size_t>(sizeof(dump_header), header.size()));
++			state_size = dump_header.state_size;
++		}
++		if (!LiveSkip(state_size))
++			return;
++		if (!LiveRead(PS2MEM_GS, Ps2MemSize::GSregs))
++			return;
++		s_live.stream_header_done = true;
++		Console.WriteLn("(GSDumpReplayer) Live GS stream connected.");
++	}
++
++	u8 id = 0;
++	if (!LiveReadValue(&id))
++		return;
++
++	if (id == kLivePacketVif1)
++	{
++		u32 length = 0;
++		if (!LiveReadValue(&length))
++			return;
++		s_live.buffer.resize((length + 15) & ~15u);
++		if (!LiveRead(s_live.buffer.data(), length))
++			return;
++		if (length >= 4)
++			GSDumpReplayerLiveVif1(s_live.buffer.data(), length);
++		return;
++	}
++	if (id == kLivePacketVif1Reg)
++	{
++		u32 address = 0, value = 0;
++		if (!LiveReadValue(&address) || !LiveReadValue(&value))
++			return;
++		vifWrite32<1>(address, value);
++		vif1.vifstalled.enabled = false;
++		return;
++	}
++
++	switch (static_cast<GSDumpTypes::GSType>(id))
++	{
++		case GSDumpTypes::GSType::Transfer:
++		{
++			u8 path = 0;
++			u32 length = 0;
++			if (!LiveReadValue(&path) || !LiveReadValue(&length))
++				return;
++			s_live.buffer.resize(length);
++			if (!LiveRead(s_live.buffer.data(), length))
++				return;
++			if (path >= static_cast<u8>(GSDumpTypes::GSTransferPath::Path2) &&
++				path <= static_cast<u8>(GSDumpTypes::GSTransferPath::Path1New) && length > 0)
++			{
++				// Dump files use path - 1 as the buffer index (Path2 -> GIF_PATH_1 ...). Live mode
++				// shares the GIF unit with the host's VIF1/VU1 (PATH1/PATH2), so each path must use
++				// its own buffer.
++				const GIF_PATH gif_path =
++					path == static_cast<u8>(GSDumpTypes::GSTransferPath::Path1New) ? GIF_PATH_1 :
++					path == static_cast<u8>(GSDumpTypes::GSTransferPath::Path2)    ? GIF_PATH_2 :
++					                                                                 GIF_PATH_3;
++				GSDumpReplayerSendPacketToMTGS(gif_path, s_live.buffer.data(), length);
++			}
++		}
++		break;
++
++		case GSDumpTypes::GSType::VSync:
++		{
++			u8 field = 0;
++			if (!LiveReadValue(&field))
++				return;
++			s_dump_frame_number++;
++			{
++				// Game frame rate = how often the displayed framebuffer changes (PS2X_FPS_LOG=1).
++				static const bool s_fps_log = [] { const char* e = std::getenv("PS2X_FPS_LOG"); return e && e[0] == '1'; }();
++				static u64 s_last_dispfb = 0;
++				static u32 s_flips = 0, s_vsyncs = 0;
++				const u64 dispfb = *reinterpret_cast<const u64*>(PS2MEM_GS + 0x70) ^ *reinterpret_cast<const u64*>(PS2MEM_GS + 0x90);
++				if (dispfb != s_last_dispfb)
++				{
++					s_last_dispfb = dispfb;
++					s_flips++;
++				}
++				if (s_fps_log && ++s_vsyncs >= 300)
++				{
++					Console.WriteLn("(PS2Recomp) internal fps %.1f, vsync fps %.1f, dispfb flips %u/%u",
++						PerformanceMetrics::GetInternalFPS(), PerformanceMetrics::GetFPS(), s_flips, s_vsyncs);
++					s_flips = s_vsyncs = 0;
++				}
++			}
++			// The game paces itself; no frame limiter here.
++			MTGS::PostVsyncStart(false);
++			VMManager::Internal::VSyncOnCPUThread();
++			if (VMManager::Internal::IsExecutionInterrupted())
++				GSDumpReplayerExitExecution();
++			Host::PumpMessagesOnCPUThread();
++		}
++		break;
++
++		case GSDumpTypes::GSType::ReadFIFO2:
++		{
++			u32 size = 0;
++			if (!LiveReadValue(&size))
++				return;
++			std::unique_ptr<u8[]> arr(new u8[(size + 1) * 16]);
++			MTGS::InitAndReadFIFO(arr.get(), size);
++		}
++		break;
++
++		case GSDumpTypes::GSType::Registers:
++			LiveRead(PS2MEM_GS, Ps2MemSize::GSregs);
++			break;
++
++		default:
++			Console.ErrorFmt("(GSDumpReplayer) Unknown live packet type {}, stopping.", id);
++			Host::RequestVMShutdown(false, false, false);
++			GSDumpReplayerExitExecution();
++			break;
++	}
++}
++#endif
++
+ void GSDumpReplayerCpuStep()
+ {
+ 	if (s_needs_state_loaded)
+@@ -264,6 +595,14 @@ void GSDumpReplayerCpuStep()
+ 		s_needs_state_loaded = false;
+ 	}
+ 
++#ifdef _WIN32
++	if (s_live_mode)
++	{
++		GSDumpReplayerLiveStep();
++		return;
++	}
++#endif
++
+ 	const GSDumpFile::GSData& packet = s_dump_file->GetPackets()[s_current_packet];
+ 	s_current_packet = (s_current_packet + 1) % static_cast<u32>(s_dump_file->GetPackets().size());
+ 	if (s_current_packet == 0)
+@@ -350,6 +689,10 @@ void GSDumpReplayerCpuExecute()
+ 	s_dump_running = true;
+ 	s_next_frame_time = GetCPUTicks();
+ 
++	// microVU only reloads MXCSR when the VU's FPCR differs from the EE's, assuming the EE
++	// thread already runs with the EE FPCR (round to zero, DAZ/FTZ). Live mode runs VU1 here.
++	FPControlRegister::SetCurrent(EmuConfig.Cpu.FPUFPCR);
++
+ 	while (s_dump_running)
+ 	{
+ 		GSDumpReplayerCpuStep();
+@@ -369,8 +712,91 @@ void GSDumpReplayerCpuClear(u32 addr, u32 size)
+ {
+ }
+ 
++namespace
++{
++	std::mutex s_menu_mutex;
++	std::string s_menu_title;
++	std::string s_menu_footer;
++	std::vector<std::string> s_menu_lines;
++	int s_menu_selected = -1;
++} // namespace
++
++void GSDumpReplayer::SetLiveMenu(std::string title, std::vector<std::string> lines, int selected, std::string footer)
++{
++	std::lock_guard lock(s_menu_mutex);
++	s_menu_title = std::move(title);
++	s_menu_lines = std::move(lines);
++	s_menu_selected = selected;
++	s_menu_footer = std::move(footer);
++}
++
++static void RenderLiveMenu()
++{
++	std::lock_guard lock(s_menu_mutex);
++	if (s_menu_lines.empty())
++		return;
++
++	const float scale = ImGuiManager::GetGlobalScale();
++	ImFont* const font = ImGuiManager::GetStandardFont();
++	const float font_size = ImGuiManager::GetFontSizeStandard() * 1.15f;
++	const float pad = std::ceil(18.0f * scale);
++	const float line_h = font_size + std::ceil(8.0f * scale);
++
++	// "label\tvalue" lines: values start in a common column.
++	float label_w = 0.0f, value_w = 0.0f;
++	for (const std::string& line : s_menu_lines)
++	{
++		const size_t tab = line.find('\t');
++		const std::string label = line.substr(0, tab);
++		label_w = std::max(label_w, font->CalcTextSizeA(font_size, FLT_MAX, -1.0f, label.c_str()).x);
++		if (tab != std::string::npos)
++			value_w = std::max(value_w, font->CalcTextSizeA(font_size, FLT_MAX, -1.0f, line.c_str() + tab + 1).x);
++	}
++	const float column_gap = std::ceil(28.0f * scale);
++	float width = label_w + column_gap + value_w;
++	width = std::max(width, font->CalcTextSizeA(font_size * 1.2f, FLT_MAX, -1.0f, s_menu_title.c_str()).x);
++	width = std::max(width, font->CalcTextSizeA(font_size * 0.85f, FLT_MAX, -1.0f, s_menu_footer.c_str()).x);
++	width += pad * 2.0f;
++	const float height = pad * 2.0f + line_h * (static_cast<float>(s_menu_lines.size()) + 2.5f);
++
++	const ImVec2 display = ImGui::GetIO().DisplaySize;
++	const ImVec2 p0((display.x - width) * 0.5f, (display.y - height) * 0.5f);
++	const ImVec2 p1(p0.x + width, p0.y + height);
++	ImDrawList* dl = ImGui::GetForegroundDrawList();
++	dl->AddRectFilled(p0, p1, IM_COL32(10, 10, 20, 225), 10.0f * scale);
++	dl->AddRect(p0, p1, IM_COL32(255, 160, 40, 255), 10.0f * scale, 2.0f * scale);
++
++	float y = p0.y + pad;
++	dl->AddText(font, font_size * 1.2f, ImVec2(p0.x + pad, y), IM_COL32(255, 180, 60, 255), s_menu_title.c_str());
++	y += line_h * 1.5f;
++	for (size_t i = 0; i < s_menu_lines.size(); i++)
++	{
++		const bool selected = static_cast<int>(i) == s_menu_selected;
++		if (selected)
++			dl->AddRectFilled(ImVec2(p0.x + pad * 0.5f, y - 2.0f * scale), ImVec2(p1.x - pad * 0.5f, y + font_size + 4.0f * scale),
++				IM_COL32(40, 90, 200, 220), 6.0f * scale);
++		const ImU32 color = selected ? IM_COL32(255, 255, 255, 255) : IM_COL32(200, 200, 210, 255);
++		const std::string& line = s_menu_lines[i];
++		const size_t tab = line.find('\t');
++		dl->AddText(font, font_size, ImVec2(p0.x + pad, y), color, line.c_str(), tab == std::string::npos ? nullptr : line.c_str() + tab);
++		if (tab != std::string::npos)
++			dl->AddText(font, font_size, ImVec2(p0.x + pad + label_w + column_gap, y),
++				selected ? IM_COL32(255, 200, 90, 255) : IM_COL32(230, 230, 240, 255), line.c_str() + tab + 1);
++		y += line_h;
++	}
++	dl->AddText(font, font_size * 0.85f, ImVec2(p0.x + pad, y + line_h * 0.25f), IM_COL32(160, 160, 170, 255), s_menu_footer.c_str());
++}
++
+ void GSDumpReplayer::RenderUI()
+ {
++#ifdef _WIN32
++	// Playing a recompiled game live: no dump frame/packet counters on screen, only our menu.
++	if (s_live_mode)
++	{
++		RenderLiveMenu();
++		return;
++	}
++#endif
+ 	const float scale = ImGuiManager::GetGlobalScale();
+ 	const float shadow_offset = std::ceil(1.0f * scale);
+ 	const float margin = std::ceil(GSConfig.OsdMargin * scale);
+@@ -404,3 +830,125 @@ void GSDumpReplayer::RenderUI()
+ 
+ #undef DRAW_LINE
+ }
++
++bool GSDumpReplayer::IsLive()
++{
++#ifdef _WIN32
++	return s_live_mode;
++#else
++	return false;
++#endif
++}
++
++static std::wstring s_live_ring_suffix;
++
++void GSDumpReplayer::SetLiveRingSuffix(std::string suffix)
++{
++	s_live_ring_suffix = std::wstring(suffix.begin(), suffix.end());
++}
++
++bool GSDumpReplayer::AttachLiveRing(Error* error)
++{
++#ifdef _WIN32
++	HANDLE mapping = nullptr;
++	const std::wstring mapping_name = ps2live::objectName(ps2live::kMappingName, s_live_ring_suffix);
++	// The game creates the ring before starting us; give it a moment anyway.
++	for (int attempt = 0; attempt < 100 && !mapping; attempt++)
++	{
++		mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, mapping_name.c_str());
++		if (!mapping)
++			Sleep(50);
++	}
++	if (!mapping)
++	{
++		Error::SetString(error, "PS2Recomp live GS ring not found (start the game, not this program).");
++		return false;
++	}
++	void* view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);
++	if (!view)
++	{
++		CloseHandle(mapping);
++		Error::SetString(error, "Failed to map the live GS ring.");
++		return false;
++	}
++	ps2live::RingHeader* header = static_cast<ps2live::RingHeader*>(view);
++	if (header->magic != ps2live::kMagic || header->version != ps2live::kVersion)
++	{
++		Error::SetString(error, "Live GS ring version mismatch.");
++		return false;
++	}
++	s_live.mapping = mapping;
++	s_live.header = header;
++	s_live.data = ps2live::ringData(header);
++	s_live.capacity = header->capacity;
++	s_live.data_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
++		ps2live::objectName(ps2live::kDataEventName, s_live_ring_suffix).c_str());
++	s_live.space_event = OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE,
++		ps2live::objectName(ps2live::kSpaceEventName, s_live_ring_suffix).c_str());
++	if (!s_live_ring_suffix.empty())
++	{
++		const DWORD pid = static_cast<DWORD>(std::wcstoul(s_live_ring_suffix.c_str(), nullptr, 10));
++		if (pid != 0)
++			s_live.producer_process = OpenProcess(SYNCHRONIZE, FALSE, pid);
++	}
++	header->consumerAlive = 1;
++	s_live_mode = true;
++	s_live_mode_early = true;
++	return true;
++#else
++	Error::SetString(error, "Live mode is only implemented on Windows.");
++	return false;
++#endif
++}
++
++void GSDumpReplayer::SetLivePad(u32 buttons, u32 axes)
++{
++#ifdef _WIN32
++	if (!s_live.header)
++		return;
++	s_live.header->padButtons = buttons;
++	s_live.header->padAxes = axes;
++	s_live.header->padSequence = s_live.header->padSequence + 1;
++#endif
++}
++
++void GSDumpReplayer::SetLiveMenuOpen(bool open)
++{
++#ifdef _WIN32
++	if (s_live.header)
++		s_live.header->hostMenuOpen = open ? 1u : 0u;
++#endif
++}
++
++void GSDumpReplayer::SetLiveQuit()
++{
++#ifdef _WIN32
++	if (s_live.header)
++		s_live.header->consumerQuit = 1;
++#endif
++}
++
++bool GSDumpReplayer::WriteLiveBootDump(const std::string& path, Error* error)
++{
++	auto fp = FileSystem::OpenManagedCFile(path.c_str(), "wb", error);
++	if (!fp)
++		return false;
++	static constexpr char serial[] = "SLUS-21126";
++	const u32 crc = 0xFFFFFFFFu;
++	const u32 header_size = static_cast<u32>(sizeof(GSDumpHeader) + sizeof(serial) - 1);
++	GSDumpHeader header = {};
++	header.state_version = 9;
++	header.state_size = 0;
++	header.serial_offset = sizeof(GSDumpHeader);
++	header.serial_size = sizeof(serial) - 1;
++	header.screenshot_offset = header.serial_offset + header.serial_size;
++	std::vector<u8> regs(8192, 0);
++	bool ok = std::fwrite(&crc, 4, 1, fp.get()) == 1;
++	ok = ok && std::fwrite(&header_size, 4, 1, fp.get()) == 1;
++	ok = ok && std::fwrite(&header, sizeof(header), 1, fp.get()) == 1;
++	ok = ok && std::fwrite(serial, sizeof(serial) - 1, 1, fp.get()) == 1;
++	ok = ok && std::fwrite(regs.data(), regs.size(), 1, fp.get()) == 1;
++	if (!ok)
++		Error::SetString(error, "Failed to write the live boot dump.");
++	return ok;
++}
+\ No newline at end of file
+diff --git a/pcsx2/GSDumpReplayer.h b/pcsx2/GSDumpReplayer.h
+index a60e431..1db531a 100644
+--- a/pcsx2/GSDumpReplayer.h
++++ b/pcsx2/GSDumpReplayer.h
+@@ -8,6 +8,8 @@
+ #include <string>
+ #include <vector>
+ 
++class BaseVUmicroCPU;
++
+ namespace GSDumpReplayer
+ {
+ 	bool IsReplayingDump();
+@@ -28,4 +30,22 @@ namespace GSDumpReplayer
+ 	u32 GetFrameNumber();
+ 
+ 	void RenderUI();
++
++	/// PS2Recomp live mode: instead of the dump's packets, play the GS stream a recompiled
++	/// game writes into the shared ring (Ps2LiveRing.h), as it arrives.
++	bool AttachLiveRing(Error* error);
++	/// Suffix of the ring/event names (the game's process id, "-livering <suffix>").
++	void SetLiveRingSuffix(std::string suffix);
++	bool IsLive();
++	/// VU1 implementation for the dump CPU set: microVU1 when a live game streams VIF1 data.
++	BaseVUmicroCPU* GetLiveVU1();
++	/// Live mode overlay menu (graphics options) drawn by RenderUI; empty lines hide it.
++	void SetLiveMenu(std::string title, std::vector<std::string> lines, int selected, std::string footer);
++	/// Tells the game (through the ring) that the options menu owns the pad.
++	void SetLiveMenuOpen(bool open);
++	/// Pad state published back to the game (the host window has the keyboard focus).
++	void SetLivePad(u32 buttons, u32 axes);
++	void SetLiveQuit();
++	/// Writes a minimal dump (header + registers, no packets) to boot the replayer with.
++	bool WriteLiveBootDump(const std::string& path, Error* error);
+ } // namespace GSDumpReplayer
+diff --git a/pcsx2/Gif_Unit.h b/pcsx2/Gif_Unit.h
+index 6b6fde5..3e4d712 100644
+--- a/pcsx2/Gif_Unit.h
++++ b/pcsx2/Gif_Unit.h
+@@ -21,6 +21,11 @@ extern bool Gif_HandlerAD_Debug(u8* pMem);
+ extern void Gif_AddBlankGSPacket(u32 size, GIF_PATH path);
+ extern void Gif_AddGSPacketMTVU(GS_Packet& gsPack, GIF_PATH path);
+ extern void Gif_AddCompletedGSPacket(GS_Packet& gsPack, GIF_PATH path);
++// PS2Recomp live: PATH3 data that may be a partial GIF packet (GS keeps PATH3's own tag state).
++extern void Gif_AddRawPath3GSPacket(GS_Packet& gsPack);
++// PS2Recomp: VU1 programs started by VIF1 so far (Vif_Codes.cpp), for PATH1 comparisons.
++extern u32 g_ps2recomp_vu1_program_count;
++extern void Ps2RecompRecordPath1(const u8* data, u32 size);
+ extern void Gif_ParsePacket(u8* data, u32 size, GIF_PATH path);
+ extern void Gif_ParsePacket(GS_Packet& gsPack, GIF_PATH path);
+ 
+@@ -668,6 +673,7 @@ struct Gif_Unit
+ 		}
+ 		if (tranType == GIF_TRANS_XGKICK)
+ 		{
++			Ps2RecompRecordPath1(pMem, size);
+ 			if (!CanDoPath1())
+ 			{
+ 				stat.P1Q = 1;
+diff --git a/pcsx2/MTGS.cpp b/pcsx2/MTGS.cpp
+index 98b453c..c2e9946 100644
+--- a/pcsx2/MTGS.cpp
++++ b/pcsx2/MTGS.cpp
+@@ -9,13 +9,19 @@
+ #include "IconsFontAwesome.h"
+ #include "VMManager.h"
+ 
++#include "common/CrashHandler.h"
+ #include "common/FPControl.h"
+ #include "common/ScopedGuard.h"
+ #include "common/StringUtil.h"
+ #include "common/WrappedMemCopy.h"
+ 
++#include "fmt/format.h"
++
++#include <cstdio>
++#include <cstdlib>
+ #include <list>
+ #include <mutex>
++#include <string>
+ #include <thread>
+ 
+ // Uncomment this to enable profiling of the GS RingBufferCopy function.
+@@ -451,12 +457,70 @@ void MTGS::MainLoop()
+ 					Gif_Path& path = gifUnit.gifPath[tag.data[2]];
+ 					u32 offset = tag.data[0];
+ 					u32 size = tag.data[1];
++					CrashHandler::g_note = {static_cast<unsigned>(tag.command), offset, size, static_cast<unsigned>(tag.data[2]), path.buffer, path.buffSize};
++					if (static std::FILE* s_trace = [] {
++							const char* e = std::getenv("PS2X_HOST_TRACE_GS");
++							return (e && e[0]) ? std::fopen(e, "w") : nullptr;
++						}();
++						s_trace && offset != ~0u)
++					{
++						static u32 s_traced = 0;
++						if (s_traced++ < 20000)
++						{
++							u64 hash = 1469598103934665603ull;
++							for (u32 i = 0; i < size; i++)
++								hash = (hash ^ path.buffer[offset + i]) * 1099511628211ull;
++							std::fprintf(s_trace, "%u %u %016llx\n", static_cast<unsigned>(tag.data[2]) + 1, size, static_cast<unsigned long long>(hash));
++							if ((s_traced & 63) == 0)
++								std::fflush(s_trace);
++						}
++					}
++					if (static const char* dump_size = std::getenv("PS2X_HOST_DUMP_PACKET_SIZE"); dump_size && offset != ~0u)
++					{
++						// Ring of the last packets; written out (oldest first) when a packet of the
++						// requested size shows up.
++						struct Recent { u32 path; std::vector<u8> data; };
++						static std::vector<Recent> s_recent(24);
++						static size_t s_recent_next = 0;
++						static int s_dumped = 0;
++						Recent& slot = s_recent[s_recent_next++ % s_recent.size()];
++						slot.path = tag.data[2] + 1;
++						slot.data.assign(&path.buffer[offset], &path.buffer[offset] + size);
++						if (s_dumped < 1 && size == static_cast<u32>(std::strtoul(dump_size, nullptr, 0)))
++						{
++							s_dumped++;
++							for (size_t i = 0; i < s_recent.size(); i++)
++							{
++								const Recent& r = s_recent[(s_recent_next + i) % s_recent.size()];
++								if (r.data.empty())
++									continue;
++								const std::string name = fmt::format("C:\\NBAStreetRecomp\\logs\\gspacket_{:02}_path{}.bin", i, r.path);
++								if (std::FILE* fp = std::fopen(name.c_str(), "wb"))
++								{
++									std::fwrite(r.data.data(), 1, r.data.size(), fp);
++									std::fclose(fp);
++								}
++							}
++						}
++					}
+ 					if (offset != ~0u)
+ 						GSgifTransfer((u8*)&path.buffer[offset], size / 16);
+ 					path.readAmount.fetch_sub(size, std::memory_order_acq_rel);
+ 					break;
+ 				}
+ 
++				case Command::GSPacketPath3:
++				{
++					Gif_Path& path = gifUnit.gifPath[GIF_PATH_3];
++					u32 offset = tag.data[0];
++					u32 size = tag.data[1];
++					CrashHandler::g_note = {static_cast<unsigned>(tag.command), offset, size, 2u, path.buffer, path.buffSize};
++					if (offset != ~0u)
++						GSgifTransfer3((u8*)&path.buffer[offset], size / 16);
++					path.readAmount.fetch_sub(size, std::memory_order_acq_rel);
++					break;
++				}
++
+ 				case Command::MTVUGSPacket:
+ 				{
+ 					MTVU_LOG("MTGS - Waiting on semaXGkick!");
+@@ -1072,6 +1136,12 @@ void Gif_AddCompletedGSPacket(GS_Packet& gsPack, GIF_PATH path)
+ 	}
+ }
+ 
++void Gif_AddRawPath3GSPacket(GS_Packet& gsPack)
++{
++	gifUnit.gifPath[GIF_PATH_3].readAmount.fetch_add(gsPack.size, std::memory_order_acq_rel);
++	MTGS::SendSimpleGSPacket(MTGS::Command::GSPacketPath3, gsPack.offset, gsPack.size, GIF_PATH_3);
++}
++
+ void Gif_AddBlankGSPacket(u32 size, GIF_PATH path)
+ {
+ 	//DevCon.WriteLn("Adding Blank Gif Packet [size=%x]", size);
+diff --git a/pcsx2/MTGS.h b/pcsx2/MTGS.h
+index 19c125a..5610226 100644
+--- a/pcsx2/MTGS.h
++++ b/pcsx2/MTGS.h
+@@ -33,6 +33,9 @@ namespace MTGS
+ 		MTVUGSPacket,
+ 		InitAndReadFIFO,
+ 		AsyncCall,
++		// PS2Recomp live: raw PATH3 chunks (possibly partial GIF packets) parsed with the GS's
++		// own PATH3 tag state, so PATH1/PATH2 packets from the GIF unit may come in between.
++		GSPacketPath3,
+ 	};
+ 
+ 	struct FreezeData
+diff --git a/pcsx2/Ps2LiveRing.h b/pcsx2/Ps2LiveRing.h
+new file mode 100644
+index 0000000..fa342ae
+--- /dev/null
++++ b/pcsx2/Ps2LiveRing.h
+@@ -0,0 +1,50 @@
++#pragma once
++
++// Shared-memory ring between the PS2Recomp runtime (producer) and the PCSX2-based GS host
++// (consumer, "pcsx2-gsrunner -live"). The byte stream is exactly a PCSX2 GS dump (.gs): the
++// file header, then Transfer / Registers / VSync / ReadFIFO2 packets. The consumer also
++// publishes the host window's keyboard state back, since that window has the focus.
++// Keep this file identical in both source trees.
++
++#include <cstdint>
++#include <string>
++
++namespace ps2live
++{
++    constexpr uint32_t kMagic = 0x50324C52u; // "RL2P"
++    constexpr uint32_t kVersion = 1u;
++    constexpr uint64_t kDefaultCapacity = 256ull << 20;
++
++    constexpr const wchar_t *kMappingName = L"Local\\PS2RecompGsLiveRing";
++    constexpr const wchar_t *kDataEventName = L"Local\\PS2RecompGsLiveData";
++    constexpr const wchar_t *kSpaceEventName = L"Local\\PS2RecompGsLiveSpace";
++
++    // Pad buttons, active high, in the libpad bit order (bit 0 = SELECT ... bit 15 = SQUARE).
++    struct alignas(64) RingHeader
++    {
++        uint32_t magic;
++        uint32_t version;
++        uint64_t capacity; // bytes of the data area after the header
++        volatile int64_t writePos; // monotonic byte counters
++        alignas(64) volatile int64_t readPos;
++        alignas(64) volatile uint32_t producerAlive;
++        volatile uint32_t consumerAlive;
++        volatile uint32_t consumerQuit; // window closed: the game should exit
++        volatile uint32_t padButtons;
++        volatile uint32_t padAxes; // lx | ly << 8 | rx << 16 | ry << 24 (0x80 = centre)
++        volatile uint32_t padSequence;
++        volatile uint32_t hostMenuOpen; // the host's options menu is open: the game gets no pad input
++    };
++
++    // Object names for one game instance: base name + "_" + suffix (the game's process id, passed
++    // to the host as "-livering <suffix>"), so several instances never share a ring.
++    inline std::wstring objectName(const wchar_t *base, const std::wstring &suffix)
++    {
++        return suffix.empty() ? std::wstring(base) : std::wstring(base) + L"_" + suffix;
++    }
++
++    inline uint8_t *ringData(RingHeader *header)
++    {
++        return reinterpret_cast<uint8_t *>(header) + sizeof(RingHeader);
++    }
++}
+diff --git a/pcsx2/VMManager.cpp b/pcsx2/VMManager.cpp
+index 23c8b44..39227af 100644
+--- a/pcsx2/VMManager.cpp
++++ b/pcsx2/VMManager.cpp
+@@ -2706,7 +2706,7 @@ void VMManager::UpdateCPUImplementations()
+ 		Cpu = &GSDumpReplayerCpu;
+ 		psxCpu = &psxInt;
+ 		CpuVU0 = &CpuIntVU0;
+-		CpuVU1 = &CpuIntVU1;
++		CpuVU1 = GSDumpReplayer::IsLive() ? GSDumpReplayer::GetLiveVU1() : &CpuIntVU1;
+ 		return;
+ 	}
+ 
+diff --git a/pcsx2/Vif_Codes.cpp b/pcsx2/Vif_Codes.cpp
+index 6f71cb3..1e08d0e 100644
+--- a/pcsx2/Vif_Codes.cpp
++++ b/pcsx2/Vif_Codes.cpp
+@@ -9,6 +9,11 @@
+ #include "Vif_Dma.h"
+ #include "Vif_Dynarec.h"
+ 
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <vector>
++
+ #define vifOp(vifCodeName) _vifT int vifCodeName(int pass, const u32* data)
+ #define pass1 if (pass == 0)
+ #define pass2 if (pass == 1)
+@@ -25,6 +30,36 @@ vifOp(vifCode_Null);
+ // Vif0/Vif1 Misc Functions
+ //------------------------------------------------------------------
+ 
++u32 g_ps2recomp_vu1_program_count = 0;
++
++// PS2X_CMP_PATH1=from,to: XGKICK data of those VU1 programs -> logs\host_path1.bin.
++void Ps2RecompRecordPath1(const u8* data, u32 size)
++{
++	static u32 s_from = 0, s_to = 0;
++	static std::FILE* s_file = [] {
++		if (const char* env = std::getenv("PS2X_CMP_PATH1"))
++		{
++			char* end = nullptr;
++			s_from = static_cast<u32>(std::strtoul(env, &end, 10));
++			if (end && *end == ',')
++				s_to = static_cast<u32>(std::strtoul(end + 1, nullptr, 10));
++		}
++		return s_to ? std::fopen("C:\\NBAStreetRecomp\\logs\\host_path1.bin", "wb") : nullptr;
++	}();
++	static int s_logs = 0;
++	if (s_logs < 5)
++	{
++		s_logs++;
++		Console.WriteLn("(PS2Recomp) XGKICK size=%u program=%u file=%p", size, g_ps2recomp_vu1_program_count, s_file);
++	}
++	if (!s_file || g_ps2recomp_vu1_program_count > s_to)
++		return;
++	const u32 header[2] = {g_ps2recomp_vu1_program_count, size};
++	std::fwrite(header, 1, sizeof(header), s_file);
++	std::fwrite(data, 1, size, s_file);
++	std::fflush(s_file);
++}
++
+ __ri void vifExecQueue(int idx)
+ {
+ 	if (!GetVifX.queued_program || (VU0.VI[REG_VPU_STAT].UL & 1 << (idx * 8)))
+@@ -80,6 +115,42 @@ static __fi void vuExecMicro(int idx, u32 addr, bool requires_wait)
+ 		return;
+ 	}
+ 
++	if (idx)
++	{
++		// PS2Recomp: PS2X_CMP_MSCAL=n1,n2,... writes VU1 data memory at the n-th program start
++		// to logs\host_vu1_<n>.bin (compare with the game's local_vu1_<n>.bin).
++		static std::vector<u32> s_targets = [] {
++			std::vector<u32> list;
++			if (const char* env = std::getenv("PS2X_CMP_MSCAL"))
++			{
++				char* p = const_cast<char*>(env);
++				while (*p)
++				{
++					list.push_back(static_cast<u32>(std::strtoul(p, &p, 10)));
++					while (*p == ',')
++						p++;
++					if (*p && (*p < '0' || *p > '9'))
++						break;
++				}
++			}
++			return list;
++		}();
++		u32& s_count = g_ps2recomp_vu1_program_count;
++		s_count++;
++		if (s_count <= 3 || (s_count % 5000) == 0)
++			Console.WriteLn("(PS2Recomp) VU1 program #%u pc=0x%X", s_count, addr);
++		if (!s_targets.empty() && std::find(s_targets.begin(), s_targets.end(), s_count) != s_targets.end())
++		{
++			char name[128];
++			std::snprintf(name, sizeof(name), "C:\\NBAStreetRecomp\\logs\\host_vu1_%u.bin", s_count);
++			if (std::FILE* f = std::fopen(name, "wb"))
++			{
++				std::fwrite(VU1.Mem, 1, 0x4000, f);
++				std::fclose(f);
++			}
++		}
++	}
++
+ 	if (vifRegs.itops > (idx ? 0x3ffu : 0xffu))
+ 	{
+ 		Console.WriteLn("VIF%d ITOP overrun! %x", idx, vifRegs.itops);
+diff --git a/pcsx2/Vif_HashBucket.h b/pcsx2/Vif_HashBucket.h
+index 228247b..a9d14d6 100644
+--- a/pcsx2/Vif_HashBucket.h
++++ b/pcsx2/Vif_HashBucket.h
+@@ -65,12 +65,14 @@ public:
+ 
+ 		while (true)
+ 		{
+-			if (chainpos->key0 == dataPtr.key0 && chainpos->key1 == dataPtr.key1)
+-				return chainpos;
+-
++			// The empty cell ends the chain; test it first: an unpack whose keys are all zero
++			// (CYCLE=0, no mask, mode 0) would otherwise "match" it and run code at address 0.
+ 			if (chainpos->startPtr == 0)
+ 				return nullptr;
+ 
++			if (chainpos->key0 == dataPtr.key0 && chainpos->key1 == dataPtr.key1)
++				return chainpos;
++
+ 			chainpos++;
+ 		}
+ 	}

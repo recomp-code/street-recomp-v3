@@ -1,0 +1,18 @@
+# Nunca subir nada del juego: ISO, ELF, archivos extraidos, codigo generado, partidas, texturas.
+*.iso
+*.ISO
+SLUS_*
+game/iso/
+game/output/
+mc0/
+mc1/
+texturas_hd/
+*.png
+# Compilaciones y logs
+out/
+build/
+logs/
+*.log
+*.pdb
+*.exe
+*.dll
