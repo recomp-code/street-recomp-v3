@@ -119,10 +119,10 @@ index 68fec81..f9e1479 100644
          class Impl;
 diff --git a/ps2xIOP/src/emulator/core/iop_dev9.cpp b/ps2xIOP/src/emulator/core/iop_dev9.cpp
 new file mode 100644
-index 0000000..1c704bb
+index 0000000..e383599
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/core/iop_dev9.cpp
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,309 @@
 +#include "iop_dev9.h"
 +
 +#include "DEV9/DEV9.h"
@@ -136,6 +136,13 @@ index 0000000..1c704bb
 +#include <mutex>
 +#include <string>
 +#include <string_view>
++#ifdef _WIN32
++#include <winsock2.h>
++#include <ws2tcpip.h>
++#else
++#include <arpa/inet.h>
++#include <netdb.h>
++#endif
 +
 +// ---- Symbols the PCSX2 DEV9 code expects from the rest of PCSX2 -------------------------------
 +
@@ -172,6 +179,37 @@ index 0000000..1c704bb
 +            out[i] = static_cast<u8>(parts[i]);
 +        }
 +        return true;
++    }
++
++    // PS2X_NET_SERVER may be a host name (e.g. a domain for a public server): the EA host
++    // overrides need an IPv4 address, so resolve it once with the PC's own resolver.
++    std::string resolveServer(const char *server)
++    {
++        u8 probe[4];
++        if (parseIp(server, probe))
++            return server;
++#ifdef _WIN32
++        WSADATA wsa;
++        WSAStartup(MAKEWORD(2, 2), &wsa);
++#endif
++        addrinfo hints{};
++        hints.ai_family = AF_INET;
++        hints.ai_socktype = SOCK_STREAM;
++        addrinfo *result = nullptr;
++        std::string ip;
++        if (getaddrinfo(server, nullptr, &hints, &result) == 0 && result)
++        {
++            char text[INET_ADDRSTRLEN] = {};
++            inet_ntop(AF_INET, &reinterpret_cast<sockaddr_in *>(result->ai_addr)->sin_addr, text, sizeof(text));
++            ip = text;
++            freeaddrinfo(result);
++            std::fprintf(stderr, "[dev9] server %s -> %s\n", server, ip.c_str());
++        }
++        else
++        {
++            std::fprintf(stderr, "[dev9] cannot resolve server %s (no internet / DNS?)\n", server);
++        }
++        return ip;
 +    }
 +
 +    void addHost(std::string_view name, std::string_view ip)
@@ -211,9 +249,11 @@ index 0000000..1c704bb
 +        if (const char *server = std::getenv("PS2X_NET_SERVER"); server && *server)
 +        {
 +            // Hosts the game contacts for EA Online (from the ELF's strings).
-+            for (const char *name : {"ps2nbastreet05.ea.com", "peach.pogocorp.com", "plum.pogocorp.com",
-+                                     "easo.ea.com", "demangler.ea.com"})
-+                addHost(name, server);
++            const std::string ip = resolveServer(server);
++            if (!ip.empty())
++                for (const char *name : {"ps2nbastreet05.ea.com", "peach.pogocorp.com", "plum.pogocorp.com",
++                                         "easo.ea.com", "demangler.ea.com"})
++                    addHost(name, ip);
 +        }
 +        if (const char *hosts = std::getenv("PS2X_NET_HOSTS"); hosts && *hosts)
 +        {
@@ -23106,13 +23146,10 @@ index 37b6a4d..9fb93fc 100644
      static constexpr uint32_t D_STAT = 0x1000E010u;
      static constexpr uint32_t D_CTRL = 0x1000E000u;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..7e88762 100644
+index 45cb9d2..e7f6296 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -1,9 +1,14 @@
--#include "ps2_runtime.h"
-+﻿#include "ps2_runtime.h"
- #include "ps2_log.h"
+@@ -3,7 +3,12 @@
  #include "ps2_stubs.h"
  #include "ps2_syscalls.h"
  #include "game_overrides.h"
@@ -23125,7 +23162,20 @@ index 45cb9d2..7e88762 100644
  #include "runtime/gs/gs_frontend.h"
  #include "runtime/ee_scheduler.h"
  #include "ThreadNaming.h"
-@@ -26,6 +31,13 @@
+@@ -17,6 +22,12 @@
+ #include <iostream>
+ #include <stdexcept>
+ #include <fstream>
++#if defined(_WIN32)
++// winmm timer resolution (declared here: <windows.h> clashes with raylib in this file).
++extern "C" __declspec(dllimport) unsigned int __stdcall timeBeginPeriod(unsigned int uPeriod);
++extern "C" __declspec(dllimport) unsigned int __stdcall timeEndPeriod(unsigned int uPeriod);
++#pragma comment(lib, "winmm.lib")
++#endif
+ #include <algorithm>
+ #include <array>
+ #include <cstring>
+@@ -26,6 +37,13 @@
  #include <thread>
  #include <unordered_map>
  #include <sstream>
@@ -23139,7 +23189,7 @@ index 45cb9d2..7e88762 100644
  
  namespace ps2_stubs
  {
-@@ -37,6 +49,99 @@ namespace ps2_stubs
+@@ -37,6 +55,99 @@ namespace ps2_stubs
  #define EM_MIPS 8            // MIPS architecture
  #define PT_LOAD 1            // Loadable segment
  
@@ -23239,7 +23289,7 @@ index 45cb9d2..7e88762 100644
  static constexpr int FB_WIDTH = 640;
  static constexpr int FB_HEIGHT = 512;
  static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
-@@ -151,8 +256,18 @@ namespace
+@@ -151,8 +262,18 @@ namespace
          return true;
      }
  
@@ -23258,7 +23308,7 @@ index 45cb9d2..7e88762 100644
          DispatchHistory &h = g_dispatchHistory;
          h.pcs[h.next] = pc;
          h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
-@@ -162,6 +277,27 @@ namespace
+@@ -162,6 +283,27 @@ namespace
          }
      }
  
@@ -23286,7 +23336,7 @@ index 45cb9d2..7e88762 100644
      std::string formatDispatchHistory()
      {
          const DispatchHistory &h = g_dispatchHistory;
-@@ -477,10 +613,36 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -477,10 +619,36 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      s_hasUploadedFrame = true;
  }
  
@@ -23323,7 +23373,7 @@ index 45cb9d2..7e88762 100644
  
      m_eeScheduler = std::make_unique<EeScheduler>(*this);
  
-@@ -526,6 +688,7 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
+@@ -526,6 +694,7 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
  
  PS2Runtime::~PS2Runtime()
  {
@@ -23331,7 +23381,29 @@ index 45cb9d2..7e88762 100644
      try
      {
          requestStop();
-@@ -731,7 +894,10 @@ bool PS2Runtime::initialize(const char *title)
+@@ -715,6 +884,21 @@ bool PS2Runtime::syncCoreSubsystems()
+ 
+ bool PS2Runtime::initialize(const char *title)
+ {
++#if defined(_WIN32)
++    // 1 ms timer resolution for the whole process: the EE scheduler sleeps until the next vblank
++    // with condition_variable::wait_until, which on the default 15.6 ms Windows tick woke up late
++    // now and then -> the game missed its frame (26-28 ms hitches, 56-58 internal fps).
++    static const bool s_timerResolution = []
++    {
++        const char *off = std::getenv("PS2X_TIMER_RES");
++        if (off && *off == '0')
++            return false;
++        timeBeginPeriod(1);
++        std::atexit([] { timeEndPeriod(1); });
++        return true;
++    }();
++    (void)s_timerResolution;
++#endif
+     try
+     {
+         if (!m_memory.initialize())
+@@ -731,7 +915,10 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -23343,7 +23415,7 @@ index 45cb9d2..7e88762 100644
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
          InitAudioDevice();
          m_audioBackend.setAudioReady(IsAudioDeviceReady());
-@@ -1064,6 +1230,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+@@ -1064,6 +1251,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
          paths.cdRoot = paths.elfDirectory;
          paths.mcRoot = paths.elfDirectory / "mc0";
      }
@@ -23355,7 +23427,7 @@ index 45cb9d2..7e88762 100644
  
      setIoPaths(paths);
  }
-@@ -1342,6 +1513,393 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+@@ -1342,6 +1534,393 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
      }
  }
  
@@ -23749,7 +23821,7 @@ index 45cb9d2..7e88762 100644
  bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                       R5900Context *ctx,
                                       uint32_t targetPc,
-@@ -1352,6 +1910,62 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1352,6 +1931,62 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  {
      ctx->pc = targetPc;
      const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
@@ -23812,7 +23884,7 @@ index 45cb9d2..7e88762 100644
  
      // Every inter-function transfer is also a deterministic EE safe point.
      // Backward edges inside generated functions use eeCheckpointDue(), while
-@@ -1363,7 +1977,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1363,7 +1998,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      if (!isCall)
      {
@@ -23821,7 +23893,7 @@ index 45cb9d2..7e88762 100644
          {
              reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
          }
-@@ -1372,6 +1986,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1372,6 +2007,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -23836,7 +23908,7 @@ index 45cb9d2..7e88762 100644
      if (!hasFunction(targetPc))
      {
          reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
-@@ -1396,6 +2018,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1396,6 +2039,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      RecompiledFunction targetFn = lookupFunction(targetPc);
      const uint32_t entryPc = ctx->pc;
@@ -23852,7 +23924,7 @@ index 45cb9d2..7e88762 100644
      targetFn(rdram, ctx, this);
  
      if (isStopRequested() || ctx->pc == 0u)
-@@ -1403,11 +2034,25 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,11 +2055,25 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -23879,7 +23951,7 @@ index 45cb9d2..7e88762 100644
      return ctx->pc == fallthroughPc;
  }
  
-@@ -1489,6 +2134,17 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+@@ -1489,6 +2155,17 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
      {
          ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
      }
@@ -23897,7 +23969,7 @@ index 45cb9d2..7e88762 100644
  }
  
  void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
-@@ -2339,6 +2995,127 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
+@@ -2339,6 +3016,127 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
      raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
  }
  
@@ -24025,7 +24097,7 @@ index 45cb9d2..7e88762 100644
  void PS2Runtime::run()
  {
      m_stopRequested.store(false, std::memory_order_relaxed);
-@@ -2367,6 +3144,7 @@ void PS2Runtime::run()
+@@ -2367,6 +3165,7 @@ void PS2Runtime::run()
      std::thread gameThread([&]()
                             {
          ThreadNaming::SetCurrentThreadName("GameThread");
@@ -24033,7 +24105,7 @@ index 45cb9d2..7e88762 100644
          try
          {
              m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
-@@ -2385,6 +3163,9 @@ void PS2Runtime::run()
+@@ -2385,6 +3184,9 @@ void PS2Runtime::run()
          }
          gameThreadFinished.store(true, std::memory_order_release); });
  
@@ -24043,7 +24115,7 @@ index 45cb9d2..7e88762 100644
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
-@@ -2392,6 +3173,8 @@ void PS2Runtime::run()
+@@ -2392,6 +3194,8 @@ void PS2Runtime::run()
              tick++;
              if ((tick % 120) == 0)
              {
@@ -24052,7 +24124,7 @@ index 45cb9d2..7e88762 100644
                  uint64_t curDma = m_memory.dmaStartCount();
                  uint64_t curGif = m_memory.gifCopyCount();
                  uint64_t curGs = m_memory.gsWriteCount();
-@@ -2418,8 +3201,98 @@ void PS2Runtime::run()
+@@ -2418,8 +3222,98 @@ void PS2Runtime::run()
                                                 << " vif=" << curVif
                                                 << std::endl);
  
@@ -24151,7 +24223,7 @@ index 45cb9d2..7e88762 100644
          uint32_t presentWidth = FB_WIDTH;
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
          UploadFrame(frameTex, this, presentWidth, presentHeight);
-@@ -2459,6 +3332,7 @@ void PS2Runtime::run()
+@@ -2459,6 +3353,7 @@ void PS2Runtime::run()
      {
          gameThread.join();
      }

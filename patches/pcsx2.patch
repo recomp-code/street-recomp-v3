@@ -934,7 +934,7 @@ index 440e279..a5108c3 100644
  		{
  			if ((m_TEX0.PSM & 0xf) != PSMCT24 && m_dirty[i].rgba.c.a && bpp >= 16)
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
-index 9c31bb8..397b342 100644
+index 9c31bb8..458bad5 100644
 --- a/pcsx2/GSDumpReplayer.cpp
 +++ b/pcsx2/GSDumpReplayer.cpp
 @@ -1,19 +1,22 @@
@@ -985,7 +985,7 @@ index 9c31bb8..397b342 100644
  
  static void GSDumpReplayerCpuReserve();
  static void GSDumpReplayerCpuShutdown();
-@@ -60,6 +74,103 @@ R5900cpu GSDumpReplayerCpu = {
+@@ -60,6 +74,109 @@ R5900cpu GSDumpReplayerCpu = {
  static InterpVU0 gsDumpVU0;
  static InterpVU1 gsDumpVU1;
  
@@ -1028,6 +1028,8 @@ index 9c31bb8..397b342 100644
 +	};
 +	LiveSource s_live;
 +	bool s_live_mode = false;
++	// Time this frame spent waiting for the game (empty ring), for the hitch log (PS2X_FPS_LOG=1).
++	u64 s_live_wait_ticks = 0;
 +
 +	// Blocks until size bytes of the stream are available; false when playback stops.
 +	bool LiveRead(void* dst, size_t size)
@@ -1049,7 +1051,11 @@ index 9c31bb8..397b342 100644
 +					Host::RequestVMShutdown(false, false, false);
 +					return false;
 +				}
++				LARGE_INTEGER waitStart, waitEnd;
++				QueryPerformanceCounter(&waitStart);
 +				WaitForSingleObject(s_live.data_event, 10);
++				QueryPerformanceCounter(&waitEnd);
++				s_live_wait_ticks += static_cast<u64>(waitEnd.QuadPart - waitStart.QuadPart);
 +				continue;
 +			}
 +			MemoryBarrier();
@@ -1089,7 +1095,7 @@ index 9c31bb8..397b342 100644
  bool GSDumpReplayer::IsReplayingDump()
  {
  	return static_cast<bool>(s_dump_file);
-@@ -106,7 +217,7 @@ bool GSDumpReplayer::Initialize(const char* filename, Error* error)
+@@ -106,7 +223,7 @@ bool GSDumpReplayer::Initialize(const char* filename, Error* error)
  	Cpu = &GSDumpReplayerCpu;
  	psxCpu = &psxInt;
  	CpuVU0 = &gsDumpVU0;
@@ -1098,7 +1104,7 @@ index 9c31bb8..397b342 100644
  
  	// loop infinitely by default
  	s_dump_loop_count = -1;
-@@ -204,6 +315,10 @@ static void GSDumpReplayerLoadInitialState()
+@@ -204,6 +321,10 @@ static void GSDumpReplayerLoadInitialState()
  	std::memcpy(PS2MEM_GS, s_dump_file->GetRegsData().data(),
  		std::min(Ps2MemSize::GSregs, static_cast<u32>(s_dump_file->GetRegsData().size())));
  
@@ -1109,7 +1115,7 @@ index 9c31bb8..397b342 100644
  	// load GS state
  	freezeData fd = {static_cast<int>(s_dump_file->GetStateData().size()),
  		const_cast<u8*>(s_dump_file->GetStateData().data())};
-@@ -219,6 +334,17 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
+@@ -219,6 +340,17 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
  
  	const u32 truncated_length = static_cast<u32>(length);
  
@@ -1127,7 +1133,7 @@ index 9c31bb8..397b342 100644
  	Gif_Path& gifPath = gifUnit.gifPath[path];
  	gifPath.CopyGSPacketData(const_cast<u8*>(data), truncated_length);
  
-@@ -226,6 +352,16 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
+@@ -226,6 +358,16 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
  	gsPack.offset = gifPath.curOffset;
  	gsPack.size = truncated_length;
  	gifPath.curOffset += length;
@@ -1144,7 +1150,7 @@ index 9c31bb8..397b342 100644
  	Gif_AddCompletedGSPacket(gsPack, path);
  }
  
-@@ -256,6 +392,201 @@ static void GSDumpReplayerFrameLimit()
+@@ -256,6 +398,236 @@ static void GSDumpReplayerFrameLimit()
  	s_next_frame_time = std::max(now, s_next_frame_time + s_frame_ticks);
  }
  
@@ -1304,11 +1310,46 @@ index 9c31bb8..397b342 100644
 +					s_last_dispfb = dispfb;
 +					s_flips++;
 +				}
-+				if (s_fps_log && ++s_vsyncs >= 300)
++				if (s_fps_log)
 +				{
-+					Console.WriteLn("(PS2Recomp) internal fps %.1f, vsync fps %.1f, dispfb flips %u/%u",
-+						PerformanceMetrics::GetInternalFPS(), PerformanceMetrics::GetFPS(), s_flips, s_vsyncs);
-+					s_flips = s_vsyncs = 0;
++					// Hitches: wall time between vsync packets and how much of it the host spent
++					// waiting for the game (high wait = the game/EE is late; low wait = the host
++					// itself was busy: GPU, shader compilation, texture loads).
++					static LARGE_INTEGER s_freq{}, s_last{};
++					static double s_max_ms = 0, s_max_wait_ms = 0, s_busy_ms = 0;
++					static u32 s_hitches = 0;
++					LARGE_INTEGER now;
++					QueryPerformanceCounter(&now);
++					if (!s_freq.QuadPart)
++						QueryPerformanceFrequency(&s_freq);
++					if (s_last.QuadPart)
++					{
++						const double ms = 1000.0 * static_cast<double>(now.QuadPart - s_last.QuadPart) / static_cast<double>(s_freq.QuadPart);
++						const double wait_ms = 1000.0 * static_cast<double>(s_live_wait_ticks) / static_cast<double>(s_freq.QuadPart);
++						s_busy_ms += ms - wait_ms;
++						if (ms > s_max_ms)
++						{
++							s_max_ms = ms;
++							s_max_wait_ms = wait_ms;
++						}
++						if (ms > 25.0)
++						{
++							s_hitches++;
++							static u32 s_hitch_logs = 0;
++							if (s_hitch_logs++ < 200)
++								Console.WriteLn("(PS2Recomp) hitch %.1f ms (host waited for the game %.1f ms, host busy %.1f ms)", ms, wait_ms, ms - wait_ms);
++						}
++					}
++					s_last = now;
++					s_live_wait_ticks = 0;
++					if (++s_vsyncs >= 60)
++					{
++						Console.WriteLn("(PS2Recomp) internal fps %.1f, vsync fps %.1f, flips %u/%u, hitches>25ms %u, worst %.1f ms (wait %.1f), host busy %.0f%%",
++							PerformanceMetrics::GetInternalFPS(), PerformanceMetrics::GetFPS(), s_flips, s_vsyncs, s_hitches,
++							s_max_ms, s_max_wait_ms, 100.0 * s_busy_ms / (1000.0 * s_vsyncs / 60.0));
++						s_flips = s_vsyncs = s_hitches = 0;
++						s_max_ms = s_max_wait_ms = s_busy_ms = 0;
++					}
 +				}
 +			}
 +			// The game paces itself; no frame limiter here.
@@ -1346,7 +1387,7 @@ index 9c31bb8..397b342 100644
  void GSDumpReplayerCpuStep()
  {
  	if (s_needs_state_loaded)
-@@ -264,6 +595,14 @@ void GSDumpReplayerCpuStep()
+@@ -264,6 +636,14 @@ void GSDumpReplayerCpuStep()
  		s_needs_state_loaded = false;
  	}
  
@@ -1361,7 +1402,7 @@ index 9c31bb8..397b342 100644
  	const GSDumpFile::GSData& packet = s_dump_file->GetPackets()[s_current_packet];
  	s_current_packet = (s_current_packet + 1) % static_cast<u32>(s_dump_file->GetPackets().size());
  	if (s_current_packet == 0)
-@@ -350,6 +689,10 @@ void GSDumpReplayerCpuExecute()
+@@ -350,6 +730,10 @@ void GSDumpReplayerCpuExecute()
  	s_dump_running = true;
  	s_next_frame_time = GetCPUTicks();
  
@@ -1372,7 +1413,7 @@ index 9c31bb8..397b342 100644
  	while (s_dump_running)
  	{
  		GSDumpReplayerCpuStep();
-@@ -369,8 +712,91 @@ void GSDumpReplayerCpuClear(u32 addr, u32 size)
+@@ -369,8 +753,91 @@ void GSDumpReplayerCpuClear(u32 addr, u32 size)
  {
  }
  
@@ -1464,7 +1505,7 @@ index 9c31bb8..397b342 100644
  	const float scale = ImGuiManager::GetGlobalScale();
  	const float shadow_offset = std::ceil(1.0f * scale);
  	const float margin = std::ceil(GSConfig.OsdMargin * scale);
-@@ -404,3 +830,125 @@ void GSDumpReplayer::RenderUI()
+@@ -404,3 +871,125 @@ void GSDumpReplayer::RenderUI()
  
  #undef DRAW_LINE
  }

@@ -22,7 +22,24 @@ Contenido:
 | `docs/PORTING_NOTES.md` | Notas técnicas: todos los bugs encontrados y cómo se arreglaron |
 | `Jugar.cmd` | Lanzador |
 
-## Requisitos
+## Para jugar (lo fácil)
+
+1. Descarga el zip de la última versión en **Releases** y descomprímelo donde quieras.
+2. Abre **`Launcher.cmd`**, elige tu ISO de NBA Street V3 (NTSC-U, SLUS-21126) y pulsa **Preparar juego**.
+   La primera vez instala las herramientas de compilación (Visual Studio Build Tools, CMake, Git)
+   y compila el juego en tu PC: descarga ~6 GB y puede tardar 1-2 horas. Solo se hace una vez.
+3. Pulsa **JUGAR**. Desde el launcher eliges resolución, renderizador, pantalla completa, texturas HD
+   y el modo **online** (activado por defecto contra el servidor de la comunidad).
+
+¿Por qué hay que compilar? El ejecutable final contiene el código del juego traducido a C++; no se
+puede distribuir. Lo que sí se distribuye (render de PCSX2, parches, herramientas) va en el zip.
+
+**Online**: en el juego, PLAY ONLINE -> YES -> "1 - NBA Street Online (DHCP)" -> crear cuenta EA
+(usuario de 4+ letras) -> crear persona -> crear baller online -> PLAY -> PICKUP GAMES -> PLAY NOW.
+No uses "New/Edit" en la pantalla de configuración de red. El tráfico de los partidos pasa por el
+servidor (relay), así que no hay que abrir puertos en el router.
+
+## Requisitos (compilar a mano)
 
 - Windows 10/11 x64, GPU con Vulkan (o Direct3D 11/12), ~40 GB libres, 16 GB de RAM recomendados.
 - **Visual Studio 2022 Build Tools** con "Desarrollo para el escritorio con C++" (MSVC v143 + Windows SDK).
@@ -99,7 +116,7 @@ Las dependencias (SDL3, shaderc, etc.) solo se compilan una vez. `setup_gshost.p
 
 Jugable de principio a fin en offline: menús, vídeos, Create Baller, partidos a 60 fps con física
 correcta, audio (SPU2 emulado) y memory card. El modo online existe en el código (adaptador de red
-DEV9 emulado, `PS2X_NET=1`) pero necesita un servidor de lobby que no forma parte de este repositorio.
+DEV9 emulado) y se conecta al servidor de la comunidad; el código del servidor no forma parte de este repositorio.
 
 Los bugs del recompilador encontrados (y corregidos en `patches/ps2recomp.patch`) están en
 `docs/PORTING_NOTES.md`; varios afectan a cualquier juego de PS2 portado con PS2Recomp

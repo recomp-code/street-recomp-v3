@@ -14,12 +14,16 @@ $Ini = "$GsHost\nba_street.ini"
 $SettingsFile = Join-Path $env:APPDATA 'NBAStreetV3Launcher.json'
 
 # ---------------------------------------------------------------- ajustes del launcher
-$settings = @{ Iso = ''; Fullscreen = $true }
+# Servidor online por defecto (se puede cambiar en la ventana).
+$DefaultServer = 'nbas3.xellrecomp.party'
+$settings = @{ Iso = ''; Fullscreen = $true; Online = $true; Server = $DefaultServer }
 try {
     if (Test-Path $SettingsFile) {
         $loaded = Get-Content $SettingsFile -Raw | ConvertFrom-Json
         if ($loaded.Iso) { $settings.Iso = $loaded.Iso }
         if ($null -ne $loaded.Fullscreen) { $settings.Fullscreen = [bool]$loaded.Fullscreen }
+        if ($null -ne $loaded.Online) { $settings.Online = [bool]$loaded.Online }
+        if ($loaded.Server) { $settings.Server = $loaded.Server }
     }
 } catch {}
 function Save-Settings { try { $settings | ConvertTo-Json | Set-Content $SettingsFile } catch {} }
@@ -52,7 +56,7 @@ $Renderers = [ordered]@{ 'Vulkan (recomendado)' = 14; 'Direct3D 11' = 3; 'Direct
 # ---------------------------------------------------------------- ventana
 $form = New-Object Windows.Forms.Form
 $form.Text = 'NBA Street V3 - PC'
-$form.Size = New-Object Drawing.Size(520, 420)
+$form.Size = New-Object Drawing.Size(520, 500)
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
@@ -116,18 +120,32 @@ $texBox = New-Object Windows.Forms.CheckBox
 $texBox.Text = 'Texturas HD'; $texBox.Location = '200,88'; $texBox.AutoSize = $true
 $group.Controls.Add($texBox)
 
+$netGroup = New-Object Windows.Forms.GroupBox
+$netGroup.Text = 'Online'; $netGroup.Location = '20,300'; $netGroup.Size = '468,76'
+$form.Controls.Add($netGroup)
+$onlineBox = New-Object Windows.Forms.CheckBox
+$onlineBox.Text = 'Jugar online (PLAY ONLINE en el juego)'; $onlineBox.Location = '12,24'; $onlineBox.AutoSize = $true
+$onlineBox.Checked = $settings.Online
+$netGroup.Controls.Add($onlineBox)
+$serverLabel = New-Object Windows.Forms.Label
+$serverLabel.Text = 'Servidor:'; $serverLabel.Location = '12,50'; $serverLabel.AutoSize = $true
+$netGroup.Controls.Add($serverLabel)
+$serverBox = New-Object Windows.Forms.TextBox
+$serverBox.Location = '90,46'; $serverBox.Size = '260,24'; $serverBox.Text = $settings.Server
+$netGroup.Controls.Add($serverBox)
+
 $prepare = New-Object Windows.Forms.Button
-$prepare.Text = 'Preparar juego'; $prepare.Location = '20,306'; $prepare.Size = '150,44'
+$prepare.Text = 'Preparar juego'; $prepare.Location = '20,386'; $prepare.Size = '150,44'
 $form.Controls.Add($prepare)
 
 $play = New-Object Windows.Forms.Button
-$play.Text = 'JUGAR'; $play.Location = '338,306'; $play.Size = '150,44'
+$play.Text = 'JUGAR'; $play.Location = '338,386'; $play.Size = '150,44'
 $play.Font = New-Object Drawing.Font('Segoe UI', 12, [Drawing.FontStyle]::Bold)
 $form.Controls.Add($play)
 
 $help = New-Object Windows.Forms.Label
 $help.Text = 'En el juego: F1 o mantener START = menu grafico. Alt+Enter = ventana.'
-$help.Location = '20,358'; $help.AutoSize = $true; $help.ForeColor = [Drawing.Color]::DimGray
+$help.Location = '20,438'; $help.AutoSize = $true; $help.ForeColor = [Drawing.Color]::DimGray
 $form.Controls.Add($help)
 
 function Load-Graphics {
@@ -145,6 +163,8 @@ function Save-Graphics {
     Write-IniValue 'Renderer' $Renderers[$renBox.SelectedItem]
     Write-IniValue 'LoadTextureReplacements' $(if ($texBox.Checked) { 'true' } else { 'false' })
     $settings.Fullscreen = $fullBox.Checked
+    $settings.Online = $onlineBox.Checked
+    $settings.Server = $(if ($serverBox.Text.Trim()) { $serverBox.Text.Trim() } else { $DefaultServer })
     Save-Settings
 }
 
@@ -184,6 +204,18 @@ $play.Add_Click({
     Save-Graphics
     New-Item -ItemType Directory -Force "$Root\logs" | Out-Null
     $env:PS2X_GS_LIVE = '1'
+    if ($onlineBox.Checked) {
+        # Adaptador de red emulado + servidor; la configuracion de red va en la memory card.
+        $env:PS2X_NET = '1'
+        $env:PS2X_NET_SERVER = $settings.Server
+        $netcnf = "$Root\game\iso\mc0\BWNETCNF"
+        if (-not (Test-Path "$netcnf\BWNETCNF")) {
+            New-Item -ItemType Directory -Force $netcnf | Out-Null
+            Copy-Item "$Repo\game\mc0_netcnf\BWNETCNF\*" $netcnf -Force
+        }
+    } else {
+        $env:PS2X_NET = '0'
+    }
     $env:PS2X_GSHOST_ARGS = '-renderer ' + $(switch ($Renderers[$renBox.SelectedItem]) { 3 { 'dx11' } 15 { 'dx12' } 12 { 'gl' } default { 'vulkan' } }) +
         ' -ini nba_street.ini' + $(if ($fullBox.Checked) { ' -fullscreen' } else { '' })
     Start-Process $GameExe -ArgumentList "`"$Root\game\iso\SLUS_211.26`"" -WorkingDirectory "$Root\game\iso" -WindowStyle Hidden `
