@@ -24,22 +24,62 @@ Contenido:
 | `docs/PORTING_NOTES.md` | Notas técnicas: todos los bugs encontrados y cómo se arreglaron |
 | `Jugar.cmd` | Lanzador |
 
-## Para jugar (lo fácil)
+## Para jugar (lo fácil): el launcher
 
-1. Descarga el zip de la última versión en **Releases** y descomprímelo donde quieras.
-2. Abre **`Launcher.cmd`**, elige tu ISO de NBA Street V3 (NTSC-U, SLUS-21126) y pulsa **Preparar juego**.
-   La primera vez instala las herramientas de compilación (Visual Studio Build Tools, CMake, Git)
-   y compila el juego en tu PC: descarga ~6 GB y puede tardar 1-2 horas. Solo se hace una vez.
-3. Pulsa **JUGAR**. Desde el launcher eliges resolución, renderizador, pantalla completa, texturas HD
-   y el modo **online** (activado por defecto contra el servidor de la comunidad).
+1. Descarga `NBAStreetV3-PC-<versión>.zip` de **Releases** y descomprímelo donde quieras.
+2. Abre **`Launcher.cmd`**:
 
-¿Por qué hay que compilar? El ejecutable final contiene el código del juego traducido a C++; no se
-puede distribuir. Lo que sí se distribuye (render de PCSX2, parches, herramientas) va en el zip.
+   | Control | Qué hace |
+   |---|---|
+   | **Tu ISO... / Elegir...** | Elige tu ISO de NBA Street V3 (NTSC-U, SLUS-21126). Se recuerda. |
+   | **Preparar juego** | Solo la primera vez: instala Visual Studio Build Tools, CMake y Git si faltan, extrae tu ISO en `C:\NBAStreetRecomp\game`, genera el C++ del juego desde tu ELF y lo compila. ~6 GB de descargas y 1-2 horas; el progreso sale en una ventana de consola ("Listo" = terminado). Después el botón pasa a **Reparar**. |
+   | **Resolución interna** | Nativa 480p, 720p, 1080p, 1440p, 4K u 8x. |
+   | **Renderizador** | Vulkan (recomendado), Direct3D 11, Direct3D 12 u OpenGL. |
+   | **Pantalla completa** | Arranca a pantalla completa (Alt+Enter alterna en el juego). |
+   | **Texturas HD** | Carga packs HD formato PCSX2 de `Documentos\PCSX2\textures\SLUS-21126\replacements`. |
+   | **Jugar online** + **Servidor** | Activa el adaptador de red y elige el servidor (por defecto el de la comunidad, `nbas3.xellrecomp.party`). Desmárcalo para jugar sin red. |
+   | **JUGAR** | Arranca el juego con esas opciones. |
 
-**Online**: en el juego, PLAY ONLINE -> YES -> "1 - NBA Street Online (DHCP)" -> crear cuenta EA
-(usuario de 4+ letras) -> crear persona -> crear baller online -> PLAY -> PICKUP GAMES -> PLAY NOW.
-No uses "New/Edit" en la pantalla de configuración de red. El tráfico de los partidos pasa por el
-servidor (relay), así que no hay que abrir puertos en el router.
+   Las opciones gráficas se guardan en `C:\NBAStreetRecomp\gshost\nba_street.ini` y las del launcher en
+   `%APPDATA%\NBAStreetV3Launcher.json`. En el juego: **F1**, **Back+Start** o **mantener START 1,5 s**
+   abre el menú gráfico.
+
+¿Por qué compilar? El ejecutable final contiene el código del juego traducido a C++, así que no se
+puede distribuir. Todo lo distribuible (render de PCSX2, parches, herramientas) va en el zip.
+
+`Jugar.cmd` hace lo mismo que **JUGAR** sin ventana (online por defecto; `set NBA_SERVER=off` para
+jugar sin red o `set NBA_SERVER=<host o IP>` para otro servidor).
+
+## Modo online
+
+El servicio EA Online original del juego cerró hace años. Este port lo recupera:
+
+- **Adaptador de red.** El adaptador de red de PS2 (DEV9/SMAP) se emula con el modo "sockets" de
+  PCSX2: sin drivers, sin permisos de administrador, sin TAP/pcap. El juego obtiene IP por DHCP y sus
+  nombres de EA (`ps2nbastreet05.ea.com`, etc.) se redirigen al servidor configurado.
+- **Servidor.** Un servidor de la comunidad reimplementa el protocolo de lobby de EA: cuentas,
+  personas, ballers online (guardados en el servidor), partidas rápidas (PLAY NOW) y montaje del
+  partido. El código del servidor no está en este repositorio.
+- **Tráfico del partido.** Las dos consolas hablan normalmente P2P por UDP. Aquí cada jugador recibe
+  una IP virtual y todo el tráfico pasa por el relay UDP del servidor: **no hay que abrir puertos** en
+  el router y funciona detrás de NAT/CGNAT. La latencia es tu ping al servidor más el del rival.
+- **Configuración de red.** El launcher copia una configuración lista (`game/mc0_netcnf`) a la
+  memory card emulada la primera vez que juegas online.
+
+Cómo jugar un partido:
+
+1. En el launcher deja **Jugar online** marcado y pulsa **JUGAR**.
+2. En el juego: **PLAY ONLINE** -> **YES** -> **"1 - NBA Street Online (DHCP)"** -> conectar.
+   No uses "New/Edit" en esa pantalla.
+3. La primera vez: crea una cuenta EA (usuario de 4+ letras, cualquier e-mail y contraseña; solo se
+   guardan en el servidor de la comunidad, no reutilices una contraseña real) y luego una **persona**.
+4. Crea un **baller online** (Create Baller desde el menú online) y guárdalo.
+5. **PLAY** -> **PICKUP GAMES** -> **PLAY NOW**. Te empareja con el siguiente jugador que haga lo
+   mismo; el partido empieza cuando están los dos.
+
+Problemas: "cannot resolve server" en `C:\NBAStreetRecomp\logs\jugar_err.log` = sin internet o DNS;
+si se queda en "connecting", seguramente un firewall bloquea `ps2EntryRunner.exe` (TCP al servidor y
+UDP 21003).
 
 ## Requisitos (compilar a mano)
 
