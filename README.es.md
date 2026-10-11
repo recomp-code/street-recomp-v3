@@ -11,7 +11,52 @@ VU1 en microVU y paquetes de texturas HD compatibles con PCSX2.
 > ni texturas. Necesitas **tu propia copia** de NBA Street V3 (SLUS-21126). El código C++ del juego se
 > genera en tu PC a partir de tu ELF.
 
-Contenido:
+| | |
+|---|---|
+| ![Title screen](docs/screenshots/title.jpg) | ![Loading screen](docs/screenshots/loading.jpg) |
+| ![Tip-off](docs/screenshots/tipoff.jpg) | ![In a match](docs/screenshots/match.jpg) |
+
+<sub>Capturas de este port (Vulkan, resolución interna 4x, 16:9). NBA Street V3 © Electronic Arts.</sub>
+
+## Características
+
+- **Ejecutable nativo x64.** El código MIPS del juego (EE) se recompila estáticamente a C++ y se
+  compila con MSVC: no hay emulador de CPU en ejecución. El IOP, el audio SPU2 y el adaptador de red
+  de PS2 se emulan; los microprogramas de VU1 corren en el recompilador microVU de PCSX2.
+- **Render moderno por GPU** con el GS de PCSX2: Vulkan, Direct3D 11/12 u OpenGL, resolución interna
+  desde 480p nativa hasta 8x (5K+), filtrado de texturas, 4:3 o 16:9 estirado, pantalla completa.
+- **Paquetes de texturas HD** en formato PCSX2 para SLUS-21126 (ver [Texturas HD](#texturas-hd)),
+  con carga asíncrona para que no frenen el juego.
+- **Online recuperado** contra un servidor de la comunidad: cuentas EA, personas, ballers online,
+  partidas PLAY NOW con el tráfico por relay (sin abrir puertos). Ver [Modo online](#modo-online).
+- **Launcher de un clic**: eliges tu ISO, preparas una vez y juegas. Resolución, renderizador,
+  texturas HD y servidor online se eligen en el launcher.
+- **Menú gráfico en el juego**: F1, Back+Start o mantener START 1,5 s (funciona con el mando).
+- **Mandos XInput y teclado**; cada ventana solo usa el mando mientras está delante.
+- **Memory card emulada** con partidas guardadas normales (`game\iso\mc0`).
+
+## Texturas HD
+
+El render carga reemplazos de texturas en formato PCSX2: PNG con el nombre del hash de la textura
+original, en `Documentos\PCSX2\textures\SLUS-21126\replacements`. Se activan con **Texturas HD** en
+el launcher o en el menú gráfico del juego.
+
+- **Usar un pack**: copia sus PNG a esa carpeta `replacements` (sin cambiar los nombres) y activa
+  las texturas HD.
+- **Hacer tu propio pack**:
+  1. En el menú gráfico pon Texturas HD en **"Activadas + volcar originales"** y recorre los menús y
+     canchas que quieras; los originales se vuelcan a `Documentos\PCSX2\textures\SLUS-21126\dumps`.
+  2. Ejecuta `tools\texturas_preparar.ps1`: copia los volcados a `C:\NBAStreetRecomp\texturas_hd\originales`
+     y aparta las texturas que **no** se deben reemplazar (fotogramas de vídeo, capturas dinámicas de
+     memoria de vídeo que el juego reescribe cada fotograma y páginas invisibles volcadas con una
+     paleta ajena). Reemplazarlas causa menús con grano e iconos de botones rotos.
+  3. Mejora los PNG con la herramienta que quieras (p. ej. un escalador por IA) en
+     `C:\NBAStreetRecomp\texturas_hd\hd`, con los mismos nombres.
+  4. Ejecuta `tools\texturas_instalar.ps1`: los copia a `replacements` saltando los descartados.
+
+Los packs de texturas son contenido del juego: no se incluyen en este repositorio ni en las releases.
+
+## Contenido
 
 | Ruta | Qué es |
 |---|---|
@@ -45,7 +90,8 @@ Contenido:
    abre el menú gráfico.
 
 ¿Por qué compilar? El ejecutable final contiene el código del juego traducido a C++, así que no se
-puede distribuir. Todo lo distribuible (render de PCSX2, parches, herramientas) va en el zip.
+puede distribuir. Todo lo distribuible (parches, herramientas, launcher) va en el zip, y el render de
+PCSX2 ya compilado (`gshost-win64-*.zip` en la misma release) se descarga solo.
 
 `Jugar.cmd` hace lo mismo que **JUGAR** sin ventana (online por defecto; `set NBA_SERVER=off` para
 jugar sin red o `set NBA_SERVER=<host o IP>` para otro servidor).

@@ -12,7 +12,7 @@
 param(
     [string]$Iso = "",
     [string]$Root = "C:\NBAStreetRecomp",
-    [string]$GsHostUrl = "",          # zip del render ya compilado (Release del repositorio)
+    [string[]]$GsHostUrl = @(),       # zip(s) del render ya compilado (assets de la Release)
     [switch]$BuildPcsx2,              # compilar el render desde las fuentes en lugar de descargarlo
     [switch]$Rebuild                  # regenerar y recompilar el juego aunque ya exista
 )
@@ -30,7 +30,7 @@ $Downloads = @{
     CMake        = 'https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip'
     MinGit       = 'https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.2/MinGit-2.56.0.2-64-bit.zip'
 }
-if (-not $GsHostUrl -and (Test-Path "$Repo\gshost\release_url.txt")) { $GsHostUrl = (Get-Content "$Repo\gshost\release_url.txt" -TotalCount 1).Trim() }
+if (-not $GsHostUrl -and (Test-Path "$Repo\gshost\release_url.txt")) { $GsHostUrl = @(Get-Content "$Repo\gshost\release_url.txt" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 
 function Step($text) { Write-Host ""; Write-Host "==> $text" -ForegroundColor Cyan }
 function Download($url, $file) {
@@ -145,17 +145,21 @@ Write-Host "    OK: $gameExe"
 Step "Render (PCSX2 pcsx2-gsrunner)"
 $gshost = Join-Path $Root 'gshost'
 if (-not (Test-Path "$gshost\pcsx2-gsrunner.exe")) {
-    $localZip = Join-Path $Repo 'gshost-win64.zip'   # incluido en el zip de la release
-    if (-not $BuildPcsx2 -and (Test-Path $localZip)) {
-        Expand-Archive $localZip $gshost -Force
+    # Render precompilado: zips junto al launcher si el jugador los bajo, si no se descargan de la release.
+    $localZips = @(Get-ChildItem $Repo -Filter 'gshost-win64*.zip' -ErrorAction SilentlyContinue)
+    if (-not $BuildPcsx2 -and $localZips.Count) {
+        foreach ($z in $localZips) { Expand-Archive $z.FullName $gshost -Force }
     } elseif ($BuildPcsx2 -or -not $GsHostUrl) {
         if (-not $BuildPcsx2) { Write-Warning "No hay URL del render precompilado: se compila desde las fuentes (necesita LLVM, Ninja, Python y PortableGit en $Tools, ver README)" }
         Run "$Tools\build_pcsx2_deps.bat" @() "$Logs\install_pcsx2_deps.log"
         Run "$Tools\build_pcsx2.cmd" @('pcsx2-gsrunner') "$Logs\install_pcsx2.log"
         & "$Repo\tools\setup_gshost.ps1" -Root $Root
     } else {
-        Download $GsHostUrl "$Tools\dl\gshost-win64.zip"
-        Expand-Archive "$Tools\dl\gshost-win64.zip" $gshost -Force
+        foreach ($url in @($GsHostUrl)) {
+            $file = Join-Path "$Tools\dl" ([IO.Path]::GetFileName($url))
+            Download $url $file
+            Expand-Archive $file $gshost -Force
+        }
     }
 }
 if (-not (Test-Path "$gshost\nba_street.ini")) { Copy-Item "$Repo\gshost\nba_street.ini" $gshost }

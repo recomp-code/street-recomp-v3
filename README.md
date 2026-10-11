@@ -11,7 +11,53 @@ resolution, VU1 on microVU, PCSX2-compatible HD texture packs and working **onli
 > textures. You need **your own copy** of NBA Street V3 (SLUS-21126). The game's C++ code is generated
 > on your PC from your own ELF.
 
-Contents:
+| | |
+|---|---|
+| ![Title screen](docs/screenshots/title.jpg) | ![Loading screen](docs/screenshots/loading.jpg) |
+| ![Tip-off](docs/screenshots/tipoff.jpg) | ![In a match](docs/screenshots/match.jpg) |
+
+<sub>Captured from this port (Vulkan, 4x internal resolution, 16:9). Screenshots of NBA Street V3 © Electronic Arts.</sub>
+
+## Features
+
+- **Native x64 executable.** The game's MIPS code (EE) is statically recompiled to C++ and compiled
+  with MSVC; no CPU emulator at run time. The IOP, SPU2 audio and the PS2 network adapter are
+  emulated, VU1 microprograms run on PCSX2's microVU recompiler.
+- **Modern GPU rendering** through PCSX2's GS: Vulkan, Direct3D 11/12 or OpenGL, internal resolution
+  from native 480p up to 8x (5K+), texture filtering, 4:3 or stretched 16:9, fullscreen.
+- **HD texture packs.** PCSX2-format replacement packs for SLUS-21126 work (see
+  [HD textures](#hd-textures)), loaded asynchronously so they do not stall the game.
+- **Online play restored** against a community server: EA accounts, personas, online ballers,
+  PLAY NOW matches with relayed traffic (no port forwarding). See [Online mode](#online-mode).
+- **One-click launcher**: choose your ISO, prepare once, play. Resolution, renderer, HD textures and
+  online server are set from the launcher.
+- **In-game graphics menu**: F1, Back+Start or hold START 1.5 s (works from the controller).
+- **XInput controllers and keyboard**; each window only takes the controller while it is in front.
+- **Emulated memory card** with normal saves (`game\iso\mc0`).
+
+## HD textures
+
+The renderer loads PCSX2-format texture replacements: PNG files named after the hash of the original
+texture, in `Documents\PCSX2\textures\SLUS-21126\replacements`. Turn them on with **Texturas HD** in
+the launcher or in the in-game graphics menu.
+
+- **Using a pack**: copy its PNG files into that `replacements` folder (keep the file names) and
+  enable HD textures.
+- **Making your own pack**:
+  1. In the in-game graphics menu set HD textures to **"Activadas + volcar originales"** (enabled +
+     dump originals) and play through the menus and courts you want; the originals are dumped to
+     `Documents\PCSX2\textures\SLUS-21126\dumps`.
+  2. Run `tools\texturas_preparar.ps1`: it copies the dumps to `C:\NBAStreetRecomp\texturas_hd\originales`
+     and sets aside textures that must **not** be replaced (video frames, dynamic video-memory
+     captures the game rewrites every frame, and invisible pages dumped with a foreign palette).
+     Replacing those causes grainy menus and broken button icons.
+  3. Upscale the PNGs with any tool (e.g. an AI upscaler) into `C:\NBAStreetRecomp\texturas_hd\hd`,
+     keeping the exact file names.
+  4. Run `tools\texturas_instalar.ps1`: it copies them to `replacements`, skipping the discarded ones.
+
+Texture packs are game assets: they are not included in this repository or in the releases.
+
+## Contents
 
 | Path | What it is |
 |---|---|
@@ -48,7 +94,8 @@ Contents:
    or **hold START 1.5 s** opens the graphics menu.
 
 Why compile? The final executable contains the game's code translated to C++, so it cannot be
-distributed. Everything that can be distributed (PCSX2 renderer, patches, tools) is in the zip.
+distributed. Everything that can be distributed (patches, tools, launcher) is in the zip, and the
+prebuilt PCSX2 renderer (`gshost-win64-*.zip` in the same release) is downloaded automatically.
 
 `Jugar.cmd` does the same as **JUGAR** without a window (online by default; `set NBA_SERVER=off`
 for offline, or `set NBA_SERVER=<host or IP>` for another server).

@@ -1,7 +1,7 @@
 <#
   Genera el zip de la release para GitHub (lo que descarga un jugador):
     NBAStreetV3-PC-<version>.zip = Launcher + instalador + parches + configuracion + scripts
-                                   + gshost-win64.zip (render de PCSX2 ya compilado, GPL)
+  y aparte gshost-win64-N.zip (render de PCSX2 ya compilado, GPL), que el instalador descarga.
   NO incluye nada del juego: el juego se compila en el PC del jugador desde su propia ISO.
   Uso: tools\make_release.ps1 -Version 1.0 [-GsHostZip C:\NBAStreetRecomp\release\gshost-win64.zip]
 #>
@@ -22,11 +22,38 @@ foreach ($f in $files) {
     New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
     Copy-Item (Join-Path $Repo $f) $dst
 }
-if (Test-Path $GsHostZip) { Copy-Item $GsHostZip (Join-Path $stage 'gshost-win64.zip') }
+
+# El render precompilado va como assets aparte de la release, partido en zips de < 10 MB
+# (gshost-win64-1.zip, -2.zip...): el instalador los descarga solo (URLs en gshost\release_url.txt).
+if (Test-Path $GsHostZip) {
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    Get-ChildItem $OutDir -Filter 'gshost-win64-*.zip' | ForEach-Object { cmd /c del /q "$($_.FullName)" }
+    $src = [IO.Compression.ZipFile]::OpenRead($GsHostZip)
+    $limit = 9MB
+    $bins = New-Object System.Collections.Generic.List[object]
+    foreach ($e in ($src.Entries | Where-Object { $_.Name } | Sort-Object CompressedLength -Descending)) {
+        $bin = $bins | Where-Object { $_.Size + $e.CompressedLength -le $limit } | Select-Object -First 1
+        if (-not $bin) { $bin = [pscustomobject]@{ Size = 0; Entries = New-Object System.Collections.Generic.List[object] }; $bins.Add($bin) }
+        $bin.Size += $e.CompressedLength; $bin.Entries.Add($e)
+    }
+    $urls = @()
+    for ($i = 0; $i -lt $bins.Count; $i++) {
+        $partName = "gshost-win64-$($i + 1).zip"
+        $out = [IO.Compression.ZipFile]::Open((Join-Path $OutDir $partName), 'Create')
+        foreach ($e in $bins[$i].Entries) {
+            $dstEntry = $out.CreateEntry($e.FullName, [IO.Compression.CompressionLevel]::Optimal)
+            $in = $e.Open(); $os = $dstEntry.Open(); $in.CopyTo($os); $os.Dispose(); $in.Dispose()
+        }
+        $out.Dispose()
+        $urls += "https://github.com/recomp-code/street-recomp-v3/releases/download/v$Version/$partName"
+    }
+    $src.Dispose()
+    Set-Content (Join-Path $stage 'gshost\release_url.txt') $urls -Encoding ascii
+}
 else { Write-Warning "Sin ${GsHostZip}: el instalador tendra que compilar PCSX2" }
 
 $zip = Join-Path $OutDir "$name.zip"
 if (Test-Path $zip) { cmd /c del /q "$zip" }
 Compress-Archive "$stage\*" $zip
 cmd /c rmdir /s /q "$stage"
-Get-Item $zip | Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
+Get-Item $zip, (Join-Path $OutDir 'gshost-win64-*.zip') | Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
