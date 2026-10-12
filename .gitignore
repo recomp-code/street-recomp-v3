@@ -8,6 +8,8 @@ mc0/
 mc1/
 texturas_hd/
 *.png
+# (excepto las capturas del README, que son nuestras)
+!docs/screenshots/*.png
 # Compilaciones y logs
 out/
 build/

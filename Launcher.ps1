@@ -1,6 +1,6 @@
 <#
-  Launcher de NBA Street V3 (port PC): elige tu ISO, prepara el juego la primera vez y juega.
-  Se abre con Launcher.cmd. La preparacion (compilar el juego en tu PC) solo se hace una vez.
+  NBA Street V3 PC launcher: pick your ISO, prepare the game once, add HD textures, play.
+  Opened by Launcher.cmd. Preparing (compiling the game on your PC) only happens once.
 #>
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -12,9 +12,10 @@ $GameExe = "$Root\PS2Recomp\out\build\ps2xRuntime\Release\ps2EntryRunner.exe"
 $GsHost = "$Root\gshost"
 $Ini = "$GsHost\nba_street.ini"
 $SettingsFile = Join-Path $env:APPDATA 'NBAStreetV3Launcher.json'
+$TextureDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PCSX2\textures\SLUS-21126\replacements'
 
-# ---------------------------------------------------------------- ajustes del launcher
-# Servidor online por defecto (se puede cambiar en la ventana).
+# ---------------------------------------------------------------- launcher settings
+# Default online server (can be changed in the window).
 $DefaultServer = 'nbas3.xellrecomp.party'
 $settings = @{ Iso = ''; Fullscreen = $true; Online = $true; Server = $DefaultServer }
 try {
@@ -28,7 +29,7 @@ try {
 } catch {}
 function Save-Settings { try { $settings | ConvertTo-Json | Set-Content $SettingsFile } catch {} }
 
-# ---------------------------------------------------------------- nba_street.ini (opciones graficas)
+# ---------------------------------------------------------------- nba_street.ini (graphics options)
 function Read-Ini {
     $values = @{}
     if (Test-Path $Ini) {
@@ -50,18 +51,17 @@ function Write-IniValue($key, $value) {
     Set-Content $Ini $lines -Encoding ascii
 }
 
-$Resolutions = [ordered]@{ 'Nativa (480p)' = 1; '720p' = 2; '1080p' = 3; '1440p' = 4; '4K' = 6; '8x (5K+)' = 8 }
-$Renderers = [ordered]@{ 'Vulkan (recomendado)' = 14; 'Direct3D 11' = 3; 'Direct3D 12' = 15; 'OpenGL' = 12 }
+$Resolutions = [ordered]@{ 'Native (480p)' = 1; '720p' = 2; '1080p' = 3; '1440p' = 4; '4K' = 6; '5K+ (8x)' = 8 }
+$Renderers = [ordered]@{ 'Vulkan (recommended)' = 14; 'Direct3D 11' = 3; 'Direct3D 12' = 15; 'OpenGL' = 12 }
 
-# ---------------------------------------------------------------- ventana
+# ---------------------------------------------------------------- window
 $form = New-Object Windows.Forms.Form
 $form.Text = 'NBA Street V3 - PC'
-$form.Size = New-Object Drawing.Size(520, 500)
+$form.Size = New-Object Drawing.Size(520, 600)
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
-$font = New-Object Drawing.Font('Segoe UI', 10)
-$form.Font = $font
+$form.Font = New-Object Drawing.Font('Segoe UI', 10)
 
 $title = New-Object Windows.Forms.Label
 $title.Text = 'NBA Street V3'
@@ -70,7 +70,7 @@ $title.Location = '20,12'; $title.AutoSize = $true
 $form.Controls.Add($title)
 
 $isoLabel = New-Object Windows.Forms.Label
-$isoLabel.Text = 'Tu ISO (NBA Street V3, NTSC-U SLUS-21126):'
+$isoLabel.Text = 'Your game disc image (NBA Street V3 USA ISO, SLUS-21126):'
 $isoLabel.Location = '20,60'; $isoLabel.AutoSize = $true
 $form.Controls.Add($isoLabel)
 
@@ -79,10 +79,11 @@ $isoBox.Location = '20,84'; $isoBox.Size = '370,26'; $isoBox.Text = $settings.Is
 $form.Controls.Add($isoBox)
 
 $browse = New-Object Windows.Forms.Button
-$browse.Text = 'Elegir...'; $browse.Location = '398,82'; $browse.Size = '90,30'
+$browse.Text = 'Browse...'; $browse.Location = '398,82'; $browse.Size = '90,30'
 $browse.Add_Click({
     $dialog = New-Object Windows.Forms.OpenFileDialog
-    $dialog.Filter = 'Imagen de disco (*.iso)|*.iso|Todos los archivos (*.*)|*.*'
+    $dialog.Title = 'Choose your NBA Street V3 ISO'
+    $dialog.Filter = 'Disc image (*.iso)|*.iso|All files (*.*)|*.*'
     if ($dialog.ShowDialog() -eq 'OK') { $isoBox.Text = $dialog.FileName; $settings.Iso = $dialog.FileName; Save-Settings }
 })
 $form.Controls.Add($browse)
@@ -91,62 +92,123 @@ $status = New-Object Windows.Forms.Label
 $status.Location = '20,124'; $status.Size = '470,44'
 $form.Controls.Add($status)
 
+# Graphics
 $group = New-Object Windows.Forms.GroupBox
-$group.Text = 'Graficos'; $group.Location = '20,172'; $group.Size = '468,120'
+$group.Text = 'Graphics'; $group.Location = '20,172'; $group.Size = '468,120'
 $form.Controls.Add($group)
 
 $resLabel = New-Object Windows.Forms.Label
-$resLabel.Text = 'Resolucion interna:'; $resLabel.Location = '12,28'; $resLabel.AutoSize = $true
+$resLabel.Text = 'Resolution:'; $resLabel.Location = '12,28'; $resLabel.AutoSize = $true
 $group.Controls.Add($resLabel)
 $resBox = New-Object Windows.Forms.ComboBox
-$resBox.DropDownStyle = 'DropDownList'; $resBox.Location = '170,24'; $resBox.Size = '180,26'
+$resBox.DropDownStyle = 'DropDownList'; $resBox.Location = '170,24'; $resBox.Size = '200,26'
 $Resolutions.Keys | ForEach-Object { [void]$resBox.Items.Add($_) }
 $group.Controls.Add($resBox)
 
 $renLabel = New-Object Windows.Forms.Label
-$renLabel.Text = 'Renderizador:'; $renLabel.Location = '12,60'; $renLabel.AutoSize = $true
+$renLabel.Text = 'Renderer:'; $renLabel.Location = '12,60'; $renLabel.AutoSize = $true
 $group.Controls.Add($renLabel)
 $renBox = New-Object Windows.Forms.ComboBox
-$renBox.DropDownStyle = 'DropDownList'; $renBox.Location = '170,56'; $renBox.Size = '180,26'
+$renBox.DropDownStyle = 'DropDownList'; $renBox.Location = '170,56'; $renBox.Size = '200,26'
 $Renderers.Keys | ForEach-Object { [void]$renBox.Items.Add($_) }
 $group.Controls.Add($renBox)
 
 $fullBox = New-Object Windows.Forms.CheckBox
-$fullBox.Text = 'Pantalla completa'; $fullBox.Location = '12,88'; $fullBox.AutoSize = $true
+$fullBox.Text = 'Fullscreen'; $fullBox.Location = '12,88'; $fullBox.AutoSize = $true
 $fullBox.Checked = $settings.Fullscreen
 $group.Controls.Add($fullBox)
 
-$texBox = New-Object Windows.Forms.CheckBox
-$texBox.Text = 'Texturas HD'; $texBox.Location = '200,88'; $texBox.AutoSize = $true
-$group.Controls.Add($texBox)
+# HD textures
+$texGroup = New-Object Windows.Forms.GroupBox
+$texGroup.Text = 'HD textures'; $texGroup.Location = '20,300'; $texGroup.Size = '468,92'
+$form.Controls.Add($texGroup)
 
+$texBox = New-Object Windows.Forms.CheckBox
+$texBox.Text = 'Use HD textures'; $texBox.Location = '12,26'; $texBox.AutoSize = $true
+$texGroup.Controls.Add($texBox)
+
+$texCount = New-Object Windows.Forms.Label
+$texCount.Location = '200,28'; $texCount.Size = '260,22'; $texCount.ForeColor = [Drawing.Color]::DimGray
+$texGroup.Controls.Add($texCount)
+
+$texZip = New-Object Windows.Forms.Button
+$texZip.Text = 'Add texture pack (.zip)...'; $texZip.Location = '12,54'; $texZip.Size = '210,30'
+$texGroup.Controls.Add($texZip)
+
+$texFolder = New-Object Windows.Forms.Button
+$texFolder.Text = 'Add texture pack (folder)...'; $texFolder.Location = '232,54'; $texFolder.Size = '224,30'
+$texGroup.Controls.Add($texFolder)
+
+# Online
 $netGroup = New-Object Windows.Forms.GroupBox
-$netGroup.Text = 'Online'; $netGroup.Location = '20,300'; $netGroup.Size = '468,76'
+$netGroup.Text = 'Online'; $netGroup.Location = '20,400'; $netGroup.Size = '468,76'
 $form.Controls.Add($netGroup)
 $onlineBox = New-Object Windows.Forms.CheckBox
-$onlineBox.Text = 'Jugar online (PLAY ONLINE en el juego)'; $onlineBox.Location = '12,24'; $onlineBox.AutoSize = $true
+$onlineBox.Text = 'Play online (choose PLAY ONLINE in the game)'; $onlineBox.Location = '12,24'; $onlineBox.AutoSize = $true
 $onlineBox.Checked = $settings.Online
 $netGroup.Controls.Add($onlineBox)
 $serverLabel = New-Object Windows.Forms.Label
-$serverLabel.Text = 'Servidor:'; $serverLabel.Location = '12,50'; $serverLabel.AutoSize = $true
+$serverLabel.Text = 'Server:'; $serverLabel.Location = '12,50'; $serverLabel.AutoSize = $true
 $netGroup.Controls.Add($serverLabel)
 $serverBox = New-Object Windows.Forms.TextBox
 $serverBox.Location = '90,46'; $serverBox.Size = '260,24'; $serverBox.Text = $settings.Server
 $netGroup.Controls.Add($serverBox)
 
 $prepare = New-Object Windows.Forms.Button
-$prepare.Text = 'Preparar juego'; $prepare.Location = '20,386'; $prepare.Size = '150,44'
+$prepare.Text = 'Prepare game'; $prepare.Location = '20,486'; $prepare.Size = '150,44'
 $form.Controls.Add($prepare)
 
 $play = New-Object Windows.Forms.Button
-$play.Text = 'JUGAR'; $play.Location = '338,386'; $play.Size = '150,44'
+$play.Text = 'PLAY'; $play.Location = '338,486'; $play.Size = '150,44'
 $play.Font = New-Object Drawing.Font('Segoe UI', 12, [Drawing.FontStyle]::Bold)
 $form.Controls.Add($play)
 
 $help = New-Object Windows.Forms.Label
-$help.Text = 'En el juego: F1 o mantener START = menu grafico. Alt+Enter = ventana.'
-$help.Location = '20,438'; $help.AutoSize = $true; $help.ForeColor = [Drawing.Color]::DimGray
+$help.Text = 'In game: F1 or hold START = graphics menu. Alt+Enter = window/fullscreen.'
+$help.Location = '20,538'; $help.AutoSize = $true; $help.ForeColor = [Drawing.Color]::DimGray
 $form.Controls.Add($help)
+
+function Update-TextureCount {
+    $n = 0
+    if (Test-Path $TextureDir) { $n = @(Get-ChildItem $TextureDir -Recurse -File -Include *.png, *.dds -ErrorAction SilentlyContinue).Count }
+    $texCount.Text = if ($n) { "$n textures installed" } else { 'No texture pack installed yet' }
+}
+
+function Install-TexturePack($source) {
+    $form.UseWaitCursor = $true
+    $texCount.Text = 'Installing...'
+    [Windows.Forms.Application]::DoEvents()
+    try {
+        $result = & "$Repo\tools\install_textures.ps1" -Source $source -Root $Root | Select-Object -Last 1
+        $installed = if ($result -match 'installed=(\d+)') { [int]$Matches[1] } else { 0 }
+        $skipped = if ($result -match 'skipped=(\d+)') { [int]$Matches[1] } else { 0 }
+        if ($installed -gt 0) {
+            $texBox.Checked = $true
+            $message = "$installed HD textures installed. They will be used the next time you press PLAY."
+            if ($skipped) { $message += "`n`n$skipped textures were skipped on purpose (they are known to break the image)." }
+            [Windows.Forms.MessageBox]::Show($message, 'HD textures') | Out-Null
+        } else {
+            [Windows.Forms.MessageBox]::Show('No textures (.png or .dds files) were found in that pack.', 'HD textures') | Out-Null
+        }
+    } catch {
+        [Windows.Forms.MessageBox]::Show("The texture pack could not be installed:`n$($_.Exception.Message)", 'HD textures') | Out-Null
+    } finally {
+        $form.UseWaitCursor = $false
+        Update-TextureCount
+    }
+}
+
+$texZip.Add_Click({
+    $dialog = New-Object Windows.Forms.OpenFileDialog
+    $dialog.Title = 'Choose an HD texture pack for NBA Street V3'
+    $dialog.Filter = 'Texture pack (*.zip)|*.zip'
+    if ($dialog.ShowDialog() -eq 'OK') { Install-TexturePack $dialog.FileName }
+})
+$texFolder.Add_Click({
+    $dialog = New-Object Windows.Forms.FolderBrowserDialog
+    $dialog.Description = 'Choose the folder of an HD texture pack for NBA Street V3'
+    if ($dialog.ShowDialog() -eq 'OK') { Install-TexturePack $dialog.SelectedPath }
+})
 
 function Load-Graphics {
     $values = Read-Ini
@@ -155,7 +217,7 @@ function Load-Graphics {
     $resBox.SelectedItem = ($Resolutions.Keys | Where-Object { $Resolutions[$_] -eq $scale } | Select-Object -First 1)
     if (-not $resBox.SelectedItem) { $resBox.SelectedItem = '1080p' }
     $renBox.SelectedItem = ($Renderers.Keys | Where-Object { $Renderers[$_] -eq $renderer } | Select-Object -First 1)
-    if (-not $renBox.SelectedItem) { $renBox.SelectedItem = 'Vulkan (recomendado)' }
+    if (-not $renBox.SelectedItem) { $renBox.SelectedItem = 'Vulkan (recommended)' }
     $texBox.Checked = $values['LoadTextureReplacements'] -eq 'true'
 }
 function Save-Graphics {
@@ -172,27 +234,27 @@ function Update-Status {
     $ready = (Test-Path $GameExe) -and (Test-Path "$GsHost\pcsx2-gsrunner.exe") -and (Test-Path "$Root\game\iso\SLUS_211.26")
     $play.Enabled = $ready
     if ($ready) {
-        $status.Text = 'Juego preparado. Pulsa JUGAR.'
+        $status.Text = 'The game is ready. Press PLAY.'
         $status.ForeColor = [Drawing.Color]::DarkGreen
-        $prepare.Text = 'Reparar'
+        $prepare.Text = 'Repair'
     } else {
-        $status.Text = "Primera vez: elige tu ISO y pulsa 'Preparar juego'. Compila el juego en tu PC (descarga ~6 GB de herramientas; la primera compilacion puede tardar 1-2 horas)."
+        $status.Text = "First time: choose your ISO and press 'Prepare game'. It builds the game on your PC (about 6 GB of downloads; the first time can take 1-2 hours)."
         $status.ForeColor = [Drawing.Color]::DarkOrange
-        $prepare.Text = 'Preparar juego'
+        $prepare.Text = 'Prepare game'
     }
 }
 
 $prepare.Add_Click({
     $iso = $isoBox.Text.Trim()
     if (-not (Test-Path "$Root\game\iso\SLUS_211.26") -and -not (Test-Path $iso)) {
-        [Windows.Forms.MessageBox]::Show('Elige primero tu ISO de NBA Street V3.', 'NBA Street V3') | Out-Null
+        [Windows.Forms.MessageBox]::Show('Choose your NBA Street V3 ISO first (Browse...).', 'NBA Street V3') | Out-Null
         return
     }
     $settings.Iso = $iso; Save-Settings
     $arguments = @('-NoExit', '-ExecutionPolicy', 'Bypass', '-File', "`"$Repo\tools\install.ps1`"")
     if ($iso) { $arguments += @('-Iso', "`"$iso`"") }
     $form.Enabled = $false
-    $status.Text = 'Preparando... sigue el progreso en la ventana negra. Puedes cerrarla cuando ponga "Listo".'
+    $status.Text = 'Preparing... progress is shown in the other window. Close it when it says "Done".'
     $proc = Start-Process powershell -ArgumentList $arguments -PassThru
     while (-not $proc.HasExited) { [Windows.Forms.Application]::DoEvents(); Start-Sleep -Milliseconds 200 }
     $form.Enabled = $true
@@ -205,7 +267,7 @@ $play.Add_Click({
     New-Item -ItemType Directory -Force "$Root\logs" | Out-Null
     $env:PS2X_GS_LIVE = '1'
     if ($onlineBox.Checked) {
-        # Adaptador de red emulado + servidor; la configuracion de red va en la memory card.
+        # Emulated network adapter + server; the network settings live on the memory card.
         $env:PS2X_NET = '1'
         $env:PS2X_NET_SERVER = $settings.Server
         $netcnf = "$Root\game\iso\mc0\BWNETCNF"
@@ -219,11 +281,12 @@ $play.Add_Click({
     $env:PS2X_GSHOST_ARGS = '-renderer ' + $(switch ($Renderers[$renBox.SelectedItem]) { 3 { 'dx11' } 15 { 'dx12' } 12 { 'gl' } default { 'vulkan' } }) +
         ' -ini nba_street.ini' + $(if ($fullBox.Checked) { ' -fullscreen' } else { '' })
     Start-Process $GameExe -ArgumentList "`"$Root\game\iso\SLUS_211.26`"" -WorkingDirectory "$Root\game\iso" -WindowStyle Hidden `
-        -RedirectStandardOutput "$Root\logs\jugar.log" -RedirectStandardError "$Root\logs\jugar_err.log"
+        -RedirectStandardOutput "$Root\logs\play.log" -RedirectStandardError "$Root\logs\play_err.log"
     $form.WindowState = 'Minimized'
 })
 
 $form.Add_FormClosing({ Save-Graphics })
 Load-Graphics
+Update-TextureCount
 Update-Status
 [void]$form.ShowDialog()

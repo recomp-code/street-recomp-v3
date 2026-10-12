@@ -1,20 +1,21 @@
 <#
-  Instalador completo de NBA Street V3 (port PC). Desde tu ISO hasta el juego listo para jugar:
-    1. Visual Studio 2022 Build Tools (compilador C++), si faltan  [pide permisos de administrador]
-    2. CMake y Git portables en C:\NBAStreetRecomp\tools
-    3. Tu ISO: comprueba que es SLUS-21126 y extrae su contenido en C:\NBAStreetRecomp\game\iso
-    4. Fuentes de PS2Recomp y PCSX2 con los parches de este repositorio
-    5. Recompilador -> codigo C++ del juego (generado en TU PC desde TU ELF) -> ejecutable del juego
-    6. Render (pcsx2-gsrunner): descarga la version ya compilada, o -BuildPcsx2 para compilarlo
-  Cada paso se salta si ya esta hecho: se puede relanzar tras un error o una interrupcion.
-  Uso:  powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Iso "D:\juegos\NBA Street V3.iso"
+  Full installer for the NBA Street V3 PC port, run by the launcher's "Prepare game" button.
+  From your ISO to a playable game:
+    1. Visual Studio 2022 Build Tools (C++ compiler), if missing  [asks for administrator rights]
+    2. Portable CMake and Git in C:\NBAStreetRecomp\tools
+    3. Your ISO: checks it is SLUS-21126 and copies its contents to C:\NBAStreetRecomp\game\iso
+    4. PS2Recomp and PCSX2 sources with this repository's patches
+    5. Recompiler -> the game's C++ code (generated on YOUR PC from YOUR ELF) -> game executable
+    6. Renderer (pcsx2-gsrunner): the prebuilt one shipped in the release zip, or -BuildPcsx2
+  Every step is skipped when already done, so it can simply be run again after an error.
+  Manual use:  powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Iso "D:\Games\NBA Street V3.iso"
 #>
 param(
     [string]$Iso = "",
     [string]$Root = "C:\NBAStreetRecomp",
-    [string[]]$GsHostUrl = @(),       # zip(s) del render ya compilado (assets de la Release)
-    [switch]$BuildPcsx2,              # compilar el render desde las fuentes en lugar de descargarlo
-    [switch]$Rebuild                  # regenerar y recompilar el juego aunque ya exista
+    [string[]]$GsHostUrl = @(),       # prebuilt renderer zip(s) to download (when not shipped next to the launcher)
+    [switch]$BuildPcsx2,              # build the renderer from source instead
+    [switch]$Rebuild                  # regenerate and rebuild the game even if it exists
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -32,10 +33,11 @@ $Downloads = @{
 }
 if (-not $GsHostUrl -and (Test-Path "$Repo\gshost\release_url.txt")) { $GsHostUrl = @(Get-Content "$Repo\gshost\release_url.txt" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 
+$Host.UI.RawUI.WindowTitle = 'NBA Street V3 - preparing the game'
 function Step($text) { Write-Host ""; Write-Host "==> $text" -ForegroundColor Cyan }
 function Download($url, $file) {
     if (Test-Path $file) { return }
-    Write-Host "    descargando $url"
+    Write-Host "    downloading $url"
     Invoke-WebRequest -Uri $url -OutFile "$file.part" -UseBasicParsing
     Move-Item "$file.part" $file -Force
 }
@@ -46,29 +48,30 @@ function Run($exe, [string[]]$arguments, $log) {
     } else {
         & $exe @arguments
     }
-    if ($LASTEXITCODE) { throw "$exe termino con codigo $LASTEXITCODE$(if ($log) { " (ver $log)" })" }
+    if ($LASTEXITCODE) { throw "$exe failed with code $LASTEXITCODE$(if ($log) { " (see $log)" })" }
 }
 
-# ---------------------------------------------------------------- 1. compilador C++
-Step "Compilador C++ (Visual Studio 2022 Build Tools)"
+try {
+# ---------------------------------------------------------------- 1. C++ compiler
+Step "C++ compiler (Visual Studio 2022 Build Tools)"
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 function Find-VS { if (Test-Path $vswhere) { & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath } }
 if (-not (Find-VS)) {
     Download $Downloads.VsBuildTools "$Tools\dl\vs_BuildTools.exe"
-    Write-Host "    instalando (unos 5 GB; Windows pedira permiso de administrador)..."
+    Write-Host "    installing (about 5 GB; Windows will ask for administrator permission)..."
     $p = Start-Process "$Tools\dl\vs_BuildTools.exe" -Verb RunAs -Wait -PassThru -ArgumentList @(
         '--passive', '--wait', '--norestart',
         '--add', 'Microsoft.VisualStudio.Workload.VCTools',
         '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
         '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621',
         '--add', 'Microsoft.VisualStudio.Component.VC.CMake.Project')
-    if ($p.ExitCode -notin 0, 3010) { throw "La instalacion de Build Tools fallo ($($p.ExitCode))" }
-    if (-not (Find-VS)) { throw "No se encuentran las Build Tools tras instalarlas" }
+    if ($p.ExitCode -notin 0, 3010) { throw "The Build Tools installation failed ($($p.ExitCode))" }
+    if (-not (Find-VS)) { throw "Build Tools not found after installing them" }
 }
 Write-Host "    OK: $(Find-VS)"
 
-# ---------------------------------------------------------------- 2. herramientas portables
-Step "CMake y Git portables"
+# ---------------------------------------------------------------- 2. portable tools
+Step "Portable CMake and Git"
 if (-not (Test-Path "$CMakeDir\cmake.exe")) {
     Download $Downloads.CMake "$Tools\dl\cmake.zip"
     Expand-Archive "$Tools\dl\cmake.zip" "$Tools\cmake" -Force
@@ -78,79 +81,79 @@ if (-not (Test-Path "$GitDir\git.exe")) {
     Expand-Archive "$Tools\dl\mingit.zip" "$Tools\mingit" -Force
 }
 $env:Path = "$GitDir;$CMakeDir;$env:Path"
-# Scripts del repositorio junto a las herramientas (los .cmd de compilacion los buscan ahi).
+# Repository scripts next to the tools (the build .cmd files look for them there).
 Copy-Item "$Repo\tools\*" $Tools -Recurse -Force -Exclude 'dl'
 Write-Host "    OK"
 
-# ---------------------------------------------------------------- 3. el juego (tu ISO)
-Step "Tu copia del juego"
+# ---------------------------------------------------------------- 3. the game (your ISO)
+Step "Your copy of the game"
 $isoTarget = Join-Path $Root 'game\NBAStreetV3.iso'
 $elf = Join-Path $Root 'game\iso\SLUS_211.26'
 if (-not (Test-Path $elf)) {
-    if (-not $Iso) { throw "Indica tu ISO: -Iso <ruta a NBA Street V3 (SLUS-21126).iso>" }
-    if (-not (Test-Path $Iso)) { throw "No existe $Iso" }
+    if (-not $Iso) { throw "Choose your ISO in the launcher first" }
+    if (-not (Test-Path $Iso)) { throw "File not found: $Iso" }
     $image = Mount-DiskImage -ImagePath (Resolve-Path $Iso).Path -PassThru
     try {
         $drive = ($image | Get-Volume).DriveLetter + ':\'
-        if (-not (Test-Path (Join-Path $drive 'SLUS_211.26'))) { throw "Esta ISO no es NBA Street V3 NTSC-U (falta SLUS_211.26)" }
-        Write-Host "    copiando el contenido del disco (varios GB)..."
+        if (-not (Test-Path (Join-Path $drive 'SLUS_211.26'))) { throw "This ISO is not NBA Street V3 NTSC-U (SLUS_211.26 is missing)" }
+        Write-Host "    copying the disc contents (several GB)..."
         robocopy $drive "$Root\game\iso" /E /R:1 /W:1 /NFL /NDL /NJH /NJS /NP | Out-Null
-        if ($LASTEXITCODE -ge 8) { throw "robocopy fallo ($LASTEXITCODE)" }
+        if ($LASTEXITCODE -ge 8) { throw "Copying the disc failed (robocopy $LASTEXITCODE)" }
         Get-ChildItem "$Root\game\iso" -Recurse -File | ForEach-Object { $_.IsReadOnly = $false }
     } finally {
         Dismount-DiskImage -ImagePath (Resolve-Path $Iso).Path | Out-Null
     }
 }
 if (-not (Test-Path $isoTarget)) {
-    if (-not $Iso) { throw "Falta ${isoTarget}: indica tu ISO con -Iso" }
+    if (-not $Iso) { throw "Choose your ISO in the launcher first" }
     $src = (Resolve-Path $Iso).Path
     if ([IO.Path]::GetPathRoot($src) -eq [IO.Path]::GetPathRoot($isoTarget)) {
-        New-Item -ItemType HardLink -Path $isoTarget -Target $src | Out-Null   # misma unidad: sin copiar
+        New-Item -ItemType HardLink -Path $isoTarget -Target $src | Out-Null   # same drive: no copy needed
     } else {
         Copy-Item $src $isoTarget
     }
 }
 Write-Host "    OK: $elf"
 
-# ---------------------------------------------------------------- 4. fuentes
-Step "Fuentes de PS2Recomp y PCSX2 (con los parches)"
+# ---------------------------------------------------------------- 4. sources
+Step "PS2Recomp and PCSX2 sources (with the patches)"
 & "$Repo\tools\setup_sources.ps1" -Root $Root
 
-# ---------------------------------------------------------------- 5. recompilador y juego
+# ---------------------------------------------------------------- 5. recompiler and game
 $build = Join-Path $Root 'PS2Recomp\out\build'
 $recompExe = Join-Path $build 'ps2xRecomp\Release\ps2_recomp.exe'
 $gameExe = Join-Path $build 'ps2xRuntime\Release\ps2EntryRunner.exe'
-Step "Recompilador"
+Step "Recompiler"
 if (-not (Test-Path $recompExe)) {
     Run "$CMakeDir\cmake.exe" @('-S', "$Root\PS2Recomp", '-B', $build) "$Logs\install_configure.log"
     Run "$CMakeDir\cmake.exe" @('--build', $build, '--config', 'Release', '--target', 'ps2_recomp', '--parallel') "$Logs\install_recomp.log"
 }
 Write-Host "    OK"
 
-Step "Codigo del juego (generado desde tu ELF)"
+Step "Game code (generated from your ELF)"
 $runner = Join-Path $Root 'PS2Recomp\ps2xRuntime\src\runner'
 if ($Rebuild -or -not (Test-Path "$runner\nba_street_v3_overrides.cpp")) {
     & "$Repo\tools\generate_game.ps1" -Root $Root
 }
 Write-Host "    OK"
 
-Step "Compilando el juego (la primera vez puede tardar mas de una hora)"
+Step "Compiling the game (the first time this can take more than an hour)"
 if ($Rebuild -or -not (Test-Path $gameExe)) {
     Run "$CMakeDir\cmake.exe" @('-S', "$Root\PS2Recomp", '-B', $build) "$Logs\install_configure2.log"
     Run "$CMakeDir\cmake.exe" @('--build', $build, '--config', 'Release', '--target', 'ps2EntryRunner', '--parallel') "$Logs\install_game.log"
 }
 Write-Host "    OK: $gameExe"
 
-# ---------------------------------------------------------------- 6. render
-Step "Render (PCSX2 pcsx2-gsrunner)"
+# ---------------------------------------------------------------- 6. renderer
+Step "Renderer (PCSX2 pcsx2-gsrunner)"
 $gshost = Join-Path $Root 'gshost'
 if (-not (Test-Path "$gshost\pcsx2-gsrunner.exe")) {
-    # Render precompilado: zips junto al launcher si el jugador los bajo, si no se descargan de la release.
+    # Prebuilt renderer: shipped next to the launcher in the release zip, otherwise downloaded.
     $localZips = @(Get-ChildItem $Repo -Filter 'gshost-win64*.zip' -ErrorAction SilentlyContinue)
     if (-not $BuildPcsx2 -and $localZips.Count) {
         foreach ($z in $localZips) { Expand-Archive $z.FullName $gshost -Force }
     } elseif ($BuildPcsx2 -or -not $GsHostUrl) {
-        if (-not $BuildPcsx2) { Write-Warning "No hay URL del render precompilado: se compila desde las fuentes (necesita LLVM, Ninja, Python y PortableGit en $Tools, ver README)" }
+        if (-not $BuildPcsx2) { Write-Warning "No prebuilt renderer found: building it from source (needs LLVM, Ninja, Python and PortableGit in $Tools, see the README)" }
         Run "$Tools\build_pcsx2_deps.bat" @() "$Logs\install_pcsx2_deps.log"
         Run "$Tools\build_pcsx2.cmd" @('pcsx2-gsrunner') "$Logs\install_pcsx2.log"
         & "$Repo\tools\setup_gshost.ps1" -Root $Root
@@ -165,6 +168,14 @@ if (-not (Test-Path "$gshost\pcsx2-gsrunner.exe")) {
 if (-not (Test-Path "$gshost\nba_street.ini")) { Copy-Item "$Repo\gshost\nba_street.ini" $gshost }
 Write-Host "    OK: $gshost"
 
-# ---------------------------------------------------------------- listo
-Copy-Item "$Repo\Jugar.cmd" (Join-Path $Root 'Jugar.cmd') -Force
-Step "Listo. Juega con $Root\Jugar.cmd o con el launcher (Launcher.cmd)."
+# ---------------------------------------------------------------- done
+Copy-Item "$Repo\Play.cmd" (Join-Path $Root 'Play.cmd') -Force
+Write-Host ""
+Write-Host "==> Done! You can close this window and press PLAY in the launcher." -ForegroundColor Green
+}
+catch {
+    Write-Host ""
+    Write-Host "==> Something went wrong: $($_.Exception.Message)" -ForegroundColor Red
+    Write-Host "    Press 'Prepare game' again to retry (finished steps are skipped)."
+    Write-Host "    If it keeps failing, open an issue on GitHub and attach the files in $Logs."
+}

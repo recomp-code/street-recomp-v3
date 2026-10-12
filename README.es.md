@@ -2,21 +2,41 @@
 
 [English](README.md) | **Español**
 
-Recompilación estática de **NBA Street V3 (PS2, NTSC-U, SLUS-21126)** a un ejecutable nativo de
-Windows x64 con [PS2Recomp](https://github.com/ran-j/PS2Recomp), con el render por GPU del GS de
-[PCSX2](https://github.com/PCSX2/pcsx2) (Vulkan / Direct3D / OpenGL), resolución interna hasta 8x,
-VU1 en microVU y paquetes de texturas HD compatibles con PCSX2.
+Juega a **NBA Street V3** (PS2) de forma nativa en Windows: alta resolución, texturas HD, mando y
+**online funcionando**. El juego se recompila estáticamente a un programa nativo x64 con
+[PS2Recomp](https://github.com/ran-j/PS2Recomp) y se dibuja en tu GPU con el render de
+[PCSX2](https://github.com/PCSX2/pcsx2).
 
-> **Este repositorio NO contiene nada del juego**: ni ISO, ni ELF, ni código generado a partir de él,
-> ni texturas. Necesitas **tu propia copia** de NBA Street V3 (SLUS-21126). El código C++ del juego se
-> genera en tu PC a partir de tu ELF.
+> **Este proyecto NO contiene nada del juego**: ni ISO, ni archivos del juego, ni texturas. Necesitas
+> **tu propia copia** de NBA Street V3 (versión USA, SLUS-21126) en un archivo ISO.
 
 | | |
 |---|---|
-| ![Title screen](docs/screenshots/title.jpg) | ![Loading screen](docs/screenshots/loading.jpg) |
-| ![Tip-off](docs/screenshots/tipoff.jpg) | ![In a match](docs/screenshots/match.jpg) |
+| ![Pantalla de título](docs/screenshots/title.jpg) | ![Pantalla de carga](docs/screenshots/loading.jpg) |
+| ![Salto inicial](docs/screenshots/tipoff.jpg) | ![En partido](docs/screenshots/match.jpg) |
 
 <sub>Capturas de este port (Vulkan, resolución interna 4x, 16:9). NBA Street V3 © Electronic Arts.</sub>
+
+## Cómo jugar
+
+1. Entra en [**Releases**](https://github.com/recomp-code/street-recomp-v3/releases/latest) y descarga
+   **`NBAStreetV3-PC-1.0.zip`** (es el único archivo que necesitas).
+2. Descomprímelo donde quieras y haz doble clic en **`Launcher.cmd`**.
+3. Pulsa **Browse...** y elige tu ISO de NBA Street V3.
+4. Pulsa **Prepare game**. Esto se hace **solo una vez**: descarga lo necesario y compila el juego en
+   tu PC a partir de tu ISO (unos 6 GB de descargas, 1-2 horas). Windows pedirá permiso una vez para
+   instalar las herramientas de C++ de Microsoft. Una ventana muestra el progreso; ciérrala cuando
+   ponga **Done**.
+5. Pulsa **PLAY**. A partir de ahí, solo abre el launcher y pulsa **PLAY**.
+
+<p align="center"><img src="docs/screenshots/launcher.png" alt="Launcher" width="420"></p>
+
+En el launcher también eliges la **resolución** (hasta 5K), el **renderizador**, **pantalla completa**,
+las **texturas HD** y el **online**. Jugando, **F1** o **mantener START** abre el menú gráfico y
+**Alt+Enter** cambia entre ventana y pantalla completa.
+
+¿Por qué compila el juego en vez de traerlo hecho? El programa contiene el código del propio juego
+traducido a C++, así que no se puede distribuir: se genera en tu PC a partir de tu copia.
 
 ## Características
 
@@ -25,107 +45,92 @@ VU1 en microVU y paquetes de texturas HD compatibles con PCSX2.
   de PS2 se emulan; los microprogramas de VU1 corren en el recompilador microVU de PCSX2.
 - **Render moderno por GPU** con el GS de PCSX2: Vulkan, Direct3D 11/12 u OpenGL, resolución interna
   desde 480p nativa hasta 8x (5K+), filtrado de texturas, 4:3 o 16:9 estirado, pantalla completa.
-- **Paquetes de texturas HD** en formato PCSX2 para SLUS-21126 (ver [Texturas HD](#texturas-hd)),
-  con carga asíncrona para que no frenen el juego.
+- **Packs de texturas HD**, instalados con un clic desde el launcher (ver [Texturas HD](#texturas-hd)).
 - **Online recuperado** contra un servidor de la comunidad: cuentas EA, personas, ballers online,
-  partidas PLAY NOW con el tráfico por relay (sin abrir puertos). Ver [Modo online](#modo-online).
-- **Launcher de un clic**: eliges tu ISO, preparas una vez y juegas. Resolución, renderizador,
-  texturas HD y servidor online se eligen en el launcher.
+  partidas PLAY NOW, sin abrir puertos. Ver [Modo online](#modo-online).
+- **Launcher de un clic**: eliges tu ISO, preparas una vez y juegas.
 - **Menú gráfico en el juego**: F1, Back+Start o mantener START 1,5 s (funciona con el mando).
-- **Mandos XInput y teclado**; cada ventana solo usa el mando mientras está delante.
-- **Memory card emulada** con partidas guardadas normales (`game\iso\mc0`).
+- **Mandos tipo Xbox (XInput) y teclado**.
+- **Memory card emulada** con partidas guardadas normales.
 
 ## Texturas HD
 
-El render carga reemplazos de texturas en formato PCSX2: PNG con el nombre del hash de la textura
-original, en `Documentos\PCSX2\textures\SLUS-21126\replacements`. Se activan con **Texturas HD** en
-el launcher o en el menú gráfico del juego.
+1. Consigue un pack de texturas HD para NBA Street V3 (formato PCSX2, normalmente un `.zip` lleno de `.png`).
+2. En el launcher pulsa **Add texture pack (.zip)...** (o **(folder)...** si ya lo descomprimiste).
+3. Pulsa **PLAY**. Listo: el launcher instala el pack, activa las texturas HD y se salta solo las
+   pocas texturas que se sabe que estropean la imagen (menús con grano, iconos de botones rotos).
 
-- **Usar un pack**: copia sus PNG a esa carpeta `replacements` (sin cambiar los nombres) y activa
-  las texturas HD.
-- **Hacer tu propio pack**:
-  1. En el menú gráfico pon Texturas HD en **"Activadas + volcar originales"** y recorre los menús y
-     canchas que quieras; los originales se vuelcan a `Documentos\PCSX2\textures\SLUS-21126\dumps`.
-  2. Ejecuta `tools\texturas_preparar.ps1`: copia los volcados a `C:\NBAStreetRecomp\texturas_hd\originales`
-     y aparta las texturas que **no** se deben reemplazar (fotogramas de vídeo, capturas dinámicas de
-     memoria de vídeo que el juego reescribe cada fotograma y páginas invisibles volcadas con una
-     paleta ajena). Reemplazarlas causa menús con grano e iconos de botones rotos.
-  3. Mejora los PNG con la herramienta que quieras (p. ej. un escalador por IA) en
-     `C:\NBAStreetRecomp\texturas_hd\hd`, con los mismos nombres.
-  4. Ejecuta `tools\texturas_instalar.ps1`: los copia a `replacements` saltando los descartados.
+Puedes activar o desactivar las texturas HD con **Use HD textures** en el launcher o en el menú
+gráfico del juego. Los packs no se incluyen aquí (se hacen a partir de las imágenes del juego).
 
-Los packs de texturas son contenido del juego: no se incluyen en este repositorio ni en las releases.
+<details>
+<summary>Hacer tu propio pack (avanzado)</summary>
 
-## Contenido
+1. En el menú gráfico del juego pon Texturas HD en **"Activadas + volcar originales"** y recorre los
+   menús y canchas que quieras; los originales se vuelcan a `Documentos\PCSX2\textures\SLUS-21126\dumps`.
+2. Ejecuta `tools\texturas_preparar.ps1`: copia los volcados a `C:\NBAStreetRecomp\texturas_hd\originales`
+   y aparta las texturas que no se deben reemplazar (fotogramas de vídeo, capturas dinámicas de
+   memoria de vídeo que el juego reescribe cada fotograma, páginas invisibles con paleta ajena).
+3. Mejora los PNG con la herramienta que quieras (p. ej. un escalador por IA), con los mismos nombres.
+4. Añade la carpeta con los PNG mejorados desde el launcher (**Add texture pack (folder)...**).
 
-| Ruta | Qué es |
-|---|---|
-| `patches/ps2recomp.patch` | Cambios sobre PS2Recomp `2c5fbb9` (recompilador, runtime, IOP, red DEV9, SPU2...) |
-| `patches/pcsx2.patch` | Cambios sobre PCSX2 `d073d75` (`pcsx2-gsrunner -live`: render en tiempo real del juego) |
-| `game/config/` | Configuración del recompilador para SLUS-21126 (lista de funciones y direcciones) |
-| `game/overrides/` | Ajustes específicos del juego (`nba_street_v3_overrides.cpp`) |
-| `gshost/nba_street.ini` | Opciones gráficas por defecto |
-| `tools/` | Scripts de preparación, compilación, depuración y texturas |
-| `docs/PORTING_NOTES.md` | Notas técnicas: todos los bugs encontrados y cómo se arreglaron |
-| `Jugar.cmd` | Lanzador |
-
-## Para jugar (lo fácil): el launcher
-
-1. Descarga `NBAStreetV3-PC-<versión>.zip` de **Releases** (es el único archivo que necesitas) y descomprímelo donde quieras.
-2. Abre **`Launcher.cmd`**:
-
-   | Control | Qué hace |
-   |---|---|
-   | **Tu ISO... / Elegir...** | Elige tu ISO de NBA Street V3 (NTSC-U, SLUS-21126). Se recuerda. |
-   | **Preparar juego** | Solo la primera vez: instala Visual Studio Build Tools, CMake y Git si faltan, extrae tu ISO en `C:\NBAStreetRecomp\game`, genera el C++ del juego desde tu ELF y lo compila. ~6 GB de descargas y 1-2 horas; el progreso sale en una ventana de consola ("Listo" = terminado). Después el botón pasa a **Reparar**. |
-   | **Resolución interna** | Nativa 480p, 720p, 1080p, 1440p, 4K u 8x. |
-   | **Renderizador** | Vulkan (recomendado), Direct3D 11, Direct3D 12 u OpenGL. |
-   | **Pantalla completa** | Arranca a pantalla completa (Alt+Enter alterna en el juego). |
-   | **Texturas HD** | Carga packs HD formato PCSX2 de `Documentos\PCSX2\textures\SLUS-21126\replacements`. |
-   | **Jugar online** + **Servidor** | Activa el adaptador de red y elige el servidor (por defecto el de la comunidad, `nbas3.xellrecomp.party`). Desmárcalo para jugar sin red. |
-   | **JUGAR** | Arranca el juego con esas opciones. |
-
-   Las opciones gráficas se guardan en `C:\NBAStreetRecomp\gshost\nba_street.ini` y las del launcher en
-   `%APPDATA%\NBAStreetV3Launcher.json`. En el juego: **F1**, **Back+Start** o **mantener START 1,5 s**
-   abre el menú gráfico.
-
-¿Por qué compilar? El ejecutable final contiene el código del juego traducido a C++, así que no se
-puede distribuir. Todo lo distribuible (launcher, parches, herramientas y el render de PCSX2 ya
-compilado) va en ese único zip.
-
-`Jugar.cmd` hace lo mismo que **JUGAR** sin ventana (online por defecto; `set NBA_SERVER=off` para
-jugar sin red o `set NBA_SERVER=<host o IP>` para otro servidor).
+</details>
 
 ## Modo online
 
-El servicio EA Online original del juego cerró hace años. Este port lo recupera:
+El servicio EA Online original del juego cerró hace años; este port lo recupera. El online viene
+activado por defecto en el launcher (**Play online**).
+
+Cómo jugar un partido:
+
+1. En el launcher deja **Play online** marcado y pulsa **PLAY**.
+2. En el juego: **PLAY ONLINE** -> **YES** -> **"1 - NBA Street Online (DHCP)"** -> conectar.
+   No uses "New/Edit" en esa pantalla.
+3. Solo la primera vez: crea una cuenta (usuario de 4+ letras, cualquier e-mail y contraseña — solo
+   se guardan en el servidor de la comunidad, **no reutilices una contraseña real**) y luego una **persona**.
+4. Crea un **baller online** (Create Baller en el menú online) y guárdalo.
+5. **PLAY** -> **PICKUP GAMES** -> **PLAY NOW**. Te empareja con el siguiente jugador que haga lo
+   mismo; el partido empieza cuando están los dos.
+
+No hace falta configurar el router: el tráfico del partido pasa por el servidor. Si se queda en
+"connecting", permite `ps2EntryRunner.exe` en tu firewall.
+
+<details>
+<summary>Cómo funciona</summary>
 
 - **Adaptador de red.** El adaptador de red de PS2 (DEV9/SMAP) se emula con el modo "sockets" de
-  PCSX2: sin drivers, sin permisos de administrador, sin TAP/pcap. El juego obtiene IP por DHCP y sus
-  nombres de EA (`ps2nbastreet05.ea.com`, etc.) se redirigen al servidor configurado.
+  PCSX2: sin drivers ni permisos de administrador. El juego obtiene IP por DHCP y sus nombres de EA
+  (`ps2nbastreet05.ea.com`, etc.) se redirigen al servidor configurado.
 - **Servidor.** Un servidor de la comunidad reimplementa el protocolo de lobby de EA: cuentas,
   personas, ballers online (guardados en el servidor), partidas rápidas (PLAY NOW) y montaje del
   partido. El código del servidor no está en este repositorio.
 - **Tráfico del partido.** Las dos consolas hablan normalmente P2P por UDP. Aquí cada jugador recibe
-  una IP virtual y todo el tráfico pasa por el relay UDP del servidor: **no hay que abrir puertos** en
-  el router y funciona detrás de NAT/CGNAT. La latencia es tu ping al servidor más el del rival.
+  una IP virtual y todo el tráfico pasa por el relay UDP del servidor (UDP 21003): funciona detrás de
+  NAT/CGNAT. La latencia es tu ping al servidor más el del rival.
 - **Configuración de red.** El launcher copia una configuración lista (`game/mc0_netcnf`) a la
   memory card emulada la primera vez que juegas online.
+- Problemas: el log es `C:\NBAStreetRecomp\logs\play_err.log` ("cannot resolve server" = sin internet o DNS).
 
-Cómo jugar un partido:
+</details>
 
-1. En el launcher deja **Jugar online** marcado y pulsa **JUGAR**.
-2. En el juego: **PLAY ONLINE** -> **YES** -> **"1 - NBA Street Online (DHCP)"** -> conectar.
-   No uses "New/Edit" en esa pantalla.
-3. La primera vez: crea una cuenta EA (usuario de 4+ letras, cualquier e-mail y contraseña; solo se
-   guardan en el servidor de la comunidad, no reutilices una contraseña real) y luego una **persona**.
-4. Crea un **baller online** (Create Baller desde el menú online) y guárdalo.
-5. **PLAY** -> **PICKUP GAMES** -> **PLAY NOW**. Te empareja con el siguiente jugador que haga lo
-   mismo; el partido empieza cuando están los dos.
+## Para desarrolladores
 
-Problemas: "cannot resolve server" en `C:\NBAStreetRecomp\logs\jugar_err.log` = sin internet o DNS;
-si se queda en "connecting", seguramente un firewall bloquea `ps2EntryRunner.exe` (TCP al servidor y
-UDP 21003).
+Lo que sigue solo hace falta para compilar o modificar el port a mano; para jugar no necesitas nada más.
+
+| Ruta | Qué es |
+|---|---|
+| `Launcher.cmd` / `Launcher.ps1` | Launcher: eliges tu ISO, preparas el juego una vez, texturas HD, jugar |
+| `tools/install.ps1` | Instalador de un paso que usa **Prepare game** (herramientas, fuentes, compilación) |
+| `tools/install_textures.ps1` | Instalador de packs que usa **Add texture pack** (con `gshost/texture_blocklist.txt`) |
+| `patches/ps2recomp.patch` | Cambios sobre PS2Recomp `2c5fbb9` (recompilador, runtime, IOP, red DEV9, SPU2...) |
+| `patches/pcsx2.patch` | Cambios sobre PCSX2 `d073d75` (`pcsx2-gsrunner -live`: render en tiempo real para el juego) |
+| `game/config/` | Configuración del recompilador para SLUS-21126 (solo lista de funciones y direcciones) |
+| `game/overrides/` | Arreglos específicos del juego (`nba_street_v3_overrides.cpp`) |
+| `game/mc0_netcnf/` | Configuración de red para la memory card emulada (online) |
+| `gshost/nba_street.ini` | Opciones gráficas por defecto |
+| `tools/` | Scripts de preparación, compilación, depuración y texturas (`make_patches.ps1` regenera los parches) |
+| `docs/PORTING_NOTES.md` | Notas técnicas: cada bug encontrado y cómo se arregló |
+| `Play.cmd` | Arranca el juego sin el launcher (`set NBA_SERVER=off` para jugar sin red) |
 
 ## Requisitos (compilar a mano)
 
@@ -187,7 +192,7 @@ powershell -ExecutionPolicy Bypass -File nbastreet-v3-recomp\tools\setup_gshost.
 Las dependencias (SDL3, shaderc, etc.) solo se compilan una vez. `setup_gshost.ps1` monta
 `C:\NBAStreetRecomp\gshost` con el exe, las DLL, `resources` y la configuración gráfica.
 
-**7. Jugar:** `nbastreet-v3-recomp\Jugar.cmd` (cópialo donde quieras).
+**7. Jugar:** `nbastreet-v3-recomp\Play.cmd` (cópialo donde quieras).
 
 ## Uso
 
@@ -197,8 +202,8 @@ Las dependencias (SDL3, shaderc, etc.) solo se compilan una vez. `setup_gshost.p
 - **Pantalla completa**: Alt+Enter o F11.
 - **Partidas guardadas**: `game\iso\mc0\` (memory card emulada).
 - **Texturas HD**: formato de PCSX2, en `Documentos\PCSX2\textures\SLUS-21126\replacements`.
-  Ver `tools\texturas_preparar.ps1` / `texturas_instalar.ps1`: apartan solas las texturas que no se
-  deben reemplazar (capturas dinámicas de pantalla y páginas invisibles), que estropean la imagen.
+  Las instala `tools\install_textures.ps1` (el botón del launcher), que se salta los hashes de
+  `gshost\texture_blocklist.txt` (capturas dinámicas de pantalla y páginas invisibles que estropean la imagen).
 
 ## Estado
 

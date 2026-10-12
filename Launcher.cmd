@@ -1,3 +1,3 @@
 @echo off
-rem Launcher de NBA Street V3 (port PC): elige tu ISO, prepara el juego (solo la primera vez) y juega.
+rem NBA Street V3 PC launcher: pick your ISO, prepare the game (first time only) and play.
 start "" powershell -NoProfile -STA -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0Launcher.ps1"
