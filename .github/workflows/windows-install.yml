@@ -1,0 +1,53 @@
+# Runs the real Windows installer (tools/install.ps1) under Windows PowerShell 5.1, the one the
+# launcher uses, up to the recompiler build: VS detection, CMake/Git from PATH, sources + patches,
+# CMake configure (which prints warnings on stderr) and the recompiler. No ISO needed.
+name: Windows installer
+
+on:
+  push:
+    paths: ['tools/*.ps1', 'patches/**', '.github/workflows/windows-install.yml']
+  pull_request:
+    paths: ['tools/*.ps1', 'patches/**', '.github/workflows/windows-install.yml']
+  workflow_dispatch:
+
+jobs:
+  install:
+    name: install.ps1 -RecompilerOnly (PowerShell 5.1)
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Native stderr under $ErrorActionPreference = 'Stop'
+        shell: powershell
+        run: |
+          $PSVersionTable.PSVersion.ToString()
+          $ErrorActionPreference = 'Stop'
+          $src = Get-Content tools/install.ps1 -Raw
+          Invoke-Expression ([regex]::Match($src, '(?s)function Run\(.*?\r?\n}\r?\n').Value)
+          $log = Join-Path $env:RUNNER_TEMP 'run_test.log'
+          Run 'cmd.exe' @('/c', 'echo out & echo CMake Warning on stderr 1>&2 & exit /b 0') $log
+          Write-Host "warning only: OK"
+          $threw = $false
+          try { Run 'cmd.exe' @('/c', 'echo boom 1>&2 & exit /b 3') $log } catch { $threw = $true; Write-Host "failure: $($_.Exception.Message)" }
+          if (-not $threw) { throw 'Run did not report a failing command' }
+
+      - name: install.ps1 -RecompilerOnly
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\install.ps1 -Root "$env:RUNNER_TEMP\NBAStreetRecomp" -RecompilerOnly
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Run it again (retry path: patches already applied, steps skipped)
+        shell: powershell
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File tools\install.ps1 -Root "$env:RUNNER_TEMP\NBAStreetRecomp" -RecompilerOnly
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: install-logs
+          path: ${{ runner.temp }}\NBAStreetRecomp\logs
