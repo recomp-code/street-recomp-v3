@@ -17,12 +17,13 @@ $TextureDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PCSX2\tex
 # ---------------------------------------------------------------- launcher settings
 # Community online server (fixed; NBA_SERVER in the environment overrides it for testing).
 $Server = if ($env:NBA_SERVER) { $env:NBA_SERVER } else { 'nbas3.xellrecomp.party' }
-$settings = @{ Iso = ''; Fullscreen = $true }
+$settings = @{ Iso = ''; Fullscreen = $true; SmoothMotion = $false }
 try {
     if (Test-Path $SettingsFile) {
         $loaded = Get-Content $SettingsFile -Raw | ConvertFrom-Json
         if ($loaded.Iso) { $settings.Iso = $loaded.Iso }
         if ($null -ne $loaded.Fullscreen) { $settings.Fullscreen = [bool]$loaded.Fullscreen }
+        if ($null -ne $loaded.SmoothMotion) { $settings.SmoothMotion = [bool]$loaded.SmoothMotion }
     }
 } catch {}
 function Save-Settings { try { $settings | ConvertTo-Json | Set-Content $SettingsFile } catch {} }
@@ -123,6 +124,10 @@ $fullBox = New-Object Windows.Forms.CheckBox
 $fullBox.Text = 'Fullscreen'; $fullBox.Location = '12,120'; $fullBox.AutoSize = $true
 $fullBox.Checked = $settings.Fullscreen
 $group.Controls.Add($fullBox)
+$smoothBox = New-Object Windows.Forms.CheckBox
+$smoothBox.Text = 'NVIDIA Smooth Motion (120+ Hz screens)'; $smoothBox.Location = '150,120'; $smoothBox.AutoSize = $true
+$smoothBox.Checked = $settings.SmoothMotion
+$group.Controls.Add($smoothBox)
 
 # HD textures
 $texGroup = New-Object Windows.Forms.GroupBox
@@ -229,6 +234,7 @@ function Save-Graphics {
     Write-IniValue 'NbaUpscaler' $Upscalers[$upBox.SelectedItem]
     Write-IniValue 'LoadTextureReplacements' $(if ($texBox.Checked) { 'true' } else { 'false' })
     $settings.Fullscreen = $fullBox.Checked
+    $settings.SmoothMotion = $smoothBox.Checked
     Save-Settings
 }
 
@@ -277,6 +283,9 @@ $play.Add_Click({
         New-Item -ItemType Directory -Force $netcnf | Out-Null
         Copy-Item "$Repo\game\mc0_netcnf\BWNETCNF\*" $netcnf -Force
     }
+    # NVIDIA driver frame generation (RTX 40/50, Vulkan): doubles the frames shown on 120+ Hz
+    # screens; the game itself still runs at 60. Read by the NVIDIA driver from the environment.
+    $env:NVPRESENT_ENABLE_SMOOTH_MOTION = if ($smoothBox.Checked) { '1' } else { $null }
     $env:PS2X_GSHOST_ARGS = '-renderer ' + $(switch ($Renderers[$renBox.SelectedItem]) { 3 { 'dx11' } 15 { 'dx12' } 12 { 'gl' } default { 'vulkan' } }) +
         ' -ini nba_street.ini' + $(if ($fullBox.Checked) { ' -fullscreen' } else { '' })
     Start-Process $GameExe -ArgumentList "`"$Root\game\iso\SLUS_211.26`"" -WorkingDirectory "$Root\game\iso" -WindowStyle Hidden `
