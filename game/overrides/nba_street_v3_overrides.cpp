@@ -39,6 +39,9 @@
 #endif
 #include <windows.h>
 #include <intrin.h>
+#else
+#include "ps2x/host_intrin.h"
+#include <time.h>
 #endif
 
 // Runtime frame-budget counters (ps2_runtime.cpp).
@@ -388,6 +391,11 @@ namespace
             GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user);
             cpu = (static_cast<uint64_t>(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
                   (static_cast<uint64_t>(user.dwHighDateTime) << 32 | user.dwLowDateTime);
+#else
+            timespec threadCpu{};
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &threadCpu);
+            // Same 100 ns units as GetThreadTimes.
+            cpu = static_cast<uint64_t>(threadCpu.tv_sec) * 10000000ull + static_cast<uint64_t>(threadCpu.tv_nsec) / 100u;
 #endif
             const double windowMs = std::chrono::duration<double, std::milli>(end - s_windowStart).count();
             const double cpuPct = s_lastCpu ? 100.0 * static_cast<double>(cpu - s_lastCpu) / 10000.0 / windowMs : 0.0;
