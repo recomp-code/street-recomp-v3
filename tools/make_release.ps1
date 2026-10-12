@@ -19,6 +19,7 @@ New-Item -ItemType Directory -Force $stage | Out-Null
 $files = git -C $Repo ls-files
 if ($LASTEXITCODE) { throw "git ls-files fallo" }
 foreach ($f in $files) {
+    if ($f -like 'docs/videos/*') { continue } # videos del README: solo en GitHub, no en el zip del jugador
     $dst = Join-Path $stage $f
     New-Item -ItemType Directory -Force (Split-Path $dst) | Out-Null
     Copy-Item (Join-Path $Repo $f) $dst
