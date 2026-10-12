@@ -50,12 +50,13 @@ function Write-IniValue($key, $value) {
 }
 
 $Resolutions = [ordered]@{ 'Native (480p)' = 1; '720p' = 2; '1080p' = 3; '1440p' = 4; '4K' = 6; '5K+ (8x)' = 8 }
+$Upscalers = [ordered]@{ 'Off' = 0; 'AMD FSR 1 (any GPU)' = 1; 'NVIDIA DLSS (RTX)' = 2 }
 $Renderers = [ordered]@{ 'Vulkan (recommended)' = 14; 'Direct3D 11' = 3; 'Direct3D 12' = 15; 'OpenGL' = 12 }
 
 # ---------------------------------------------------------------- window
 $form = New-Object Windows.Forms.Form
 $form.Text = 'NBA Street V3 - PC'
-$form.Size = New-Object Drawing.Size(520, 580)
+$form.Size = New-Object Drawing.Size(520, 612)
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
@@ -92,7 +93,7 @@ $form.Controls.Add($status)
 
 # Graphics
 $group = New-Object Windows.Forms.GroupBox
-$group.Text = 'Graphics'; $group.Location = '20,172'; $group.Size = '468,120'
+$group.Text = 'Graphics'; $group.Location = '20,172'; $group.Size = '468,152'
 $form.Controls.Add($group)
 
 $resLabel = New-Object Windows.Forms.Label
@@ -111,14 +112,21 @@ $renBox.DropDownStyle = 'DropDownList'; $renBox.Location = '170,56'; $renBox.Siz
 $Renderers.Keys | ForEach-Object { [void]$renBox.Items.Add($_) }
 $group.Controls.Add($renBox)
 
+$upLabel = New-Object Windows.Forms.Label
+$upLabel.Text = 'Upscaling:'; $upLabel.Location = '12,92'; $upLabel.AutoSize = $true
+$group.Controls.Add($upLabel)
+$upBox = New-Object Windows.Forms.ComboBox
+$upBox.DropDownStyle = 'DropDownList'; $upBox.Location = '170,88'; $upBox.Size = '200,26'
+$Upscalers.Keys | ForEach-Object { [void]$upBox.Items.Add($_) }
+$group.Controls.Add($upBox)
 $fullBox = New-Object Windows.Forms.CheckBox
-$fullBox.Text = 'Fullscreen'; $fullBox.Location = '12,88'; $fullBox.AutoSize = $true
+$fullBox.Text = 'Fullscreen'; $fullBox.Location = '12,120'; $fullBox.AutoSize = $true
 $fullBox.Checked = $settings.Fullscreen
 $group.Controls.Add($fullBox)
 
 # HD textures
 $texGroup = New-Object Windows.Forms.GroupBox
-$texGroup.Text = 'HD textures'; $texGroup.Location = '20,300'; $texGroup.Size = '468,92'
+$texGroup.Text = 'HD textures'; $texGroup.Location = '20,332'; $texGroup.Size = '468,92'
 $form.Controls.Add($texGroup)
 
 $texBox = New-Object Windows.Forms.CheckBox
@@ -139,7 +147,7 @@ $texGroup.Controls.Add($texFolder)
 
 # Online
 $netGroup = New-Object Windows.Forms.GroupBox
-$netGroup.Text = 'Online'; $netGroup.Location = '20,400'; $netGroup.Size = '468,56'
+$netGroup.Text = 'Online'; $netGroup.Location = '20,432'; $netGroup.Size = '468,56'
 $form.Controls.Add($netGroup)
 $onlineLabel = New-Object Windows.Forms.Label
 $onlineLabel.Text = 'Ready - choose PLAY ONLINE in the game menu.'; $onlineLabel.Location = '12,26'; $onlineLabel.AutoSize = $true
@@ -147,17 +155,17 @@ $onlineLabel.ForeColor = [Drawing.Color]::DarkGreen
 $netGroup.Controls.Add($onlineLabel)
 
 $prepare = New-Object Windows.Forms.Button
-$prepare.Text = 'Prepare game'; $prepare.Location = '20,466'; $prepare.Size = '150,44'
+$prepare.Text = 'Prepare game'; $prepare.Location = '20,498'; $prepare.Size = '150,44'
 $form.Controls.Add($prepare)
 
 $play = New-Object Windows.Forms.Button
-$play.Text = 'PLAY'; $play.Location = '338,466'; $play.Size = '150,44'
+$play.Text = 'PLAY'; $play.Location = '338,498'; $play.Size = '150,44'
 $play.Font = New-Object Drawing.Font('Segoe UI', 12, [Drawing.FontStyle]::Bold)
 $form.Controls.Add($play)
 
 $help = New-Object Windows.Forms.Label
 $help.Text = 'In game: F1 or hold START = graphics menu. Alt+Enter = window/fullscreen.'
-$help.Location = '20,518'; $help.AutoSize = $true; $help.ForeColor = [Drawing.Color]::DimGray
+$help.Location = '20,550'; $help.AutoSize = $true; $help.ForeColor = [Drawing.Color]::DimGray
 $form.Controls.Add($help)
 
 function Update-TextureCount {
@@ -211,10 +219,14 @@ function Load-Graphics {
     $renBox.SelectedItem = ($Renderers.Keys | Where-Object { $Renderers[$_] -eq $renderer } | Select-Object -First 1)
     if (-not $renBox.SelectedItem) { $renBox.SelectedItem = 'Vulkan (recommended)' }
     $texBox.Checked = $values['LoadTextureReplacements'] -eq 'true'
+    $up = if ($values['NbaUpscaler']) { [int]$values['NbaUpscaler'] } else { 0 }
+    $upBox.SelectedItem = ($Upscalers.Keys | Where-Object { $Upscalers[$_] -eq $up } | Select-Object -First 1)
+    if (-not $upBox.SelectedItem) { $upBox.SelectedItem = 'Off' }
 }
 function Save-Graphics {
     Write-IniValue 'upscale_multiplier' $Resolutions[$resBox.SelectedItem]
     Write-IniValue 'Renderer' $Renderers[$renBox.SelectedItem]
+    Write-IniValue 'NbaUpscaler' $Upscalers[$upBox.SelectedItem]
     Write-IniValue 'LoadTextureReplacements' $(if ($texBox.Checked) { 'true' } else { 'false' })
     $settings.Fullscreen = $fullBox.Checked
     Save-Settings

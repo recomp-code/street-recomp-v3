@@ -32,6 +32,7 @@ $Downloads = @{
     CMake        = 'https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip'
     MinGit       = 'https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.2/MinGit-2.56.0.2-64-bit.zip'
 }
+$DlssDllUrl = 'https://raw.githubusercontent.com/NVIDIA/DLSS/main/lib/Windows_x86_64/rel/nvngx_dlss.dll'
 # Fixed to the release that carries the pack, so later releases only need the small launcher zip.
 $TexturePackUrl = 'https://github.com/recomp-code/street-recomp-v3/releases/download/v1.1/NBAStreetV3-HD-Textures.zip'
 if (-not $GsHostUrl -and (Test-Path "$Repo\gshost\release_url.txt")) { $GsHostUrl = @(Get-Content "$Repo\gshost\release_url.txt" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
@@ -150,9 +151,15 @@ Write-Host "    OK: $gameExe"
 # ---------------------------------------------------------------- 6. renderer
 Step "Renderer (PCSX2 pcsx2-gsrunner)"
 $gshost = Join-Path $Root 'gshost'
-if (-not (Test-Path "$gshost\pcsx2-gsrunner.exe")) {
-    # Prebuilt renderer: shipped next to the launcher in the release zip, otherwise downloaded.
-    $localZips = @(Get-ChildItem $Repo -Filter 'gshost-win64*.zip' -ErrorAction SilentlyContinue)
+# Prebuilt renderer: shipped next to the launcher in the release zip, otherwise downloaded.
+$localZips = @(Get-ChildItem $Repo -Filter 'gshost-win64*.zip' -ErrorAction SilentlyContinue)
+# A newer release zip (e.g. after unzipping an update over the old one) refreshes the renderer.
+$rendererOutdated = (Test-Path "$gshost\pcsx2-gsrunner.exe") -and $localZips.Count -and
+    ($localZips | Where-Object { $_.LastWriteTime -gt (Get-Item "$gshost\pcsx2-gsrunner.exe").LastWriteTime })
+if ($rendererOutdated) { Write-Host "    updating the renderer from the new release" }
+# Keep the player's graphics settings across renderer updates.
+$savedIni = if (Test-Path "$gshost\nba_street.ini") { [IO.File]::ReadAllBytes("$gshost\nba_street.ini") } else { $null }
+if ($rendererOutdated -or -not (Test-Path "$gshost\pcsx2-gsrunner.exe")) {
     if (-not $BuildPcsx2 -and $localZips.Count) {
         foreach ($z in $localZips) { Expand-Archive $z.FullName $gshost -Force }
     } elseif ($BuildPcsx2 -or -not $GsHostUrl) {
@@ -168,7 +175,18 @@ if (-not (Test-Path "$gshost\pcsx2-gsrunner.exe")) {
         }
     }
 }
+if ($savedIni) { [IO.File]::WriteAllBytes("$gshost\nba_street.ini", $savedIni) }
 if (-not (Test-Path "$gshost\nba_street.ini")) { Copy-Item "$Repo\gshost\nba_street.ini" $gshost }
+# NVIDIA DLSS runtime, straight from NVIDIA's official SDK repository (only used on RTX GPUs; the
+# renderer falls back to AMD FSR without it). DLSS Swapper can update this file later.
+if (-not (Test-Path "$gshost\nvngx_dlss.dll")) {
+    try {
+        Download $DlssDllUrl "$Tools\dl\nvngx_dlss.dll"
+        Copy-Item "$Tools\dl\nvngx_dlss.dll" "$gshost\nvngx_dlss.dll"
+    } catch {
+        Write-Warning "NVIDIA DLSS runtime not downloaded ($($_.Exception.Message)); the upscaler will use AMD FSR."
+    }
+}
 Write-Host "    OK: $gshost"
 
 # ---------------------------------------------------------------- 7. HD textures

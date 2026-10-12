@@ -10,6 +10,8 @@ $Repo = Split-Path -Parent $PSScriptRoot
 foreach ($dir in "$Root\tools\mingit\cmd", "$Root\tools\portablegit\cmd") { if (Test-Path $dir) { $env:Path = "$dir;$env:Path" } }
 
 function MakePatch($src, $out, $exclude) {
+    # git prints line-ending warnings on stderr; they must not stop the script.
+    $ErrorActionPreference = 'Continue'
     $tmp = Join-Path $env:TEMP ("idx_" + [guid]::NewGuid().ToString('N'))
     Copy-Item "$src\.git\index" $tmp
     $env:GIT_INDEX_FILE = $tmp
