@@ -3,7 +3,7 @@
 # patches, your ISO, the GS host and the game. Equivalent of tools/install.ps1.
 #   tools/macos/install.sh /path/to/NBAStreetV3.iso
 # Run it again after updating the repository: finished steps are skipped or redone quickly.
-# Needs: Xcode Command Line Tools (xcode-select --install) and Homebrew (cmake, ninja).
+# Needs: Xcode Command Line Tools (xcode-select --install) and Homebrew (cmake, ninja, pkgconf, ffmpeg).
 # Everything goes into $NBA_ROOT (default ~/NBAStreetRecomp); this repository must be inside it.
 set -e
 ROOT="${NBA_ROOT:-$HOME/NBAStreetRecomp}"
@@ -26,6 +26,11 @@ for tool in cmake ninja; do
     fi
 done
 command -v python3 > /dev/null || { echo "Missing python3 (comes with the Command Line Tools)."; exit 1; }
+# The runtime decodes the game's videos with FFmpeg, found through pkg-config.
+if ! command -v pkg-config > /dev/null || ! pkg-config --exists libavcodec libavformat libavutil libswresample libswscale; then
+    command -v brew > /dev/null || { echo "Missing FFmpeg. Install Homebrew (https://brew.sh), then: brew install pkgconf ffmpeg"; exit 1; }
+    brew install pkgconf ffmpeg
+fi
 
 step "Sources (PS2Recomp 2c5fbb9, PCSX2 d073d75) + patches"
 mkdir -p "$ROOT/logs" "$ROOT/game/iso"

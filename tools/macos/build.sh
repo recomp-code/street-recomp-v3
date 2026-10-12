@@ -4,7 +4,7 @@
 #   build.sh recomp      the recompiler (ps2_recomp), needed by generate_game.py
 #   build.sh lib         runtime + IOP libraries only (quick check without the game code)
 #   build.sh game        the game (ps2EntryRunner); needs generate_game.py first
-# Needs: Xcode Command Line Tools, CMake and Ninja (brew install cmake ninja).
+# Needs: Xcode Command Line Tools, CMake, Ninja, pkg-config and FFmpeg (brew install cmake ninja pkgconf ffmpeg).
 # NBA_ROOT overrides the base folder (default ~/NBAStreetRecomp). Logs go to $NBA_ROOT/logs.
 set -e
 ROOT="${NBA_ROOT:-$HOME/NBAStreetRecomp}"

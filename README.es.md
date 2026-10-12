@@ -57,7 +57,7 @@ nbastreet-v3-recomp/tools/macos/install.sh ~/Downloads/NBAStreetV3.iso    # una 
 nbastreet-v3-recomp/tools/macos/play.sh                                    # jugar
 ```
 
-`install.sh` descarga las fuentes y compila el render y el juego a partir de tu ISO. Vuelve a
+`install.sh` instala con Homebrew lo que falte (CMake, Ninja, FFmpeg), descarga las fuentes y compila el render y el juego a partir de tu ISO. Vuelve a
 ejecutarlo después de un `git pull` para actualizar.
 
 ## Controles

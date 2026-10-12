@@ -80,7 +80,8 @@ jobs:
           path: nbastreet-v3-recomp
 
       - name: Tools
-        run: brew list ninja > /dev/null 2>&1 || brew install ninja
+        run: |
+          for f in ninja pkgconf ffmpeg; do brew list "$f" > /dev/null 2>&1 || brew install "$f"; done
 
       - name: Sources + patches
         run: |
