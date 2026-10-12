@@ -32,6 +32,7 @@ jobs:
           $threw = $false
           try { Run 'cmd.exe' @('/c', 'echo boom 1>&2 & exit /b 3') $log } catch { $threw = $true; Write-Host "failure: $($_.Exception.Message)" }
           if (-not $threw) { throw 'Run did not report a failing command' }
+          exit 0   # the runner would otherwise exit with the test command's code (3)
 
       - name: install.ps1 -RecompilerOnly
         shell: powershell
