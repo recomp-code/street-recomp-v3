@@ -13,9 +13,16 @@ BUILD="$SRC/out/build-mac"
 LOGS="$ROOT/logs"
 mkdir -p "$LOGS"
 
+# On failure, show the end of the log: the cause is usually there.
+fail() {
+    tail -30 "$1"
+    echo "$2 failed: $1"
+    exit 1
+}
+
 configure() {
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release > "$LOGS/mac_configure.log" 2>&1 \
-        || { echo "CMake configure failed: $LOGS/mac_configure.log"; exit 1; }
+        || fail "$LOGS/mac_configure.log" "CMake configure"
 }
 
 build() {
@@ -26,8 +33,7 @@ build() {
         echo "OK ($*)"
     else
         grep -E 'error:' "$log" | head -20
-        echo "Build failed: $log"
-        exit 1
+        fail "$log" "Build"
     fi
 }
 

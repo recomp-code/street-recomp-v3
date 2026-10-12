@@ -33,9 +33,9 @@ case "${1:-}" in
             -DCMAKE_PREFIX_PATH="$DEPS" -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DENABLE_QT_UI=OFF -DUSE_VULKAN=OFF -DENABLE_TESTS=OFF \
             -DCMAKE_DISABLE_FIND_PACKAGE_FFMPEG=ON > "$LOGS/mac_pcsx2_configure.log" 2>&1 \
-            || { echo "configure failed: $LOGS/mac_pcsx2_configure.log"; exit 1; }
+            || { tail -30 "$LOGS/mac_pcsx2_configure.log"; echo "configure failed: $LOGS/mac_pcsx2_configure.log"; exit 1; }
         cmake --build "$PCSX2/build-mac" --target pcsx2-gsrunner > "$LOGS/mac_pcsx2_build.log" 2>&1 \
-            || { grep -E 'error:' "$LOGS/mac_pcsx2_build.log" | head -20; echo "build failed: $LOGS/mac_pcsx2_build.log"; exit 1; }
+            || { grep -E 'error:' "$LOGS/mac_pcsx2_build.log" | head -20; tail -15 "$LOGS/mac_pcsx2_build.log"; echo "build failed: $LOGS/mac_pcsx2_build.log"; exit 1; }
         echo "OK: $PCSX2/build-mac/pcsx2-gsrunner/pcsx2-gsrunner"
         ;;
     gshost)
