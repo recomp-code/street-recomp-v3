@@ -39,7 +39,7 @@ jobs:
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\install.ps1 -Root "$env:RUNNER_TEMP\NBAStreetRecomp" -RecompilerOnly
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
-      - name: Run it again (retry path: patches already applied, steps skipped)
+      - name: "Run it again (retry path: patches already applied, steps skipped)"
         shell: powershell
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File tools\install.ps1 -Root "$env:RUNNER_TEMP\NBAStreetRecomp" -RecompilerOnly
