@@ -71,7 +71,7 @@ Los packs de texturas son contenido del juego: no se incluyen en este repositori
 
 ## Para jugar (lo fácil): el launcher
 
-1. Descarga `NBAStreetV3-PC-<versión>.zip` de **Releases** y descomprímelo donde quieras.
+1. Descarga `NBAStreetV3-PC-<versión>.zip` de **Releases** (es el único archivo que necesitas) y descomprímelo donde quieras.
 2. Abre **`Launcher.cmd`**:
 
    | Control | Qué hace |
@@ -90,8 +90,8 @@ Los packs de texturas son contenido del juego: no se incluyen en este repositori
    abre el menú gráfico.
 
 ¿Por qué compilar? El ejecutable final contiene el código del juego traducido a C++, así que no se
-puede distribuir. Todo lo distribuible (parches, herramientas, launcher) va en el zip, y el render de
-PCSX2 ya compilado (`gshost-win64-*.zip` en la misma release) se descarga solo.
+puede distribuir. Todo lo distribuible (launcher, parches, herramientas y el render de PCSX2 ya
+compilado) va en ese único zip.
 
 `Jugar.cmd` hace lo mismo que **JUGAR** sin ventana (online por defecto; `set NBA_SERVER=off` para
 jugar sin red o `set NBA_SERVER=<host o IP>` para otro servidor).

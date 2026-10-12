@@ -1,12 +1,13 @@
 <#
   Genera el zip de la release para GitHub (lo que descarga un jugador):
     NBAStreetV3-PC-<version>.zip = Launcher + instalador + parches + configuracion + scripts
-  y aparte gshost-win64-N.zip (render de PCSX2 ya compilado, GPL), que el instalador descarga.
+                                   + gshost-win64.zip (render de PCSX2 ya compilado, GPL)
+  Un solo archivo: es lo unico que se sube a la release y lo unico que baja el jugador.
   NO incluye nada del juego: el juego se compila en el PC del jugador desde su propia ISO.
   Uso: tools\make_release.ps1 -Version 1.0 [-GsHostZip C:\NBAStreetRecomp\release\gshost-win64.zip]
 #>
-param([Parameter(Mandatory)][string]$Version, [string]$GsHostZip = "C:\NBAStreetRecomp\release\gshost-win64.zip",
-      [string]$OutDir = "C:\NBAStreetRecomp\release")
+param([Parameter(Mandatory)][string]$Version, [string]$GsHostZip = "C:\NBAStreetRecomp\release_src\gshost-win64.zip",
+      [string]$OutDir = "C:\NBAStreetRecomp\release", [switch]$SplitRenderer)
 $ErrorActionPreference = 'Stop'
 $Repo = Split-Path -Parent $PSScriptRoot
 $name = "NBAStreetV3-PC-$Version"
@@ -23,11 +24,15 @@ foreach ($f in $files) {
     Copy-Item (Join-Path $Repo $f) $dst
 }
 
-# El render precompilado va como assets aparte de la release, partido en zips de < 10 MB
-# (gshost-win64-1.zip, -2.zip...): el instalador los descarga solo (URLs en gshost\release_url.txt).
-if (Test-Path $GsHostZip) {
+# Normal: un solo zip para el jugador, con el render precompilado dentro (gshost-win64.zip).
+# -SplitRenderer: el render va como assets aparte partido en zips de < 10 MB (gshost-win64-N.zip)
+# que el instalador descarga solo (URLs en gshost\release_url.txt), por si hay limite de subida.
+Get-ChildItem $OutDir -Filter 'gshost-win64*.zip' -ErrorAction SilentlyContinue | ForEach-Object { cmd /c del /q "$($_.FullName)" }
+if ((Test-Path $GsHostZip) -and -not $SplitRenderer) {
+    Copy-Item $GsHostZip (Join-Path $stage 'gshost-win64.zip')
+}
+elseif (Test-Path $GsHostZip) {
     Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
-    Get-ChildItem $OutDir -Filter 'gshost-win64-*.zip' | ForEach-Object { cmd /c del /q "$($_.FullName)" }
     $src = [IO.Compression.ZipFile]::OpenRead($GsHostZip)
     $limit = 9MB
     $bins = New-Object System.Collections.Generic.List[object]
@@ -56,4 +61,4 @@ $zip = Join-Path $OutDir "$name.zip"
 if (Test-Path $zip) { cmd /c del /q "$zip" }
 Compress-Archive "$stage\*" $zip
 cmd /c rmdir /s /q "$stage"
-Get-Item $zip, (Join-Path $OutDir 'gshost-win64-*.zip') | Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }
+Get-ChildItem $OutDir -Filter '*.zip' | Select-Object Name, @{ n = 'MB'; e = { [math]::Round($_.Length / 1MB, 1) } }

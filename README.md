@@ -75,7 +75,7 @@ Texture packs are game assets: they are not included in this repository or in th
 
 ## Playing (the easy way): the launcher
 
-1. Download `NBAStreetV3-PC-<version>.zip` from **Releases** and unzip it anywhere.
+1. Download `NBAStreetV3-PC-<version>.zip` from **Releases** (it is the only file you need) and unzip it anywhere.
 2. Double-click **`Launcher.cmd`**. A small window opens:
 
    | Control | What it does |
@@ -94,8 +94,8 @@ Texture packs are game assets: they are not included in this repository or in th
    or **hold START 1.5 s** opens the graphics menu.
 
 Why compile? The final executable contains the game's code translated to C++, so it cannot be
-distributed. Everything that can be distributed (patches, tools, launcher) is in the zip, and the
-prebuilt PCSX2 renderer (`gshost-win64-*.zip` in the same release) is downloaded automatically.
+distributed. Everything that can be distributed (launcher, patches, tools and the prebuilt PCSX2
+renderer) is in that single zip.
 
 `Jugar.cmd` does the same as **JUGAR** without a window (online by default; `set NBA_SERVER=off`
 for offline, or `set NBA_SERVER=<host or IP>` for another server).
