@@ -934,7 +934,7 @@ index 440e279..a5108c3 100644
  		{
  			if ((m_TEX0.PSM & 0xf) != PSMCT24 && m_dirty[i].rgba.c.a && bpp >= 16)
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
-index 9c31bb8..458bad5 100644
+index 9c31bb8..0817805 100644
 --- a/pcsx2/GSDumpReplayer.cpp
 +++ b/pcsx2/GSDumpReplayer.cpp
 @@ -1,19 +1,22 @@
@@ -985,7 +985,7 @@ index 9c31bb8..458bad5 100644
  
  static void GSDumpReplayerCpuReserve();
  static void GSDumpReplayerCpuShutdown();
-@@ -60,6 +74,109 @@ R5900cpu GSDumpReplayerCpu = {
+@@ -60,6 +74,117 @@ R5900cpu GSDumpReplayerCpu = {
  static InterpVU0 gsDumpVU0;
  static InterpVU1 gsDumpVU1;
  
@@ -1053,7 +1053,13 @@ index 9c31bb8..458bad5 100644
 +				}
 +				LARGE_INTEGER waitStart, waitEnd;
 +				QueryPerformanceCounter(&waitStart);
-+				WaitForSingleObject(s_live.data_event, 10);
++				// Announce the wait so the game signals the event (it skips SetEvent otherwise),
++				// then re-check: data written before the announcement was seen would not wake us.
++				s_live.header->consumerWaiting = 1;
++				MemoryBarrier();
++				if (s_live.header->writePos == w)
++					WaitForSingleObject(s_live.data_event, 10);
++				s_live.header->consumerWaiting = 0;
 +				QueryPerformanceCounter(&waitEnd);
 +				s_live_wait_ticks += static_cast<u64>(waitEnd.QuadPart - waitStart.QuadPart);
 +				continue;
@@ -1064,7 +1070,9 @@ index 9c31bb8..458bad5 100644
 +			std::memcpy(out, s_live.data + offset, chunk);
 +			MemoryBarrier();
 +			s_live.header->readPos = r + static_cast<s64>(chunk);
-+			SetEvent(s_live.space_event);
++			MemoryBarrier(); // readPos store before the producerWaiting load
++			if (!s_live.header->producerFlags || s_live.header->producerWaiting)
++				SetEvent(s_live.space_event);
 +			out += chunk;
 +			size -= chunk;
 +		}
@@ -1095,7 +1103,7 @@ index 9c31bb8..458bad5 100644
  bool GSDumpReplayer::IsReplayingDump()
  {
  	return static_cast<bool>(s_dump_file);
-@@ -106,7 +223,7 @@ bool GSDumpReplayer::Initialize(const char* filename, Error* error)
+@@ -106,7 +231,7 @@ bool GSDumpReplayer::Initialize(const char* filename, Error* error)
  	Cpu = &GSDumpReplayerCpu;
  	psxCpu = &psxInt;
  	CpuVU0 = &gsDumpVU0;
@@ -1104,7 +1112,7 @@ index 9c31bb8..458bad5 100644
  
  	// loop infinitely by default
  	s_dump_loop_count = -1;
-@@ -204,6 +321,10 @@ static void GSDumpReplayerLoadInitialState()
+@@ -204,6 +329,10 @@ static void GSDumpReplayerLoadInitialState()
  	std::memcpy(PS2MEM_GS, s_dump_file->GetRegsData().data(),
  		std::min(Ps2MemSize::GSregs, static_cast<u32>(s_dump_file->GetRegsData().size())));
  
@@ -1115,7 +1123,7 @@ index 9c31bb8..458bad5 100644
  	// load GS state
  	freezeData fd = {static_cast<int>(s_dump_file->GetStateData().size()),
  		const_cast<u8*>(s_dump_file->GetStateData().data())};
-@@ -219,6 +340,17 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
+@@ -219,6 +348,17 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
  
  	const u32 truncated_length = static_cast<u32>(length);
  
@@ -1133,7 +1141,7 @@ index 9c31bb8..458bad5 100644
  	Gif_Path& gifPath = gifUnit.gifPath[path];
  	gifPath.CopyGSPacketData(const_cast<u8*>(data), truncated_length);
  
-@@ -226,6 +358,16 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
+@@ -226,6 +366,16 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
  	gsPack.offset = gifPath.curOffset;
  	gsPack.size = truncated_length;
  	gifPath.curOffset += length;
@@ -1150,7 +1158,7 @@ index 9c31bb8..458bad5 100644
  	Gif_AddCompletedGSPacket(gsPack, path);
  }
  
-@@ -256,6 +398,236 @@ static void GSDumpReplayerFrameLimit()
+@@ -256,6 +406,236 @@ static void GSDumpReplayerFrameLimit()
  	s_next_frame_time = std::max(now, s_next_frame_time + s_frame_ticks);
  }
  
@@ -1387,7 +1395,7 @@ index 9c31bb8..458bad5 100644
  void GSDumpReplayerCpuStep()
  {
  	if (s_needs_state_loaded)
-@@ -264,6 +636,14 @@ void GSDumpReplayerCpuStep()
+@@ -264,6 +644,14 @@ void GSDumpReplayerCpuStep()
  		s_needs_state_loaded = false;
  	}
  
@@ -1402,7 +1410,7 @@ index 9c31bb8..458bad5 100644
  	const GSDumpFile::GSData& packet = s_dump_file->GetPackets()[s_current_packet];
  	s_current_packet = (s_current_packet + 1) % static_cast<u32>(s_dump_file->GetPackets().size());
  	if (s_current_packet == 0)
-@@ -350,6 +730,10 @@ void GSDumpReplayerCpuExecute()
+@@ -350,6 +738,10 @@ void GSDumpReplayerCpuExecute()
  	s_dump_running = true;
  	s_next_frame_time = GetCPUTicks();
  
@@ -1413,7 +1421,7 @@ index 9c31bb8..458bad5 100644
  	while (s_dump_running)
  	{
  		GSDumpReplayerCpuStep();
-@@ -369,8 +753,91 @@ void GSDumpReplayerCpuClear(u32 addr, u32 size)
+@@ -369,8 +761,91 @@ void GSDumpReplayerCpuClear(u32 addr, u32 size)
  {
  }
  
@@ -1505,7 +1513,7 @@ index 9c31bb8..458bad5 100644
  	const float scale = ImGuiManager::GetGlobalScale();
  	const float shadow_offset = std::ceil(1.0f * scale);
  	const float margin = std::ceil(GSConfig.OsdMargin * scale);
-@@ -404,3 +871,125 @@ void GSDumpReplayer::RenderUI()
+@@ -404,3 +879,126 @@ void GSDumpReplayer::RenderUI()
  
  #undef DRAW_LINE
  }
@@ -1571,6 +1579,7 @@ index 9c31bb8..458bad5 100644
 +			s_live.producer_process = OpenProcess(SYNCHRONIZE, FALSE, pid);
 +	}
 +	header->consumerAlive = 1;
++	header->consumerFlags = 1;
 +	s_live_mode = true;
 +	s_live_mode_early = true;
 +	return true;
@@ -1816,10 +1825,10 @@ index 19c125a..5610226 100644
  	struct FreezeData
 diff --git a/pcsx2/Ps2LiveRing.h b/pcsx2/Ps2LiveRing.h
 new file mode 100644
-index 0000000..fa342ae
+index 0000000..ca529e5
 --- /dev/null
 +++ b/pcsx2/Ps2LiveRing.h
-@@ -0,0 +1,50 @@
+@@ -0,0 +1,57 @@
 +#pragma once
 +
 +// Shared-memory ring between the PS2Recomp runtime (producer) and the PCSX2-based GS host
@@ -1856,6 +1865,13 @@ index 0000000..fa342ae
 +        volatile uint32_t padAxes; // lx | ly << 8 | rx << 16 | ry << 24 (0x80 = centre)
 +        volatile uint32_t padSequence;
 +        volatile uint32_t hostMenuOpen; // the host's options menu is open: the game gets no pad input
++        // Wake-ups only when needed: each side sets its *Flags to 1 at start (it understands the
++        // *Waiting fields) and raises *Waiting while blocked on its event. The other side then
++        // signals only if that side is waiting (or is an older build with no flags).
++        volatile uint32_t consumerFlags;
++        volatile uint32_t consumerWaiting; // host blocked on the data event
++        volatile uint32_t producerFlags;
++        volatile uint32_t producerWaiting; // game blocked on the space event (ring full)
 +    };
 +
 +    // Object names for one game instance: base name + "_" + suffix (the game's process id, passed

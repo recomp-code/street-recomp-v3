@@ -211,6 +211,12 @@ Jugable de principio a fin en offline: menús, vídeos, Create Baller, partidos 
 correcta, audio (SPU2 emulado) y memory card. El modo online existe en el código (adaptador de red
 DEV9 emulado) y se conecta al servidor de la comunidad; el código del servidor no forma parte de este repositorio.
 
+Rendimiento: los partidos van a ~59-60 fps en una CPU moderna. La versión 1.2 corrigió las causas
+principales de las bajadas (un hilo del juego atascado en un falso timeout de DMA, la sobrecarga del
+IOP y el mezclador de sonido de EA, que ahora corre nativo); ver `docs/PORTING_NOTES.md`, sección 5.1.
+Aún puede haber pequeñas bajadas en las escenas más cargadas: el trabajo del propio juego por
+fotograma está cerca del presupuesto de 16,7 ms.
+
 Los bugs del recompilador encontrados (y corregidos en `patches/ps2recomp.patch`) están en
 `docs/PORTING_NOTES.md`; varios afectan a cualquier juego de PS2 portado con PS2Recomp
 (SQRT.S, saltos BLTZ/BGEZ de 64 bits, MMI, VU0...).

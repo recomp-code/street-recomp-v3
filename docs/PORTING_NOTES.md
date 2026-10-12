@@ -114,6 +114,43 @@ NODATA callback, sceMpegIsEnd (escribir el flag), memcard GetDir, SPU2, etc.
 8. GS local: sin `BeginTransfer`/subidas en modo live.
 Resultado: partido a 58–60 fps internos con ~20% del hilo EE ocioso (el juego está hecho para 60; menús a 30 por diseño).
 
+### 5.1 Bajadas a 56–58 fps en partido (segunda ronda)
+Medir antes de tocar: `PS2X_NBA_FRAME_LOG=1` (override en 0x003E3920, la espera de vsync del juego:
+trabajo por fotograma, CPU del hilo EE y reparto IOP/VIF1), `PS2X_THREAD_STATS=1` (tiempo por hilo
+guest), `PS2X_PROFILE=1` (con `[prof:pc]`: el pc guest exacto, porque el código generado actualiza
+`ctx->pc` en cada instrucción) y `PS2X_IOP_PC_STATS=1` (pc/ra/hilo del IOP). `tools\mipsdis.ps1`
+desensambla volcados de RAM (IOP o EE).
+- El hilo principal usa ~95% del hilo EE y el fotograma va justo (~16 ms de 16,7). El render (host)
+  no es el problema (~28% ocupado).
+- **Hilo del juego colgado en un bucle de error (intermitente)**: las esperas de fin de fotograma
+  0x003E1910 (VIF1 hasta la etiqueta END) y 0x003E1530 (GIF) cuentan *iteraciones* (límite en
+  0x005B5E28 = 300000000/200 = 1,5 M sondeos, ~1 s en PS2 con lecturas de bus lentas, ~150 ms aquí).
+  Si la IRQ a mitad de la cadena VIF1 (lectura GS->EE que reanuda el handler DMAC 0x003E1358) se
+  atiende más tarde, el juego da timeout y ese hilo gira para siempre en 0x003E10F8 robando CPU el
+  resto de la sesión (partidas a 45–53 fps). Override: límite ilimitado antes de cada espera.
+- **El IOP se comía ~20% del hilo EE**, y no por ejecutar código: `accountCycles` llamaba a
+  `advanceIopEeCycles` en cada punto de control generado (~7,6 millones de veces/s) aunque el IOP solo
+  avanza por tramos de 8192 ciclos EE. Ahora el planificador acumula y llama por tramos: 20% -> 6%.
+- Del código IOP, ~55% era el **mezclador software del driver de sonido de EA** (IOP 0x52D50:
+  remuestreo 3:4 de 2x2 bloques de 256 muestras con saturación). Sustituido por una versión nativa
+  (`ps2xIOP/src/emulator/iop_hle_routines.h`), activa solo si las instrucciones coinciden y cobrando
+  los mismos ciclos IOP. `PS2X_IOP_HLE=verify` ejecuta el original y compara la RAM byte a byte:
+  0 diferencias en 15000 llamadas. `PS2X_IOP_HLE=0` lo desactiva.
+- Inlining forzado (`PS2_FORCEINLINE`) de los accesos a registros/memoria del código generado: en
+  funciones gigantes MSVC dejaba llamadas reales con `__m128i` pasado por memoria.
+- Anillo de render: `SetEvent` solo si el otro lado está dormido (flags en `Ps2LiveRing.h`); los
+  paquetes PATH3 completos se envían sin copiarlos antes a un vector.
+- Guarda de 4096 etiquetas por cadena DMA subida a 1M (solo protege de cadenas corruptas).
+- Ojo al medir: la IA juega distinto en cada partida; una sola pasada no vale para comparar. Mirar
+  los porcentajes de tiempo (estables) o promediar varias pasadas.
+- Resultado: partidas normales a ~59 fps sin bucle de error. **Pendiente**: en escenas muy cargadas
+  (listas VIF1 de >4300 etiquetas) el trabajo por fotograma pasa de 16,7 ms y el juego cae a 30
+  durante unos segundos (rama "llego tarde" de 0x003E3920: pc 0x3E3DB0/0x3E3DC0 esperando el
+  siguiente VSINT). ~16% del tiempo en esas escenas es nuestro procesado de la cadena VIF1 en el EE
+  (0x3E24C8 arranque del DMA, 0x3E1214/0x3E1224 reanudación tras cada i-bit): recorrido + copia en
+  `chainBuf` + `processVIF1Data` + copia al anillo. Siguiente paso: no copiar la cadena dos veces y
+  analizar solo lo necesario para las paradas.
+
 ## Texturas HD (packs PCSX2) — qué NO reemplazar
 * Volcado: menú del host -> "Texturas HD" -> "Activadas + volcar originales"; `tools\texturas_preparar.ps1`
   copia a `texturas_hd\originales`; el usuario reescala con IA a `texturas_hd\hd`; `tools\texturas_instalar.ps1`.

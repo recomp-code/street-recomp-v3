@@ -22,12 +22,36 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 
+#include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <string>
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#include <intrin.h>
+#endif
+
+// Runtime frame-budget counters (ps2_runtime.cpp).
+extern uint64_t g_ps2StatIopTicks;
+extern uint64_t g_ps2StatVif1Ticks;
+extern uint64_t g_ps2StatRingTicks;
+extern uint64_t g_ps2StatRingWaitTicks;
+extern uint64_t g_iopStatCpuTicks;
+extern uint64_t g_iopStatImportTicks;
+extern uint64_t g_iopStatSpu2Ticks;
+extern uint64_t g_iopStatRunTicks;
+extern uint64_t g_iopStatRunCalls;
+extern uint64_t g_iopStatEeCalls;
 
 namespace
 {
@@ -324,9 +348,135 @@ namespace
             std::fprintf(stderr, "[asset] malloc(%u, flags=0x%X) FAILED (caller 0x%X)\n", size, flags, ra);
     }
 
+    // PS2X_NBA_FRAME_LOG=1: wall-clock frame budget. 0x003E3920 is the game's end-of-frame
+    // vsync wait (polls GS_CSR.VSINT); "work" is the time from one wait's end to the next one's
+    // start, "wait" the slack left. A frame whose work exceeds a vblank period misses a vsync.
+    PS2Runtime::RecompiledFunction g_originalVsyncWait = nullptr;
+
+    void timedVsyncWait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        using Clock = std::chrono::steady_clock;
+        static Clock::time_point s_lastEnd{};
+        static Clock::time_point s_windowStart = Clock::now();
+        static double s_workSum = 0.0, s_workMax = 0.0, s_waitSum = 0.0;
+        static uint32_t s_frames = 0, s_over = 0, s_hist[6] = {};
+        const Clock::time_point start = Clock::now();
+        if (s_lastEnd != Clock::time_point{})
+        {
+            const double work = std::chrono::duration<double, std::milli>(start - s_lastEnd).count();
+            s_workSum += work;
+            s_workMax = std::max(s_workMax, work);
+            s_over += work > 16.0 ? 1u : 0u;
+            ++s_hist[std::min<int>(5, static_cast<int>(work / 4.0))];
+            ++s_frames;
+        }
+        g_originalVsyncWait(rdram, ctx, runtime);
+        const Clock::time_point end = Clock::now();
+        s_waitSum += std::chrono::duration<double, std::milli>(end - start).count();
+        s_lastEnd = end;
+        if (end - s_windowStart >= std::chrono::seconds(5) && s_frames)
+        {
+            // CPU time of this (EE) thread over the window: ~100% = compute-bound, less = blocked.
+            static uint64_t s_lastCpu = 0;
+            uint64_t cpu = 0;
+#if defined(_WIN32)
+            FILETIME created, exited, kernel, user;
+            GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user);
+            cpu = (static_cast<uint64_t>(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
+                  (static_cast<uint64_t>(user.dwHighDateTime) << 32 | user.dwLowDateTime);
+#endif
+            const double windowMs = std::chrono::duration<double, std::milli>(end - s_windowStart).count();
+            const double cpuPct = s_lastCpu ? 100.0 * static_cast<double>(cpu - s_lastCpu) / 10000.0 / windowMs : 0.0;
+            s_lastCpu = cpu;
+            std::fprintf(stderr, "[frame] %u frames, work avg %.2f ms max %.2f ms, >16ms %u, wait avg %.2f ms, cpu %.0f%%, "
+                                 "work hist <4:%u <8:%u <12:%u <16:%u <20:%u >=20:%u\n",
+                         s_frames, s_workSum / s_frames, s_workMax, s_over, s_waitSum / s_frames, cpuPct,
+                         s_hist[0], s_hist[1], s_hist[2], s_hist[3], s_hist[4], s_hist[5]);
+            // Where the EE thread's time went (runtime counters, rdtsc ticks).
+            static uint64_t s_lastTsc = 0, s_lastIop = 0, s_lastVif1 = 0, s_lastRing = 0, s_lastRingWait = 0;
+            static uint64_t s_lastIopCpu = 0, s_lastIopImport = 0, s_lastIopSpu2 = 0;
+            const uint64_t tsc = __rdtsc();
+            if (s_lastTsc)
+            {
+                const double span = static_cast<double>(tsc - s_lastTsc) / 100.0;
+                std::fprintf(stderr, "[frame] time: iop %.1f%% (guest code %.1f%%, of it imports %.1f%%; spu2 %.1f%%) vif1 %.1f%% ring %.1f%% (blocked %.1f%%)\n",
+                             static_cast<double>(g_ps2StatIopTicks - s_lastIop) / span,
+                             static_cast<double>(g_iopStatCpuTicks - s_lastIopCpu) / span,
+                             static_cast<double>(g_iopStatImportTicks - s_lastIopImport) / span,
+                             static_cast<double>(g_iopStatSpu2Ticks - s_lastIopSpu2) / span,
+                             static_cast<double>(g_ps2StatVif1Ticks - s_lastVif1) / span,
+                             static_cast<double>(g_ps2StatRingTicks - s_lastRing) / span,
+                             static_cast<double>(g_ps2StatRingWaitTicks - s_lastRingWait) / span);
+            }
+            static uint64_t s_lastRunTicks = 0, s_lastRunCalls = 0, s_lastEeCalls = 0;
+            if (s_lastRunCalls)
+                std::fprintf(stderr, "[frame] iop slices %.1f%% (%llu slices/5s), advance calls %llu/5s\n",
+                             static_cast<double>(g_iopStatRunTicks - s_lastRunTicks) / (static_cast<double>(tsc - s_lastTsc) / 100.0),
+                             static_cast<unsigned long long>(g_iopStatRunCalls - s_lastRunCalls),
+                             static_cast<unsigned long long>(g_iopStatEeCalls - s_lastEeCalls));
+            s_lastRunTicks = g_iopStatRunTicks;
+            s_lastRunCalls = g_iopStatRunCalls;
+            s_lastEeCalls = g_iopStatEeCalls;
+            s_lastIopCpu = g_iopStatCpuTicks;
+            s_lastIopImport = g_iopStatImportTicks;
+            s_lastIopSpu2 = g_iopStatSpu2Ticks;
+            s_lastTsc = tsc;
+            s_lastIop = g_ps2StatIopTicks;
+            s_lastVif1 = g_ps2StatVif1Ticks;
+            s_lastRing = g_ps2StatRingTicks;
+            s_lastRingWait = g_ps2StatRingWaitTicks;
+            s_windowStart = end;
+            s_workSum = s_workMax = s_waitSum = 0.0;
+            s_frames = s_over = 0;
+            std::fill(std::begin(s_hist), std::end(s_hist), 0u);
+        }
+    }
+
+    // End-of-frame DMA waits: 0x003E1910 (VIF1 chain reached its END tag) and 0x003E1530 (GIF)
+    // poll CHCR at most 0x005B5E28 / 200 times (300000000 / 200 = 1.5 M polls, ~1 s on a PS2,
+    // where each poll is a slow bus read). Here a poll takes ~0.1 us, so the limit expires after
+    // ~150 ms; when the VIF1 chain's mid-list IRQ (a GS readback restarted by the DMAC handler at
+    // 0x003E1358) is serviced later than that, the game declares a timeout and the thread spins
+    // forever in its error path (0x003E10F8), stealing EE time from the game for the rest of the
+    // session. Lift the limit before each wait: a real hang would spin forever either way.
+    constexpr uint32_t kDmaWaitLimit = 0x005B5E28u;
+    PS2Runtime::RecompiledFunction g_originalVif1Wait = nullptr;
+    PS2Runtime::RecompiledFunction g_originalGifWait = nullptr;
+
+    void liftDmaWaitLimit(uint8_t *rdram)
+    {
+        const uint32_t unlimited = 0xFFFFFFFFu;
+        std::memcpy(rdram + kDmaWaitLimit, &unlimited, sizeof(unlimited));
+    }
+
+    void untimedVif1Wait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        liftDmaWaitLimit(rdram);
+        g_originalVif1Wait(rdram, ctx, runtime);
+    }
+
+    void untimedGifWait(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        liftDmaWaitLimit(rdram);
+        g_originalGifWait(rdram, ctx, runtime);
+    }
+
     void applyNbaStreetV3(PS2Runtime &runtime)
     {
         configureCdImage();
+        g_originalVif1Wait = runtime.lookupFunction(0x003E1910u);
+        g_originalGifWait = runtime.lookupFunction(0x003E1530u);
+        if (g_originalVif1Wait && g_originalGifWait)
+        {
+            runtime.replaceFunction(0x003E1910u, untimedVif1Wait);
+            runtime.replaceFunction(0x003E1530u, untimedGifWait);
+        }
+        if (envFlagSet("PS2X_NBA_FRAME_LOG"))
+        {
+            g_originalVsyncWait = runtime.lookupFunction(0x003E3920u);
+            if (g_originalVsyncWait)
+                runtime.replaceFunction(0x003E3920u, timedVsyncWait);
+        }
         if (envFlagSet("PS2X_NBA_ASSET_TRACE"))
         {
             g_originalBhLoad = runtime.lookupFunction(0x003C1AC8u);

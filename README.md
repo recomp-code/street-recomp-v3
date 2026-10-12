@@ -220,8 +220,10 @@ physics, audio (emulated SPU2) and memory card. Online works through the emulate
 adapter and the community server (accounts, online ballers and courts, PLAY NOW matches relayed
 through the server); the server code is not part of this repository.
 
-Known issues: occasional dropped frames (57-58 fps instead of 60) caused by synchronous VU1
-round-trips between the game and the renderer process; being worked on.
+Performance: matches run at ~59-60 fps on a modern CPU. Version 1.2 fixed the main causes of the
+earlier drops (a game thread stuck in a false DMA-timeout loop, IOP overhead and the EA sound
+driver's software mixer, now run natively); see `docs/PORTING_NOTES.md` section 5.1. Short dips can
+still happen in the busiest scenes, since the game's own frame work is close to the 16.7 ms budget.
 
 The recompiler bugs found (and fixed in `patches/ps2recomp.patch`) are documented in
 `docs/PORTING_NOTES.md`; several affect any PS2 game ported with PS2Recomp (SQRT.S, 64-bit

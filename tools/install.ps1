@@ -32,7 +32,8 @@ $Downloads = @{
     CMake        = 'https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip'
     MinGit       = 'https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.2/MinGit-2.56.0.2-64-bit.zip'
 }
-$TexturePackUrl = 'https://github.com/recomp-code/street-recomp-v3/releases/latest/download/NBAStreetV3-HD-Textures.zip'
+# Fixed to the release that carries the pack, so later releases only need the small launcher zip.
+$TexturePackUrl = 'https://github.com/recomp-code/street-recomp-v3/releases/download/v1.1/NBAStreetV3-HD-Textures.zip'
 if (-not $GsHostUrl -and (Test-Path "$Repo\gshost\release_url.txt")) { $GsHostUrl = @(Get-Content "$Repo\gshost\release_url.txt" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 
 $Host.UI.RawUI.WindowTitle = 'NBA Street V3 - preparing the game'
