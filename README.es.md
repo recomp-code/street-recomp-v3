@@ -7,8 +7,9 @@ Juega a **NBA Street V3** (PS2) de forma nativa en Windows: alta resolución, te
 [PS2Recomp](https://github.com/ran-j/PS2Recomp) y se dibuja en tu GPU con el render de
 [PCSX2](https://github.com/PCSX2/pcsx2).
 
-> **Este proyecto NO contiene nada del juego**: ni ISO, ni archivos del juego, ni texturas. Necesitas
-> **tu propia copia** de NBA Street V3 (versión USA, SLUS-21126) en un archivo ISO.
+> **Necesitas tu propia copia** de NBA Street V3 (versión USA, SLUS-21126) en un archivo ISO. Este
+> proyecto no incluye el juego: ni ISO ni código del juego (se compila en tu PC desde tu copia).
+> La única descarga extra es el pack de texturas HD hecho por fans.
 
 | | |
 |---|---|
@@ -31,8 +32,8 @@ Juega a **NBA Street V3** (PS2) de forma nativa en Windows: alta resolución, te
 
 <p align="center"><img src="docs/screenshots/launcher.png" alt="Launcher" width="420"></p>
 
-En el launcher también eliges la **resolución** (hasta 5K), el **renderizador**, **pantalla completa**,
-las **texturas HD** y el **online**. Jugando, **F1** o **mantener START** abre el menú gráfico y
+Las **texturas HD** se descargan y activan solas durante **Prepare game**, y el **online** está siempre
+listo. En el launcher también eliges la **resolución** (hasta 5K), el **renderizador** y **pantalla completa**. Jugando, **F1** o **mantener START** abre el menú gráfico y
 **Alt+Enter** cambia entre ventana y pantalla completa.
 
 ¿Por qué compila el juego en vez de traerlo hecho? El programa contiene el código del propio juego
@@ -45,7 +46,7 @@ traducido a C++, así que no se puede distribuir: se genera en tu PC a partir de
   de PS2 se emulan; los microprogramas de VU1 corren en el recompilador microVU de PCSX2.
 - **Render moderno por GPU** con el GS de PCSX2: Vulkan, Direct3D 11/12 u OpenGL, resolución interna
   desde 480p nativa hasta 8x (5K+), filtrado de texturas, 4:3 o 16:9 estirado, pantalla completa.
-- **Packs de texturas HD**, instalados con un clic desde el launcher (ver [Texturas HD](#texturas-hd)).
+- **Texturas HD incluidas**: se descargan y activan solas (ver [Texturas HD](#texturas-hd)).
 - **Online recuperado** contra un servidor de la comunidad: cuentas EA, personas, ballers online,
   partidas PLAY NOW, sin abrir puertos. Ver [Modo online](#modo-online).
 - **Launcher de un clic**: eliges tu ISO, preparas una vez y juegas.
@@ -55,13 +56,12 @@ traducido a C++, así que no se puede distribuir: se genera en tu PC a partir de
 
 ## Texturas HD
 
-1. Consigue un pack de texturas HD para NBA Street V3 (formato PCSX2, normalmente un `.zip` lleno de `.png`).
-2. En el launcher pulsa **Add texture pack (.zip)...** (o **(folder)...** si ya lo descomprimiste).
-3. Pulsa **PLAY**. Listo: el launcher instala el pack, activa las texturas HD y se salta solo las
-   pocas texturas que se sabe que estropean la imagen (menús con grano, iconos de botones rotos).
+No tienes que hacer nada: **Prepare game** descarga el pack de texturas HD (`NBAStreetV3-HD-Textures.zip`,
+unos 250 MB, de la misma release) y lo activa. Puedes desactivarlas y activarlas con **Use HD textures**
+en el launcher o en el menú gráfico del juego.
 
-Puedes activar o desactivar las texturas HD con **Use HD textures** en el launcher o en el menú
-gráfico del juego. Los packs no se incluyen aquí (se hacen a partir de las imágenes del juego).
+Otros packs (formato PCSX2, un `.zip` o una carpeta de `.png`) se añaden con **Add texture pack** en el
+launcher, que se salta solo las pocas texturas que estropean la imagen (menús con grano, iconos rotos).
 
 <details>
 <summary>Hacer tu propio pack (avanzado)</summary>
@@ -78,12 +78,12 @@ gráfico del juego. Los packs no se incluyen aquí (se hacen a partir de las im�
 
 ## Modo online
 
-El servicio EA Online original del juego cerró hace años; este port lo recupera. El online viene
-activado por defecto en el launcher (**Play online**).
+El servicio EA Online original del juego cerró hace años; este port lo recupera. El online está
+siempre listo: no hay que configurar nada.
 
 Cómo jugar un partido:
 
-1. En el launcher deja **Play online** marcado y pulsa **PLAY**.
+1. Pulsa **PLAY** en el launcher.
 2. En el juego: **PLAY ONLINE** -> **YES** -> **"1 - NBA Street Online (DHCP)"** -> conectar.
    No uses "New/Edit" en esa pantalla.
 3. Solo la primera vez: crea una cuenta (usuario de 4+ letras, cualquier e-mail y contraseña — solo

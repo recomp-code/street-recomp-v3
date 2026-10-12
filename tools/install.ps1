@@ -7,6 +7,7 @@
     4. PS2Recomp and PCSX2 sources with this repository's patches
     5. Recompiler -> the game's C++ code (generated on YOUR PC from YOUR ELF) -> game executable
     6. Renderer (pcsx2-gsrunner): the prebuilt one shipped in the release zip, or -BuildPcsx2
+    7. HD texture pack: downloaded from the release and installed (turned on) automatically
   Every step is skipped when already done, so it can simply be run again after an error.
   Manual use:  powershell -ExecutionPolicy Bypass -File tools\install.ps1 -Iso "D:\Games\NBA Street V3.iso"
 #>
@@ -31,6 +32,7 @@ $Downloads = @{
     CMake        = 'https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip'
     MinGit       = 'https://github.com/git-for-windows/git/releases/download/v2.56.0.windows.2/MinGit-2.56.0.2-64-bit.zip'
 }
+$TexturePackUrl = 'https://github.com/recomp-code/street-recomp-v3/releases/latest/download/NBAStreetV3-HD-Textures.zip'
 if (-not $GsHostUrl -and (Test-Path "$Repo\gshost\release_url.txt")) { $GsHostUrl = @(Get-Content "$Repo\gshost\release_url.txt" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) }
 
 $Host.UI.RawUI.WindowTitle = 'NBA Street V3 - preparing the game'
@@ -167,6 +169,29 @@ if (-not (Test-Path "$gshost\pcsx2-gsrunner.exe")) {
 }
 if (-not (Test-Path "$gshost\nba_street.ini")) { Copy-Item "$Repo\gshost\nba_street.ini" $gshost }
 Write-Host "    OK: $gshost"
+
+# ---------------------------------------------------------------- 7. HD textures
+# The HD pack is a separate asset of the release; downloaded and installed once, automatically.
+# Not fatal: without it the game simply uses its original textures.
+Step "HD textures"
+$textureDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PCSX2\textures\SLUS-21126\replacements'
+$haveTextures = (Test-Path $textureDir) -and @(Get-ChildItem $textureDir -File -Filter *.png -ErrorAction SilentlyContinue | Select-Object -First 1).Count
+if (-not $haveTextures) {
+    try {
+        $pack = Join-Path $Repo 'NBAStreetV3-HD-Textures.zip'   # next to the launcher, if downloaded by hand
+        if (-not (Test-Path $pack)) {
+            $pack = "$Tools\dl\NBAStreetV3-HD-Textures.zip"
+            Write-Host "    downloading the HD texture pack (about 250 MB)..."
+            Download $TexturePackUrl $pack
+        }
+        $result = & "$Repo\tools\install_textures.ps1" -Source $pack -Root $Root | Select-Object -Last 1
+        Write-Host "    OK: $result"
+    } catch {
+        Write-Warning "HD textures could not be installed ($($_.Exception.Message)). The game works without them; press 'Prepare game' again later to retry."
+    }
+} else {
+    Write-Host "    OK (already installed)"
+}
 
 # ---------------------------------------------------------------- done
 Copy-Item "$Repo\Play.cmd" (Join-Path $Root 'Play.cmd') -Force

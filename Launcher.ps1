@@ -15,16 +15,14 @@ $SettingsFile = Join-Path $env:APPDATA 'NBAStreetV3Launcher.json'
 $TextureDir = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PCSX2\textures\SLUS-21126\replacements'
 
 # ---------------------------------------------------------------- launcher settings
-# Default online server (can be changed in the window).
-$DefaultServer = 'nbas3.xellrecomp.party'
-$settings = @{ Iso = ''; Fullscreen = $true; Online = $true; Server = $DefaultServer }
+# Community online server (fixed; NBA_SERVER in the environment overrides it for testing).
+$Server = if ($env:NBA_SERVER) { $env:NBA_SERVER } else { 'nbas3.xellrecomp.party' }
+$settings = @{ Iso = ''; Fullscreen = $true }
 try {
     if (Test-Path $SettingsFile) {
         $loaded = Get-Content $SettingsFile -Raw | ConvertFrom-Json
         if ($loaded.Iso) { $settings.Iso = $loaded.Iso }
         if ($null -ne $loaded.Fullscreen) { $settings.Fullscreen = [bool]$loaded.Fullscreen }
-        if ($null -ne $loaded.Online) { $settings.Online = [bool]$loaded.Online }
-        if ($loaded.Server) { $settings.Server = $loaded.Server }
     }
 } catch {}
 function Save-Settings { try { $settings | ConvertTo-Json | Set-Content $SettingsFile } catch {} }
@@ -57,7 +55,7 @@ $Renderers = [ordered]@{ 'Vulkan (recommended)' = 14; 'Direct3D 11' = 3; 'Direct
 # ---------------------------------------------------------------- window
 $form = New-Object Windows.Forms.Form
 $form.Text = 'NBA Street V3 - PC'
-$form.Size = New-Object Drawing.Size(520, 600)
+$form.Size = New-Object Drawing.Size(520, 580)
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
@@ -141,31 +139,25 @@ $texGroup.Controls.Add($texFolder)
 
 # Online
 $netGroup = New-Object Windows.Forms.GroupBox
-$netGroup.Text = 'Online'; $netGroup.Location = '20,400'; $netGroup.Size = '468,76'
+$netGroup.Text = 'Online'; $netGroup.Location = '20,400'; $netGroup.Size = '468,56'
 $form.Controls.Add($netGroup)
-$onlineBox = New-Object Windows.Forms.CheckBox
-$onlineBox.Text = 'Play online (choose PLAY ONLINE in the game)'; $onlineBox.Location = '12,24'; $onlineBox.AutoSize = $true
-$onlineBox.Checked = $settings.Online
-$netGroup.Controls.Add($onlineBox)
-$serverLabel = New-Object Windows.Forms.Label
-$serverLabel.Text = 'Server:'; $serverLabel.Location = '12,50'; $serverLabel.AutoSize = $true
-$netGroup.Controls.Add($serverLabel)
-$serverBox = New-Object Windows.Forms.TextBox
-$serverBox.Location = '90,46'; $serverBox.Size = '260,24'; $serverBox.Text = $settings.Server
-$netGroup.Controls.Add($serverBox)
+$onlineLabel = New-Object Windows.Forms.Label
+$onlineLabel.Text = 'Ready - choose PLAY ONLINE in the game menu.'; $onlineLabel.Location = '12,26'; $onlineLabel.AutoSize = $true
+$onlineLabel.ForeColor = [Drawing.Color]::DarkGreen
+$netGroup.Controls.Add($onlineLabel)
 
 $prepare = New-Object Windows.Forms.Button
-$prepare.Text = 'Prepare game'; $prepare.Location = '20,486'; $prepare.Size = '150,44'
+$prepare.Text = 'Prepare game'; $prepare.Location = '20,466'; $prepare.Size = '150,44'
 $form.Controls.Add($prepare)
 
 $play = New-Object Windows.Forms.Button
-$play.Text = 'PLAY'; $play.Location = '338,486'; $play.Size = '150,44'
+$play.Text = 'PLAY'; $play.Location = '338,466'; $play.Size = '150,44'
 $play.Font = New-Object Drawing.Font('Segoe UI', 12, [Drawing.FontStyle]::Bold)
 $form.Controls.Add($play)
 
 $help = New-Object Windows.Forms.Label
 $help.Text = 'In game: F1 or hold START = graphics menu. Alt+Enter = window/fullscreen.'
-$help.Location = '20,538'; $help.AutoSize = $true; $help.ForeColor = [Drawing.Color]::DimGray
+$help.Location = '20,518'; $help.AutoSize = $true; $help.ForeColor = [Drawing.Color]::DimGray
 $form.Controls.Add($help)
 
 function Update-TextureCount {
@@ -225,8 +217,6 @@ function Save-Graphics {
     Write-IniValue 'Renderer' $Renderers[$renBox.SelectedItem]
     Write-IniValue 'LoadTextureReplacements' $(if ($texBox.Checked) { 'true' } else { 'false' })
     $settings.Fullscreen = $fullBox.Checked
-    $settings.Online = $onlineBox.Checked
-    $settings.Server = $(if ($serverBox.Text.Trim()) { $serverBox.Text.Trim() } else { $DefaultServer })
     Save-Settings
 }
 
@@ -266,17 +256,14 @@ $play.Add_Click({
     Save-Graphics
     New-Item -ItemType Directory -Force "$Root\logs" | Out-Null
     $env:PS2X_GS_LIVE = '1'
-    if ($onlineBox.Checked) {
-        # Emulated network adapter + server; the network settings live on the memory card.
-        $env:PS2X_NET = '1'
-        $env:PS2X_NET_SERVER = $settings.Server
-        $netcnf = "$Root\game\iso\mc0\BWNETCNF"
-        if (-not (Test-Path "$netcnf\BWNETCNF")) {
-            New-Item -ItemType Directory -Force $netcnf | Out-Null
-            Copy-Item "$Repo\game\mc0_netcnf\BWNETCNF\*" $netcnf -Force
-        }
-    } else {
-        $env:PS2X_NET = '0'
+    # Online is always available: emulated network adapter + community server; the network
+    # settings live on the memory card (offline modes are unaffected).
+    $env:PS2X_NET = '1'
+    $env:PS2X_NET_SERVER = $Server
+    $netcnf = "$Root\game\iso\mc0\BWNETCNF"
+    if (-not (Test-Path "$netcnf\BWNETCNF")) {
+        New-Item -ItemType Directory -Force $netcnf | Out-Null
+        Copy-Item "$Repo\game\mc0_netcnf\BWNETCNF\*" $netcnf -Force
     }
     $env:PS2X_GSHOST_ARGS = '-renderer ' + $(switch ($Renderers[$renBox.SelectedItem]) { 3 { 'dx11' } 15 { 'dx12' } 12 { 'gl' } default { 'vulkan' } }) +
         ' -ini nba_street.ini' + $(if ($fullBox.Checked) { ' -fullscreen' } else { '' })
