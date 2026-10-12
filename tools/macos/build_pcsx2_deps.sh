@@ -1,0 +1,261 @@
+#!/bin/bash
+# Derived from PCSX2 .github/workflows/scripts/macos/build-dependencies.sh (d073d75) for the
+# street-recomp-v3 macOS ARM64 GS host: arm64 only, no Qt/MoltenVK/shaderc.
+
+set -e
+
+if [ "$#" -ne 1 ]; then
+    echo "Syntax: $0 <output directory>"
+    exit 1
+fi
+
+# The bundled ffmpeg has a lot of things disabled to reduce code size.
+# Users may want to use system ffmpeg for additional features
+: ${BUILD_FFMPEG:=0} # FFmpeg is only for video capture; its build below is x86_64-only
+
+export MACOSX_DEPLOYMENT_TARGET=11.0
+
+NPROCS="$(getconf _NPROCESSORS_ONLN)"
+SCRIPTDIR="${PCSX2_MACOS_SCRIPTS:?set PCSX2_MACOS_SCRIPTS to pcsx2/.github/workflows/scripts/macos}"
+INSTALLDIR="$1"
+if [ "${INSTALLDIR:0:1}" != "/" ]; then
+	INSTALLDIR="$PWD/$INSTALLDIR"
+fi
+
+QT=6.11.1
+QTAPNG=1.3.0
+
+FREETYPE=2.14.3
+SDL=SDL3-3.4.12
+HARFBUZZ=14.2.0
+ZSTD=1.5.7
+LZ4=1.10.0
+LIBPNG=1.6.58
+LIBJPEGTURBO=3.2.0
+LIBWEBP=1.6.0
+FFMPEG=8.1
+MOLTENVK=1.4.1
+KDDOCKWIDGETS=2.4.1
+PLUTOVG=1.3.2
+PLUTOSVG=0.0.7
+RAPIDYAML=0.12.1
+
+SHADERC=2026.2
+SHADERC_GLSLANG=275822a6261ee689aadb1da5f09a0ec2f058685c
+SHADERC_SPIRVHEADERS=58006c901d1d5c37dece6b6610e9af87fa951375
+SHADERC_SPIRVTOOLS=6337eb62cadd7d124ac6789bf39c0f71148f0a73
+
+mkdir -p deps-build
+cd deps-build
+
+export PKG_CONFIG_PATH="$INSTALLDIR/lib/pkgconfig:$PKG_CONFIG_PATH"
+export LDFLAGS="-L$INSTALLDIR/lib $LDFLAGS"
+export CFLAGS="-I$INSTALLDIR/include $CFLAGS"
+export CXXFLAGS="-I$INSTALLDIR/include $CXXFLAGS"
+CMAKE_COMMON=(
+	-DCMAKE_BUILD_TYPE=Release
+	-DCMAKE_SHARED_LINKER_FLAGS="-dead_strip -dead_strip_dylibs"
+	-DCMAKE_PREFIX_PATH="$INSTALLDIR"
+	-DCMAKE_INSTALL_PREFIX="$INSTALLDIR"
+	-DCMAKE_OSX_ARCHITECTURES="arm64"
+	-DCMAKE_APPLE_SILICON_PROCESSOR="arm64"
+	-DCMAKE_INSTALL_NAME_DIR='$<INSTALL_PREFIX>/lib'
+)
+
+grep . > SHASUMS <<EOF
+d9594a31228aa23ad6b531719a29b45f0f3989fe6c136d45767ea179f233c1ac  qtbase-everywhere-src-$QT.tar.xz
+b2bf6c6845ac175ed7f819145483ba4676f617aaa6a5012c8efee63c8bbac413  qtimageformats-everywhere-src-$QT.tar.xz
+7f3cf02f4824bf03c2c5859ea6db173bf1482a1daf24e6cdf7bc78cfa26a8a94  qtsvg-everywhere-src-$QT.tar.xz
+8e61835a679c93fa9c6065b142353c2071ba68e297898937c32a03777fcaf50d  qttools-everywhere-src-$QT.tar.xz
+37c02c81206594c7bb4edca85ac93e8e55a9836b70c960fde6cb0f8623ec5677  qttranslations-everywhere-src-$QT.tar.xz
+f1d3be3489f758efe1a8f12118a212febbe611aa670af32e0159fa3c1feab2a6  QtApng-$QTAPNG.tar.gz
+
+36bc4f1cc413335368ee656c42afca65c5a3987e8768cc28cf11ba775e785a5f  freetype-$FREETYPE.tar.xz
+f07b958a9ac5020fb7a44cadb957f658b2149c3c8abb4f63145fac9303249db7  $SDL.tar.gz
+c652d5d94971031654ab3989891a490a895d3e3f2b71171c62692b28e94b1b93  harfbuzz-$HARFBUZZ.tar.gz
+eb33e51f49a15e023950cd7825ca74a4a2b43db8354825ac24fc1b7ee09e6fa3  zstd-$ZSTD.tar.gz
+537512904744b35e232912055ccf8ec66d768639ff3abe5788d90d792ec5f48b  lz4-$LZ4.tar.gz
+28eb403f51f0f7405249132cecfe82ea5c0ef97f1b32c5a65828814ae0d34775  libpng-$LIBPNG.tar.xz
+e4ab7009bf0629fd11982d4c2aa83964cf244cffba7347ecd39019a9e38c4564  libwebp-$LIBWEBP.tar.gz
+eee7dea22ed502868017971c86c63c4ed1e6085de0baebfdcc3d3322f00f3eb0  libpng-$LIBPNG-apng.patch.gz
+6f30092cef9fb839779646608f4ee14ae3cbac989c47fa05e841b0841f09878e  libjpeg-turbo-$LIBJPEGTURBO.tar.gz
+b072aed6871998cce9b36e7774033105ca29e33632be5b6347f3206898e0756a  ffmpeg-$FFMPEG.tar.xz
+9985f141902a17de818e264d17c1ce334b748e499ee02fcb4703e4dc0038f89c  v$MOLTENVK.tar.gz
+5cd9495d9316cf6cc937bb328a7fd491c3248ef2469cfa42511f1039f6148aca  KDDockWidgets-$KDDOCKWIDGETS.tar.gz
+7bd4e79ce18b1d47517e7e91fbb7cf19d4f01942804a519bc7c0bf32b6325dd5  plutovg-$PLUTOVG.tar.gz
+78561b571ac224030cdc450ca2986b4de915c2ba7616004a6d71a379bffd15f3  plutosvg-$PLUTOSVG.tar.gz
+e9efcdd17f86287748793cf21d106e461fcad8d103a3e5a23632afe93828660d  rapidyaml-$RAPIDYAML-src.tgz
+
+f924178e75e3293082481b25ed64d5e48a795b479dac3bd3c83d23070855df42  shaderc-$SHADERC.tar.gz
+971848a1cc639ce8dc244e778b17efe0f690e32ac398a75e31d1c67ad06d3e0a  shaderc-glslang-$SHADERC_GLSLANG.tar.gz
+a6cb1b300bb8171795e116457e858e555334749f9cacaed8068ae0ef8681110c  shaderc-spirv-headers-$SHADERC_SPIRVHEADERS.tar.gz
+e156be0bd81c8812f1bff8e520422bfa9df61b3045587b9eb483185f1074a7b2  shaderc-spirv-tools-$SHADERC_SPIRVTOOLS.tar.gz
+EOF
+
+if ! shasum -sa 256 --check SHASUMS 2> /dev/null; then
+	curl -L \
+		-O "https://sourceforge.net/projects/freetype/files/freetype2/$FREETYPE/freetype-$FREETYPE.tar.xz" \
+		-O "https://github.com/harfbuzz/harfbuzz/archive/$HARFBUZZ/harfbuzz-$HARFBUZZ.tar.gz" \
+		-O "https://libsdl.org/release/$SDL.tar.gz" \
+		-O "https://github.com/facebook/zstd/releases/download/v$ZSTD/zstd-$ZSTD.tar.gz" \
+		-O "https://github.com/lz4/lz4/releases/download/v$LZ4/lz4-$LZ4.tar.gz" \
+		-O "https://downloads.sourceforge.net/project/libpng/libpng16/$LIBPNG/libpng-$LIBPNG.tar.xz" \
+		-O "https://download.sourceforge.net/libpng-apng/libpng-$LIBPNG-apng.patch.gz" \
+		-O "https://github.com/libjpeg-turbo/libjpeg-turbo/releases/download/$LIBJPEGTURBO/libjpeg-turbo-$LIBJPEGTURBO.tar.gz" \
+		-O "https://storage.googleapis.com/downloads.webmproject.org/releases/webp/libwebp-$LIBWEBP.tar.gz" \
+		-O "https://ffmpeg.org/releases/ffmpeg-$FFMPEG.tar.xz" \
+		-O "https://github.com/KhronosGroup/MoltenVK/archive/refs/tags/v$MOLTENVK.tar.gz" \
+		-O "https://download.qt.io/archive/qt/${QT%.*}/$QT/submodules/qtbase-everywhere-src-$QT.tar.xz" \
+		-O "https://download.qt.io/archive/qt/${QT%.*}/$QT/submodules/qtimageformats-everywhere-src-$QT.tar.xz" \
+		-O "https://download.qt.io/archive/qt/${QT%.*}/$QT/submodules/qtsvg-everywhere-src-$QT.tar.xz" \
+		-O "https://download.qt.io/archive/qt/${QT%.*}/$QT/submodules/qttools-everywhere-src-$QT.tar.xz" \
+		-O "https://download.qt.io/archive/qt/${QT%.*}/$QT/submodules/qttranslations-everywhere-src-$QT.tar.xz" \
+		-O "https://github.com/jurplel/QtApng/archive/$QTAPNG/QtApng-$QTAPNG.tar.gz" \
+		-O "https://github.com/google/shaderc/archive/v$SHADERC/shaderc-$SHADERC.tar.gz" \
+		-O "https://github.com/KhronosGroup/glslang/archive/$SHADERC_GLSLANG/shaderc-glslang-$SHADERC_GLSLANG.tar.gz" \
+		-O "https://github.com/KhronosGroup/SPIRV-Headers/archive/$SHADERC_SPIRVHEADERS/shaderc-spirv-headers-$SHADERC_SPIRVHEADERS.tar.gz" \
+		-O "https://github.com/KhronosGroup/SPIRV-Tools/archive/$SHADERC_SPIRVTOOLS/shaderc-spirv-tools-$SHADERC_SPIRVTOOLS.tar.gz" \
+		-O "https://github.com/KDAB/KDDockWidgets/archive/v$KDDOCKWIDGETS/KDDockWidgets-$KDDOCKWIDGETS.tar.gz" \
+		-O "https://github.com/sammycage/plutovg/archive/v$PLUTOVG/plutovg-$PLUTOVG.tar.gz" \
+		-O "https://github.com/sammycage/plutosvg/archive/v$PLUTOSVG/plutosvg-$PLUTOSVG.tar.gz" \
+		-O "https://github.com/biojppm/rapidyaml/releases/download/v$RAPIDYAML/rapidyaml-$RAPIDYAML-src.tgz"
+fi
+
+shasum -a 256 --check --strict SHASUMS
+
+echo "Installing SDL..."
+rm -fr "$SDL"
+tar xf "$SDL.tar.gz"
+cd "$SDL"
+cmake -B build "${CMAKE_COMMON[@]}" -DSDL_VIDEO=OFF -DSDL_POWER=OFF -DSDL_SENSOR=OFF -DSDL_DIALOG=OFF -DSDL_TRAY=OFF -DSDL_TEST_LIBRARY=OFF -DBUILD_SHARED_LIBS=ON
+make -C build "-j$NPROCS"
+make -C build install
+cd ..
+
+if [ "$BUILD_FFMPEG" -ne 0 ]; then
+	echo "Installing FFmpeg..."
+	rm -fr "ffmpeg-$FFMPEG"
+	tar xf "ffmpeg-$FFMPEG.tar.xz"
+	cd "ffmpeg-$FFMPEG"
+	LDFLAGS="-dead_strip $LDFLAGS" CFLAGS="-Os $CFLAGS" CXXFLAGS="-Os $CXXFLAGS" \
+		./configure --prefix="$INSTALLDIR" \
+		--enable-cross-compile --arch=x86_64 --cc='clang -arch x86_64' --cxx='clang++ -arch x86_64' \
+		--disable-all --disable-autodetect --disable-static --enable-shared \
+		--enable-avcodec --enable-avformat --enable-avutil --enable-swresample --enable-swscale \
+		--enable-audiotoolbox --enable-videotoolbox \
+		--enable-encoder=ffv1,qtrle,pcm_s16be,pcm_s16le,*_at,*_videotoolbox \
+		--enable-muxer=avi,matroska,mov,mp3,mp4,wav \
+		--enable-protocol=file
+	make "-j$NPROCS"
+	make install
+	cd ..
+fi
+
+echo "Installing Zstd..."
+rm -fr "zstd-$ZSTD"
+tar xf "zstd-$ZSTD.tar.gz"
+cd "zstd-$ZSTD"
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DZSTD_BUILD_PROGRAMS=OFF -B build-dir build/cmake
+make -C build-dir "-j$NPROCS"
+make -C build-dir install
+cd ..
+
+echo "Installing LZ4..."
+rm -fr "lz4-$LZ4"
+tar xf "lz4-$LZ4.tar.gz"
+cd "lz4-$LZ4"
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DLZ4_BUILD_CLI=OFF -DLZ4_BUILD_LEGACY_LZ4C=OFF -B build-dir build/cmake
+make -C build-dir "-j$NPROCS"
+make -C build-dir install
+cd ..
+
+echo "Installing libpng..."
+rm -fr "libpng-$LIBPNG"
+tar xf "libpng-$LIBPNG.tar.xz"
+gzip -kd -f "libpng-$LIBPNG-apng.patch.gz"
+cd "libpng-$LIBPNG"
+patch -p1 < "../libpng-$LIBPNG-apng.patch"
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DPNG_TESTS=OFF -DPNG_FRAMEWORK=OFF -B build
+make -C build "-j$NPROCS"
+make -C build install
+cd ..
+
+echo "Installing libjpegturbo..."
+rm -fr "libjpeg-turbo-$LIBJPEGTURBO"
+tar xf "libjpeg-turbo-$LIBJPEGTURBO.tar.gz"
+cd "libjpeg-turbo-$LIBJPEGTURBO"
+cmake "${CMAKE_COMMON[@]}" "$CMAKE_ARCH_X64" -DENABLE_STATIC=OFF -DENABLE_SHARED=ON -B build
+make -C build "-j$NPROCS"
+make -C build install
+cd ..
+
+echo "Installing WebP..."
+rm -fr "libwebp-$LIBWEBP"
+tar xf "libwebp-$LIBWEBP.tar.gz"
+cd "libwebp-$LIBWEBP"
+cmake "${CMAKE_COMMON[@]}" -B build \
+	-DWEBP_BUILD_ANIM_UTILS=OFF -DWEBP_BUILD_CWEBP=OFF -DWEBP_BUILD_DWEBP=OFF -DWEBP_BUILD_GIF2WEBP=OFF -DWEBP_BUILD_IMG2WEBP=OFF \
+	-DWEBP_BUILD_VWEBP=OFF -DWEBP_BUILD_WEBPINFO=OFF -DWEBP_BUILD_WEBPMUX=OFF -DWEBP_BUILD_EXTRAS=OFF -DBUILD_SHARED_LIBS=ON
+make -C build "-j$NPROCS"
+make -C build install
+cd ..
+
+echo "Building FreeType without HarfBuzz..."
+rm -fr "freetype-$FREETYPE"
+tar xf "freetype-$FREETYPE.tar.xz"
+cd "freetype-$FREETYPE"
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DFT_REQUIRE_ZLIB=ON -DFT_REQUIRE_PNG=ON -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE -DFT_DISABLE_HARFBUZZ=TRUE -B build
+make -C build "-j$NPROCS"
+make -C build install
+cd ..
+
+echo "Building HarfBuzz..."
+rm -fr "harfbuzz-$HARFBUZZ"
+tar xf "harfbuzz-$HARFBUZZ.tar.gz"
+cd "harfbuzz-$HARFBUZZ"
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DHB_BUILD_UTILS=OFF -DHB_BUILD_GPU=OFF -B build
+make -C build "-j$NPROCS"
+make -C build install
+cd ..
+
+echo "Building FreeType with HarfBuzz..."
+rm -fr "freetype-$FREETYPE"
+tar xf "freetype-$FREETYPE.tar.xz"
+cd "freetype-$FREETYPE"
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DFT_REQUIRE_ZLIB=ON -DFT_REQUIRE_PNG=ON -DFT_DISABLE_BZIP2=TRUE -DFT_DISABLE_BROTLI=TRUE -DFT_REQUIRE_HARFBUZZ=TRUE -B build
+make -C build "-j$NPROCS"
+make -C build install
+cd ..
+
+# Qt, MoltenVK and shaderc are skipped: pcsx2-gsrunner on macOS uses the Metal renderer and no Qt.
+
+echo "Building PlutoVG..."
+rm -fr "plutovg-$PLUTOVG"
+tar xf "plutovg-$PLUTOVG.tar.gz"
+cd "plutovg-$PLUTOVG"
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DPLUTOVG_BUILD_EXAMPLES=OFF -B build
+make -C build "-j$NPROCS"
+make -C build install
+cd ..
+
+echo "Building PlutoSVG..."
+rm -fr "plutosvg-$PLUTOSVG"
+tar xf "plutosvg-$PLUTOSVG.tar.gz"
+cd "plutosvg-$PLUTOSVG"
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -DPLUTOSVG_ENABLE_FREETYPE=ON -DPLUTOSVG_BUILD_EXAMPLES=OFF -B build
+make -C build "-j$NPROCS"
+make -C build install
+cd ..
+
+echo "Building RapidYAML..."
+rm -fr "rapidyaml-$RAPIDYAML-src"
+tar xf "rapidyaml-$RAPIDYAML-src.tgz"
+cd "rapidyaml-$RAPIDYAML-src"
+cmake "${CMAKE_COMMON[@]}" -DBUILD_SHARED_LIBS=ON -B build
+make -C build "-j$NPROCS"
+make -C build install
+cd ..
+
+echo "Cleaning up..."
+cd ..
+rm -rf deps-build
