@@ -4907,7 +4907,7 @@ index e8b9f37..9c6e1e2 100644
  					{
  						size -= total;
 diff --git a/pcsx2/GS/Renderers/Common/GSDevice.cpp b/pcsx2/GS/Renderers/Common/GSDevice.cpp
-index a4f70a9..fa879ba 100644
+index a4f70a9..48e6fe8 100644
 --- a/pcsx2/GS/Renderers/Common/GSDevice.cpp
 +++ b/pcsx2/GS/Renderers/Common/GSDevice.cpp
 @@ -930,8 +930,10 @@ void GSDevice::ClearCurrent()
@@ -4921,12 +4921,13 @@ index a4f70a9..fa879ba 100644
  	m_weavebob = nullptr;
  	m_blend = nullptr;
  	m_mad = nullptr;
-@@ -1200,6 +1202,41 @@ void GSDevice::CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, con
+@@ -1200,6 +1202,42 @@ void GSDevice::CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, con
  	src_uv = GSVector4(0.0f, 0.0f, 1.0f, 1.0f);
  }
  
-+void GSDevice::Upscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, int mode)
++void GSDevice::Upscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, int mode, GSTexture* depth)
 +{
++	m_upscaler_depth = depth;
 +	const int dst_width = static_cast<int>(std::ceil(draw_rect.z - draw_rect.x));
 +	const int dst_height = static_cast<int>(std::ceil(draw_rect.w - draw_rect.y));
 +	// Only an upscaler: when the internal resolution already covers the window, present as is.
@@ -4964,18 +4965,19 @@ index a4f70a9..fa879ba 100644
  {
  	return enable && (((colormask.key & 7u) && (src_factor != GSDevice::CONST_ONE || dst_factor != GSDevice::CONST_ZERO)) ||
 diff --git a/pcsx2/GS/Renderers/Common/GSDevice.h b/pcsx2/GS/Renderers/Common/GSDevice.h
-index 9ef0233..ccca3d0 100644
+index 9ef0233..639ec41 100644
 --- a/pcsx2/GS/Renderers/Common/GSDevice.h
 +++ b/pcsx2/GS/Renderers/Common/GSDevice.h
-@@ -1483,6 +1483,7 @@ protected:
+@@ -1483,6 +1483,8 @@ protected:
  	GSTexture* m_target_tmp = nullptr;
  	GSTexture* m_current = nullptr;
  	GSTexture* m_cas = nullptr;
 +	GSTexture* m_upscaled = nullptr; ///< PS2Recomp final upscaler output (FSR / DLSS)
++	GSTexture* m_upscaler_depth = nullptr; ///< PS2Recomp depth of the frame being upscaled (DLSS), may be null
  	GSTexture* m_colclip_rt = nullptr; ///< Temp hw colclip texture
  	GSTexture* m_ds_as_rt = nullptr; ///< Depth as color
  
-@@ -1501,6 +1502,10 @@ protected:
+@@ -1501,6 +1503,10 @@ protected:
  	/// Applies CAS and writes to the destination texture, which should be a shader writeable texture.
  	virtual bool DoCAS(GSTexture* sTex, GSTexture* dTex, bool sharpen_only, const std::array<u32, NUM_CAS_CONSTANTS>& constants) = 0;
  
@@ -4986,17 +4988,17 @@ index 9ef0233..ccca3d0 100644
  	/// Perform texture operations for ImGui
  	void UpdateImGuiTextures();
  
-@@ -1707,6 +1712,8 @@ public:
+@@ -1707,6 +1713,8 @@ public:
  	void Resize(int width, int height);
  
  	void CAS(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, bool sharpen_only);
 +	/// PS2Recomp: FSR 1 / DLSS upscale of the display output to the window draw size (see DoUpscale).
-+	void Upscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, int mode);
++	void Upscale(GSTexture*& tex, GSVector4i& src_rect, GSVector4& src_uv, const GSVector4& draw_rect, int mode, GSTexture* depth = nullptr);
  
  	bool ResizeRenderTarget(GSTexture** t, int w, int h, bool preserve_contents, bool recycle);
  
 diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
-index 1d77040..8929af5 100644
+index 1d77040..6a8f13d 100644
 --- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
 +++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
 @@ -685,6 +685,10 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
@@ -5006,7 +5008,7 @@ index 1d77040..8929af5 100644
 +
 +			// PS2Recomp: AMD FSR 1 / NVIDIA DLSS up to the window size.
 +			if (GSConfig.NbaUpscaler != 0)
-+				g_gs_device->Upscale(current, src_rect, src_uv, draw_rect, GSConfig.NbaUpscaler);
++				g_gs_device->Upscale(current, src_rect, src_uv, draw_rect, GSConfig.NbaUpscaler, GetUpscalerDepth());
  		}
  
  		if (BeginPresentFrame(false))
@@ -5020,11 +5022,195 @@ index 1d77040..8929af5 100644
 +			GSVector4i shot_rect = src_rect;
 +			GSVector4 shot_uv = src_uv;
 +			if (GSConfig.NbaUpscaler != 0)
-+				g_gs_device->Upscale(shot_src, shot_rect, shot_uv, GSVector4(rc), GSConfig.NbaUpscaler);
++				g_gs_device->Upscale(shot_src, shot_rect, shot_uv, GSVector4(rc), GSConfig.NbaUpscaler, GetUpscalerDepth());
 +			g_gs_device->StretchRect(shot_src, shot_uv, rt, GSVector4(rc), ShaderConvert::TRANSPARENCY_FILTER, Biln);
  			dl->CopyFromTexture(rc, rt, rc, 0);
  			dl->Flush();
  
+diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.h b/pcsx2/GS/Renderers/Common/GSRenderer.h
+index 5f6f8d4..f400f25 100644
+--- a/pcsx2/GS/Renderers/Common/GSRenderer.h
++++ b/pcsx2/GS/Renderers/Common/GSRenderer.h
+@@ -29,6 +29,8 @@ protected:
+ 
+ 	virtual GSTexture* GetOutput(int i, float& scale, int& y_offset) = 0;
+ 	virtual GSTexture* GetFeedbackOutput(float& scale) { return nullptr; }
++	// PS2Recomp: depth buffer of the displayed frame, for the DLSS upscaler (may be null).
++	virtual GSTexture* GetUpscalerDepth() { return nullptr; }
+ 
+ public:
+ 	GSRenderer();
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+index 98483f2..a903a1c 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
+@@ -48,6 +48,7 @@ GSRendererHW::~GSRendererHW()
+ 
+ void GSRendererHW::Destroy()
+ {
++	NbaFreeDepth();
+ 	g_texture_cache->RemoveAll(true, true, true);
+ 	GSRenderer::Destroy();
+ }
+@@ -84,6 +85,7 @@ void GSRendererHW::Reset(bool hardware_reset)
+ 		g_texture_cache->ReadbackAll();
+ 
+ 	g_texture_cache->RemoveAll(true, true, true);
++	NbaFreeDepth();
+ 
+ 	GSRenderer::Reset(hardware_reset);
+ }
+@@ -169,6 +171,11 @@ GSTexture* GSRendererHW::GetOutput(int i, float& scale, int& y_offset)
+ 
+ 	if (GSTextureCache::Target* rt = g_texture_cache->LookupDisplayTarget(TEX0, framebufferSize, GetTextureScaleFactor(), false))
+ 	{
++		if (rt->m_TEX0.TBP0 != m_nba_display_bp) // PS2Recomp: for NbaTrackDepth() / GetUpscalerDepth()
++		{
++			m_nba_prev_display_bp = m_nba_display_bp;
++			m_nba_display_bp = rt->m_TEX0.TBP0;
++		}
+ 		const u32 bp_adj = (TEX0.TBP0 < rt->m_TEX0.TBP0 && rt->UnwrappedEndBlock() > GS_MAX_BLOCKS) ? (TEX0.TBP0 + GS_MAX_BLOCKS) : TEX0.TBP0;
+ 		rt->Update();
+ 		t = rt->m_texture;
+@@ -192,6 +199,92 @@ GSTexture* GSRendererHW::GetOutput(int i, float& scale, int& y_offset)
+ 	return t;
+ }
+ 
++// PS2Recomp: the game draws frame N+1 with the same Z buffer while frame N is on screen, so the
++// depth of a finished frame only exists until the next frame starts. Whenever a depth-using draw
++// moves to another colour target, the previous target's depth is complete: keep a copy of it,
++// tagged with that frame's address. GetUpscalerDepth() hands DLSS the copy of the shown frame.
++void GSRendererHW::NbaTrackDepth(GSTextureCache::Target* rt, GSTextureCache::Target* ds)
++{
++	const bool uses_depth = !m_cached_ctx.ZBUF.ZMSK || (m_cached_ctx.TEST.ZTE && m_cached_ctx.TEST.ZTST > ZTST_ALWAYS);
++	if (!uses_depth || m_using_temp_z || !ds->m_texture)
++		return;
++
++	const u32 frame_bp = rt->m_TEX0.TBP0;
++	const u32 depth_bp = ds->m_TEX0.TBP0;
++	m_nba_last_depth_bp = depth_bp;
++	m_nba_last_depth_psm = ds->m_TEX0.PSM;
++
++	// Last colour target per Z buffer (render-to-texture passes use their own Z buffers).
++	NbaDepthUse* use = nullptr;
++	for (NbaDepthUse& u : m_nba_depth_uses)
++	{
++		if (u.depth_bp == depth_bp)
++		{
++			use = &u;
++			break;
++		}
++	}
++	if (!use)
++	{
++		use = &m_nba_depth_uses[m_nba_depth_use_next++ % std::size(m_nba_depth_uses)];
++		*use = {depth_bp, frame_bp};
++		return;
++	}
++
++	const u32 done_bp = use->frame_bp;
++	use->frame_bp = frame_bp;
++	// Only frames that are (or recently were) on screen matter; skips render-to-texture targets.
++	if (frame_bp != done_bp && (done_bp == m_nba_display_bp || done_bp == m_nba_prev_display_bp))
++	{
++		GSTexture* const src = ds->m_texture;
++		if (!m_nba_saved_depth || m_nba_saved_depth->GetSize() != src->GetSize())
++		{
++			delete m_nba_saved_depth;
++			m_nba_saved_depth = g_gs_device->CreateDepthStencil(src->GetSize(), false, false);
++		}
++		if (m_nba_saved_depth)
++		{
++			g_gs_device->CopyRect(src, m_nba_saved_depth, GSVector4i(0, 0, src->GetWidth(), src->GetHeight()), 0, 0);
++			m_nba_saved_depth_bp = done_bp;
++		}
++	}
++}
++
++void GSRendererHW::NbaFreeDepth()
++{
++	delete m_nba_saved_depth;
++	m_nba_saved_depth = nullptr;
++	m_nba_saved_depth_bp = ~0u;
++	m_nba_last_depth_bp = ~0u;
++	for (NbaDepthUse& u : m_nba_depth_uses)
++		u = {~0u, ~0u};
++}
++
++GSTexture* GSRendererHW::GetUpscalerDepth()
++{
++	static const bool s_log = std::getenv("PS2X_DLSS_DEPTH_LOG") != nullptr;
++	static u32 s_n = 0;
++	if (s_log && (s_n++ % 120) == 0)
++	{
++		Console.WriteLn("(PS2Recomp) depth: display %x prev %x saved %x(%p) uses %x>%x %x>%x %x>%x %x>%x", m_nba_display_bp,
++			m_nba_prev_display_bp, m_nba_saved_depth_bp, m_nba_saved_depth, m_nba_depth_uses[0].depth_bp, m_nba_depth_uses[0].frame_bp,
++			m_nba_depth_uses[1].depth_bp, m_nba_depth_uses[1].frame_bp, m_nba_depth_uses[2].depth_bp, m_nba_depth_uses[2].frame_bp,
++			m_nba_depth_uses[3].depth_bp, m_nba_depth_uses[3].frame_bp);
++	}
++	// Page flipping games: the copy taken when the shown frame was finished.
++	if (m_nba_saved_depth && m_nba_saved_depth_bp == m_nba_display_bp)
++		return m_nba_saved_depth;
++	// Games that render into one back buffer and copy it to the display buffer: the frame is
++	// finished when the vsync arrives (the GS stream is processed in order), so the live Z buffer
++	// of the last 3D draw is exactly the shown frame's depth.
++	if (m_nba_last_depth_bp != ~0u && m_nba_saved_depth_bp == ~0u)
++	{
++		if (GSTextureCache::Target* ds = g_texture_cache->GetTargetWithSharedBits(m_nba_last_depth_bp, m_nba_last_depth_psm))
++			return ds->m_texture;
++	}
++	return nullptr;
++}
++
+ GSTexture* GSRendererHW::GetFeedbackOutput(float& scale)
+ {
+ 	const int index = m_regs->EXTBUF.FBIN & 1;
+@@ -4989,6 +5082,9 @@ void GSRendererHW::Draw()
+ 			}
+ 		}
+ 	}
++	if (GSConfig.NbaUpscaler == 2 && rt && ds)
++		NbaTrackDepth(rt, ds);
++
+ 	bool skip_draw = false;
+ 	if (!GSConfig.UserHacks_DisableSafeFeatures && is_possible_mem_clear)
+ 		skip_draw = TryTargetClear(rt, ds, preserve_rt_color, preserve_depth);
+diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.h b/pcsx2/GS/Renderers/HW/GSRendererHW.h
+index 4ee9d55..2066b4f 100644
+--- a/pcsx2/GS/Renderers/HW/GSRendererHW.h
++++ b/pcsx2/GS/Renderers/HW/GSRendererHW.h
+@@ -34,6 +34,23 @@ public:
+ private:
+ 	static constexpr float SSR_UV_TOLERANCE = 1.0f;
+ 
++	// PS2Recomp: depth of the last finished on-screen frame, for DLSS (see NbaTrackDepth).
++	struct NbaDepthUse
++	{
++		u32 depth_bp;
++		u32 frame_bp;
++	};
++	NbaDepthUse m_nba_depth_uses[4] = {{~0u, ~0u}, {~0u, ~0u}, {~0u, ~0u}, {~0u, ~0u}};
++	u32 m_nba_depth_use_next = 0;
++	u32 m_nba_display_bp = ~1u;
++	u32 m_nba_prev_display_bp = ~1u;
++	GSTexture* m_nba_saved_depth = nullptr;
++	u32 m_nba_saved_depth_bp = ~0u;
++	u32 m_nba_last_depth_bp = ~0u;
++	u32 m_nba_last_depth_psm = 0;
++	void NbaTrackDepth(GSTextureCache::Target* rt, GSTextureCache::Target* ds);
++	void NbaFreeDepth();
++
+ 	using GSC_Ptr = bool(*)(GSRendererHW& r, int& skip);	// GSC - Get Skip Count
+ 	using OI_Ptr = bool(*)(GSRendererHW& r, GSTexture* rt, GSTexture* ds, GSTextureCache::Source* t); // OI - Before draw
+ 	using MV_Ptr = bool(*)(GSRendererHW& r); // MV - Move
+@@ -376,6 +393,7 @@ public:
+ 
+ 	GSTexture* GetOutput(int i, float& scale, int& y_offset) override;
+ 	GSTexture* GetFeedbackOutput(float& scale) override;
++	GSTexture* GetUpscalerDepth() override;
+ 	void InvalidateVideoMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r) override;
+ 	void InvalidateLocalMem(const GIFRegBITBLTBUF& BITBLTBUF, const GSVector4i& r, bool clut = false) override;
+ 	void Move() override;
 diff --git a/pcsx2/GS/Renderers/HW/GSTextureCache.cpp b/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
 index 440e279..a5108c3 100644
 --- a/pcsx2/GS/Renderers/HW/GSTextureCache.cpp
@@ -5043,7 +5229,7 @@ index 440e279..a5108c3 100644
  		{
  			if ((m_TEX0.PSM & 0xf) != PSMCT24 && m_dirty[i].rgba.c.a && bpp >= 16)
 diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
-index d3dad7e..5d8df17 100644
+index d3dad7e..365382a 100644
 --- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 +++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 @@ -21,10 +21,21 @@
@@ -5149,7 +5335,7 @@ index d3dad7e..5d8df17 100644
  
  	m_swap_chain.reset();
  
-@@ -4774,6 +4831,347 @@ bool GSDeviceVK::DoCAS(
+@@ -4774,6 +4831,370 @@ bool GSDeviceVK::DoCAS(
  	return true;
  }
  
@@ -5382,8 +5568,10 @@ index d3dad7e..5d8df17 100644
 +		create.Feature.InTargetWidth = out_w;
 +		create.Feature.InTargetHeight = out_h;
 +		create.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_MaxQuality;
-+		// LDR input, motion vectors at render resolution, no exposure texture.
-+		create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure;
++		// LDR input, motion vectors at render resolution, no exposure texture. PS2 Z grows towards
++		// the camera, so the depth buffer is "inverted" (1 = near) in DLSS terms.
++		create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
++		                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
 +		NVSDK_NGX_Handle* handle = nullptr;
 +		const NVSDK_NGX_Result res = NGX_VULKAN_CREATE_DLSS_EXT(cmdbuf, 1, 1, &handle, params, &create);
 +		if (NVSDK_NGX_FAILED(res) || !handle)
@@ -5402,8 +5590,22 @@ index d3dad7e..5d8df17 100644
 +	if (!m_dlss_feature)
 +		return false;
 +
-+	GSTextureVK* const depth = static_cast<GSTextureVK*>(m_dlss_depth);
++	// The game's real depth buffer of the shown frame when the renderer has one that covers the
++	// input (see GSRendererHW::NbaTrackDepth), otherwise the cleared stand-in (all far).
++	GSTextureVK* const game_depth = static_cast<GSTextureVK*>(m_upscaler_depth);
++	const bool real_depth = game_depth && game_depth->IsDepthStencil() &&
++	                        game_depth->GetWidth() >= src_rect.z && game_depth->GetHeight() >= src_rect.w;
++	static int s_real_depth = -1;
++	if (s_real_depth != static_cast<int>(real_depth))
++	{
++		s_real_depth = static_cast<int>(real_depth);
++		Console.WriteLn("(PS2Recomp) DLSS depth: %s", real_depth ? "game depth buffer" : "none");
++	}
++	GSTextureVK* const depth = real_depth ? game_depth : static_cast<GSTextureVK*>(m_dlss_depth);
 +	GSTextureVK* const mv = static_cast<GSTextureVK*>(m_dlss_mv);
++	if (real_depth && depth->GetState() == GSTexture::State::Cleared)
++		depth->CommitClear(cmdbuf);
++	depth->SetUseFenceCounter(GetCurrentFenceCounter());
 +	sTex->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ShaderReadOnly);
 +	depth->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ShaderReadOnly);
 +	mv->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ShaderReadOnly);
@@ -5414,8 +5616,10 @@ index d3dad7e..5d8df17 100644
 +		sTex->GetVkFormat(), sTex->GetWidth(), sTex->GetHeight(), false);
 +	NVSDK_NGX_Resource_VK out_res = NVSDK_NGX_Create_ImageView_Resource_VK(dTex->GetView(), dTex->GetImage(), range,
 +		dTex->GetVkFormat(), out_w, out_h, true);
-+	NVSDK_NGX_Resource_VK depth_res = NVSDK_NGX_Create_ImageView_Resource_VK(depth->GetView(), depth->GetImage(), range,
-+		depth->GetVkFormat(), in_w, in_h, false);
++	const VkImageSubresourceRange depth_range = {
++		static_cast<VkImageAspectFlags>(real_depth ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT), 0, 1, 0, 1};
++	NVSDK_NGX_Resource_VK depth_res = NVSDK_NGX_Create_ImageView_Resource_VK(depth->GetView(), depth->GetImage(), depth_range,
++		depth->GetVkFormat(), depth->GetWidth(), depth->GetHeight(), false);
 +	NVSDK_NGX_Resource_VK mv_res = NVSDK_NGX_Create_ImageView_Resource_VK(mv->GetView(), mv->GetImage(), range,
 +		mv->GetVkFormat(), in_w, in_h, false);
 +
@@ -5428,6 +5632,11 @@ index d3dad7e..5d8df17 100644
 +	eval.InRenderSubrectDimensions.Height = in_h;
 +	eval.InColorSubrectBase.X = src_rect.x;
 +	eval.InColorSubrectBase.Y = src_rect.y;
++	if (real_depth)
++	{
++		eval.InDepthSubrectBase.X = src_rect.x;
++		eval.InDepthSubrectBase.Y = src_rect.y;
++	}
 +	// No real motion vectors exist for a PS2 frame: drop the history every frame so moving
 +	// objects never ghost (DLSS then works as a per-frame AI upscaler).
 +	eval.InReset = 1;

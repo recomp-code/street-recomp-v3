@@ -48,7 +48,7 @@ translated to C++, so it can't be distributed; it's made on your PC from your ow
 - **Modern GPU rendering** through PCSX2's GS: Vulkan, Direct3D 11/12 or OpenGL, internal resolution
   from native 480p up to 8x (5K+), texture filtering, 4:3 or stretched 16:9, fullscreen.
 - **HD textures included**: downloaded and enabled automatically (see [HD textures](#hd-textures)).
-- **Upscaling to your screen with AMD FSR 1 (any GPU) or NVIDIA DLSS (RTX cards)**, chosen in the launcher or the in-game graphics menu. Tip: internal resolution 2x-3x plus DLSS/FSR for a 4K screen. `nvngx_dlss.dll` is downloaded from NVIDIA's official SDK and sits in `C:\NBAStreetRecomp\gshost`, where DLSS Swapper can update it.
+- **Upscaling to your screen with AMD FSR 1 (any GPU) or NVIDIA DLSS (RTX cards)**, chosen in the launcher or the in-game graphics menu. Tip: internal resolution 2x-3x plus DLSS/FSR for a 4K screen. `nvngx_dlss.dll` is downloaded from NVIDIA's official SDK and sits in `C:\NBAStreetRecomp\gshost`, where DLSS Swapper can update it. DLSS gets the game's real depth buffer for every frame.
 - **Online play restored** against a community server: EA accounts, personas, online ballers,
   PLAY NOW matches, no port forwarding. See [Online mode](#online-mode).
 - **One-click launcher**: choose your ISO, prepare once, play.

@@ -151,6 +151,19 @@ desensambla volcados de RAM (IOP o EE).
   `chainBuf` + `processVIF1Data` + copia al anillo. Siguiente paso: no copiar la cadena dos veces y
   analizar solo lo necesario para las paradas.
 
+### 5.2 Reescalado FSR 1 / DLSS en el host
+- FSR 1 (EASU+RCAS, compute) y DLSS (NGX Vulkan) se aplican al presentar, tras CAS
+  (`GSDevice::Upscale`, ini `NbaUpscaler` 0/1/2). Bug de PCSX2: `SetSpecializationValue` del
+  constructor de pipelines compute nunca guardaba el valor (cualquier shader con constantes de
+  especialización salía de un color plano).
+- DLSS no tiene vectores de movimiento (un PS2 no los genera): `InReset=1` en cada fotograma.
+- Profundidad real para DLSS (`GSRendererHW::NbaTrackDepth/GetUpscalerDepth`): NBA Street dibuja
+  el 3D en un búfer trasero (0x8C0, Z en 0x1A40) y lo copia al de pantalla (0). Como el host procesa
+  el flujo GS en orden, al llegar el vsync el Z del último dibujo 3D es exactamente el del fotograma
+  mostrado. Para juegos con intercambio de páginas se guarda una copia del Z cuando un dibujo con
+  profundidad pasa a otro búfer de color, etiquetada con su dirección. El Z del PS2 crece hacia la
+  cámara: flag `DepthInverted`. Log: `PS2X_DLSS_DEPTH_LOG=1`.
+
 ## Texturas HD (packs PCSX2) — qué NO reemplazar
 * Volcado: menú del host -> "Texturas HD" -> "Activadas + volcar originales"; `tools\texturas_preparar.ps1`
   copia a `texturas_hd\originales`; el usuario reescala con IA a `texturas_hd\hd`; `tools\texturas_instalar.ps1`.
