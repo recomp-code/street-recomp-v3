@@ -4040,7 +4040,7 @@ index 7bf5bfc..2d0df41 100644
  	void SetWriteDirectory(std::string_view dump_directory);
  	void WriteDumpForCaller();
 diff --git a/pcsx2-gsrunner/Main.cpp b/pcsx2-gsrunner/Main.cpp
-index de624db..47b94d7 100644
+index de624db..4bbe3b5 100644
 --- a/pcsx2-gsrunner/Main.cpp
 +++ b/pcsx2-gsrunner/Main.cpp
 @@ -6,11 +6,17 @@
@@ -4257,7 +4257,7 @@ index de624db..47b94d7 100644
  	// update GS thread copy of frame number
  	MTGS::RunOnGSThread([frame_number = GSDumpReplayer::GetFrameNumber()]() { s_dump_frame_number = frame_number; });
  	MTGS::RunOnGSThread([loop_number = GSDumpReplayer::GetLoopCount()]() { s_loop_number = loop_number; });
-@@ -1075,17 +1204,33 @@ bool GSRunner::CreatePlatformWindow()
+@@ -1075,17 +1204,40 @@ bool GSRunner::CreatePlatformWindow()
  		return false;
  	}
  
@@ -4274,6 +4274,13 @@ index de624db..47b94d7 100644
 +			dpi = get_dpi();
 +	}
 +	RECT live_rect = {0, 0, MulDiv(1280, static_cast<int>(dpi), 96), MulDiv(960, static_cast<int>(dpi), 96)};
++	// PS2X_HOST_WINDOW=WxH: exact client size in pixels (video captures, screenshots).
++	if (const char* size = std::getenv("PS2X_HOST_WINDOW"))
++	{
++		int w = 0, h = 0;
++		if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w > 0 && h > 0)
++			live_rect = {0, 0, w, h};
++	}
 +	AdjustWindowRectEx(&live_rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
 +	s_hwnd = CreateWindowExW(s_live ? 0 : WS_EX_CLIENTEDGE, WINDOW_CLASS_NAME, s_live ? L"NBA Street V3" : L"PCSX2 GS Runner",
 +		WS_OVERLAPPEDWINDOW | WS_CAPTION | WS_MINIMIZEBOX | WS_SYSMENU | WS_SIZEBOX, CW_USEDEFAULT, CW_USEDEFAULT,
@@ -4295,7 +4302,7 @@ index de624db..47b94d7 100644
  
  	// make sure all messages are processed before returning
  	PumpPlatformMessages();
-@@ -1150,13 +1295,501 @@ void GSRunner::StopPlatformMessagePump()
+@@ -1150,13 +1302,501 @@ void GSRunner::StopPlatformMessagePump()
  	PostThreadMessageW(MainThreadID, SHUTDOWN_MSG, 0, 0);
  }
  
@@ -4998,10 +5005,81 @@ index 9ef0233..639ec41 100644
  	bool ResizeRenderTarget(GSTexture** t, int w, int h, bool preserve_contents, bool recycle);
  
 diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.cpp b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
-index 1d77040..6a8f13d 100644
+index 1d77040..66f3cb9 100644
 --- a/pcsx2/GS/Renderers/Common/GSRenderer.cpp
 +++ b/pcsx2/GS/Renderers/Common/GSRenderer.cpp
-@@ -685,6 +685,10 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+@@ -15,6 +15,7 @@
+ #include "pcsx2/Config.h"
+ #include "VMManager.h"
+ 
++#include "common/Console.h"
+ #include "common/FileSystem.h"
+ #include "common/Image.h"
+ #include "common/Path.h"
+@@ -577,8 +578,62 @@ void GSRenderer::EndPresentFrame()
+ 	ImGuiManager::NewFrame();
+ }
+ 
++// PS2Recomp scripted capture (deterministic with PS2X_LIVE_PLAYBACK), counted in vsyncs:
++//   PS2X_CAPTURE=<file.mp4> PS2X_CAPTURE_FROM=<n> PS2X_CAPTURE_FRAMES=<n> [PS2X_CAPTURE_SIZE=WxH]
++//   PS2X_SHOT_FRAMES=<n,n,...> (+ PS2X_SHOT_DIR) screenshots, PS2X_EXIT_FRAME=<n> closes the host.
++static void NbaScriptedCapture(GSRenderer& renderer)
++{
++	static u64 s_vsync = 0;
++	static const char* s_capture = std::getenv("PS2X_CAPTURE");
++	static const u64 s_capture_from = [] { const char* v = std::getenv("PS2X_CAPTURE_FROM"); return v ? std::strtoull(v, nullptr, 10) : 0ull; }();
++	static const u64 s_capture_frames = [] { const char* v = std::getenv("PS2X_CAPTURE_FRAMES"); return v ? std::strtoull(v, nullptr, 10) : 600ull; }();
++	static const u64 s_exit_frame = [] { const char* v = std::getenv("PS2X_EXIT_FRAME"); return v ? std::strtoull(v, nullptr, 10) : 0ull; }();
++	static const std::vector<u64> s_shots = [] {
++		std::vector<u64> frames;
++		if (const char* v = std::getenv("PS2X_SHOT_FRAMES"))
++			for (const std::string_view item : StringUtil::SplitString(v, ','))
++				if (const std::optional<u64> n = StringUtil::FromChars<u64>(item))
++					frames.push_back(*n);
++		return frames;
++	}();
++
++	const u64 n = s_vsync++;
++	if (s_capture && *s_capture)
++	{
++		if (n == s_capture_from)
++		{
++			GSVector2i size(0, 0);
++			if (const char* v = std::getenv("PS2X_CAPTURE_SIZE"))
++				std::sscanf(v, "%dx%d", &size.x, &size.y);
++			if (size.x == 0 || size.y == 0)
++				size = GSVector2i(1920, 1080);
++			// NTSC rate and the window's aspect: the replayer's video mode is not reliable here.
++			const bool ok = GSCapture::BeginCapture(59.94f, size, static_cast<float>(size.x) / static_cast<float>(size.y), s_capture);
++			Console.WriteLn("(PS2Recomp) capture to '%s' at vsync %llu: %s", s_capture, n, ok ? "started" : "FAILED");
++		}
++		else if (n == s_capture_from + s_capture_frames)
++		{
++			renderer.EndCapture();
++			Console.WriteLn("(PS2Recomp) capture finished at vsync %llu.", n);
++		}
++	}
++	for (const u64 shot : s_shots)
++	{
++		if (shot == n)
++		{
++			const char* dir = std::getenv("PS2X_SHOT_DIR");
++			renderer.QueueSnapshot(Path::Combine(dir ? dir : EmuFolders::Snapshots, fmt::format("frame_{}.png", n)), 0);
++		}
++	}
++	if (s_exit_frame != 0 && n == s_exit_frame)
++		Host::RequestVMShutdown(false, false, false);
++}
++
+ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ {
++	NbaScriptedCapture(*this);
++	m_nba_final = nullptr;
++
+ 	if (GSConfig.ShouldDump(s_n, g_perfmon.GetFrame()))
+ 	{
+ 		if (GSConfig.SaveInfo)
+@@ -685,6 +740,11 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
  					cas_log_once = true;
  				}
  			}
@@ -5009,10 +5087,20 @@ index 1d77040..6a8f13d 100644
 +			// PS2Recomp: AMD FSR 1 / NVIDIA DLSS up to the window size.
 +			if (GSConfig.NbaUpscaler != 0)
 +				g_gs_device->Upscale(current, src_rect, src_uv, draw_rect, GSConfig.NbaUpscaler, GetUpscalerDepth());
++			m_nba_final = current; // what reaches the screen (CAS / FSR / DLSS applied), for video capture
  		}
  
  		if (BeginPresentFrame(false))
-@@ -1087,7 +1091,13 @@ bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool
+@@ -811,7 +871,7 @@ void GSRenderer::VSync(u32 field, bool registers_written, bool idle_frame)
+ 	if (GSCapture::IsCapturingVideo())
+ 	{
+ 		const GSVector2i size = GSCapture::GetSize();
+-		if (GSTexture* current = g_gs_device->GetCurrent())
++		if (GSTexture* current = m_nba_final ? m_nba_final : g_gs_device->GetCurrent())
+ 		{
+ 			// TODO: Maybe avoid this copy in the future? We can use swscale to fix it up on the dumping thread..
+ 			if (current->GetSize() != size)
+@@ -1087,7 +1147,13 @@ bool GSRenderer::SaveSnapshotToMemory(u32 window_width, u32 window_height, bool
  		if (dl)
  		{
  			const GSVector4i rc(0, 0, draw_width, draw_height);
@@ -5028,10 +5116,17 @@ index 1d77040..6a8f13d 100644
  			dl->Flush();
  
 diff --git a/pcsx2/GS/Renderers/Common/GSRenderer.h b/pcsx2/GS/Renderers/Common/GSRenderer.h
-index 5f6f8d4..f400f25 100644
+index 5f6f8d4..dcb6638 100644
 --- a/pcsx2/GS/Renderers/Common/GSRenderer.h
 +++ b/pcsx2/GS/Renderers/Common/GSRenderer.h
-@@ -29,6 +29,8 @@ protected:
+@@ -24,11 +24,15 @@ private:
+ 	u64 m_last_draw_n = 0;
+ 	u64 m_last_transfer_n = 0;
+ 
++	GSTexture* m_nba_final = nullptr; // PS2Recomp: final presented texture this vsync (video capture)
++
+ protected:
+ 	GSVector2i m_real_size{0, 0};
  
  	virtual GSTexture* GetOutput(int i, float& scale, int& y_offset) = 0;
  	virtual GSTexture* GetFeedbackOutput(float& scale) { return nullptr; }
@@ -5765,13 +5860,10 @@ index bbec5be..c41a174 100644
  
  Vulkan::SamplerBuilder::SamplerBuilder()
 diff --git a/pcsx2/GSDumpReplayer.cpp b/pcsx2/GSDumpReplayer.cpp
-index 9c31bb8..0817805 100644
+index 9c31bb8..dd0d3af 100644
 --- a/pcsx2/GSDumpReplayer.cpp
 +++ b/pcsx2/GSDumpReplayer.cpp
-@@ -1,19 +1,22 @@
--// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
-+﻿// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
- // SPDX-License-Identifier: GPL-3.0+
+@@ -3,17 +3,20 @@
  
  #include "GS.h"
  #include "GS/GSLzma.h"
@@ -5816,7 +5908,7 @@ index 9c31bb8..0817805 100644
  
  static void GSDumpReplayerCpuReserve();
  static void GSDumpReplayerCpuShutdown();
-@@ -60,6 +74,117 @@ R5900cpu GSDumpReplayerCpu = {
+@@ -60,6 +74,151 @@ R5900cpu GSDumpReplayerCpu = {
  static InterpVU0 gsDumpVU0;
  static InterpVU1 gsDumpVU1;
  
@@ -5862,8 +5954,42 @@ index 9c31bb8..0817805 100644
 +	// Time this frame spent waiting for the game (empty ring), for the hitch log (PS2X_FPS_LOG=1).
 +	u64 s_live_wait_ticks = 0;
 +
++	// PS2X_LIVE_RECORD=<file>: also writes every byte read from the ring to a file.
++	// PS2X_LIVE_PLAYBACK=<file>: reads the stream from such a file instead of a running game, so the
++	// same session renders identically under different settings (comparison videos, screenshots).
++	std::FILE* s_live_record = nullptr;
++	std::FILE* s_live_playback = nullptr;
++	ps2live::RingHeader s_live_playback_header = {};
++
++	bool LiveReadRing(void* dst, size_t size);
++
++	bool LivePlaybackRead(void* dst, size_t size)
++	{
++		if (size == 0)
++			return true;
++		if (s_dump_running && std::fread(dst, 1, size, s_live_playback) == size)
++			return true;
++		Console.WriteLn("(GSDumpReplayer) Live playback finished.");
++		Host::RequestVMShutdown(false, false, false);
++		return false;
++	}
++
 +	// Blocks until size bytes of the stream are available; false when playback stops.
 +	bool LiveRead(void* dst, size_t size)
++	{
++		if (s_live_playback)
++			return LivePlaybackRead(dst, size);
++		if (s_live_record && size > 0)
++		{
++			const bool ok = LiveReadRing(dst, size);
++			if (ok)
++				std::fwrite(dst, 1, size, s_live_record);
++			return ok;
++		}
++		return LiveReadRing(dst, size);
++	}
++
++	bool LiveReadRing(void* dst, size_t size)
 +	{
 +		u8* out = static_cast<u8*>(dst);
 +		while (size > 0)
@@ -5934,7 +6060,7 @@ index 9c31bb8..0817805 100644
  bool GSDumpReplayer::IsReplayingDump()
  {
  	return static_cast<bool>(s_dump_file);
-@@ -106,7 +231,7 @@ bool GSDumpReplayer::Initialize(const char* filename, Error* error)
+@@ -106,7 +265,7 @@ bool GSDumpReplayer::Initialize(const char* filename, Error* error)
  	Cpu = &GSDumpReplayerCpu;
  	psxCpu = &psxInt;
  	CpuVU0 = &gsDumpVU0;
@@ -5943,7 +6069,7 @@ index 9c31bb8..0817805 100644
  
  	// loop infinitely by default
  	s_dump_loop_count = -1;
-@@ -204,6 +329,10 @@ static void GSDumpReplayerLoadInitialState()
+@@ -204,6 +363,10 @@ static void GSDumpReplayerLoadInitialState()
  	std::memcpy(PS2MEM_GS, s_dump_file->GetRegsData().data(),
  		std::min(Ps2MemSize::GSregs, static_cast<u32>(s_dump_file->GetRegsData().size())));
  
@@ -5954,7 +6080,7 @@ index 9c31bb8..0817805 100644
  	// load GS state
  	freezeData fd = {static_cast<int>(s_dump_file->GetStateData().size()),
  		const_cast<u8*>(s_dump_file->GetStateData().data())};
-@@ -219,6 +348,17 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
+@@ -219,6 +382,17 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
  
  	const u32 truncated_length = static_cast<u32>(length);
  
@@ -5972,7 +6098,7 @@ index 9c31bb8..0817805 100644
  	Gif_Path& gifPath = gifUnit.gifPath[path];
  	gifPath.CopyGSPacketData(const_cast<u8*>(data), truncated_length);
  
-@@ -226,6 +366,16 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
+@@ -226,6 +400,16 @@ static void GSDumpReplayerSendPacketToMTGS(GIF_PATH path, const u8* data, size_t
  	gsPack.offset = gifPath.curOffset;
  	gsPack.size = truncated_length;
  	gifPath.curOffset += length;
@@ -5989,7 +6115,7 @@ index 9c31bb8..0817805 100644
  	Gif_AddCompletedGSPacket(gsPack, path);
  }
  
-@@ -256,6 +406,236 @@ static void GSDumpReplayerFrameLimit()
+@@ -256,6 +440,236 @@ static void GSDumpReplayerFrameLimit()
  	s_next_frame_time = std::max(now, s_next_frame_time + s_frame_ticks);
  }
  
@@ -6226,7 +6352,7 @@ index 9c31bb8..0817805 100644
  void GSDumpReplayerCpuStep()
  {
  	if (s_needs_state_loaded)
-@@ -264,6 +644,14 @@ void GSDumpReplayerCpuStep()
+@@ -264,6 +678,14 @@ void GSDumpReplayerCpuStep()
  		s_needs_state_loaded = false;
  	}
  
@@ -6241,7 +6367,7 @@ index 9c31bb8..0817805 100644
  	const GSDumpFile::GSData& packet = s_dump_file->GetPackets()[s_current_packet];
  	s_current_packet = (s_current_packet + 1) % static_cast<u32>(s_dump_file->GetPackets().size());
  	if (s_current_packet == 0)
-@@ -350,6 +738,10 @@ void GSDumpReplayerCpuExecute()
+@@ -350,6 +772,10 @@ void GSDumpReplayerCpuExecute()
  	s_dump_running = true;
  	s_next_frame_time = GetCPUTicks();
  
@@ -6252,7 +6378,7 @@ index 9c31bb8..0817805 100644
  	while (s_dump_running)
  	{
  		GSDumpReplayerCpuStep();
-@@ -369,8 +761,91 @@ void GSDumpReplayerCpuClear(u32 addr, u32 size)
+@@ -369,8 +795,91 @@ void GSDumpReplayerCpuClear(u32 addr, u32 size)
  {
  }
  
@@ -6344,7 +6470,7 @@ index 9c31bb8..0817805 100644
  	const float scale = ImGuiManager::GetGlobalScale();
  	const float shadow_offset = std::ceil(1.0f * scale);
  	const float margin = std::ceil(GSConfig.OsdMargin * scale);
-@@ -404,3 +879,126 @@ void GSDumpReplayer::RenderUI()
+@@ -404,3 +913,150 @@ void GSDumpReplayer::RenderUI()
  
  #undef DRAW_LINE
  }
@@ -6368,6 +6494,30 @@ index 9c31bb8..0817805 100644
 +bool GSDumpReplayer::AttachLiveRing(Error* error)
 +{
 +#ifdef _WIN32
++	if (const char* playback = std::getenv("PS2X_LIVE_PLAYBACK"); playback && *playback)
++	{
++		s_live_playback = std::fopen(playback, "rb");
++		if (!s_live_playback)
++		{
++			Error::SetStringFmt(error, "Cannot open live playback file '{}'.", playback);
++			return false;
++		}
++		std::setvbuf(s_live_playback, nullptr, _IOFBF, 4 << 20);
++		s_live_playback_header.magic = ps2live::kMagic;
++		s_live_playback_header.version = ps2live::kVersion;
++		s_live.header = &s_live_playback_header;
++		s_live_mode = true;
++		s_live_mode_early = true;
++		Console.WriteLn("(GSDumpReplayer) Live playback from '%s'.", playback);
++		return true;
++	}
++	if (const char* record = std::getenv("PS2X_LIVE_RECORD"); record && *record)
++	{
++		s_live_record = std::fopen(record, "wb");
++		if (s_live_record)
++			std::setvbuf(s_live_record, nullptr, _IOFBF, 4 << 20);
++		Console.WriteLn("(GSDumpReplayer) Recording the live stream to '%s'%s.", record, s_live_record ? "" : " FAILED");
++	}
 +	HANDLE mapping = nullptr;
 +	const std::wstring mapping_name = ps2live::objectName(ps2live::kMappingName, s_live_ring_suffix);
 +	// The game creates the ring before starting us; give it a moment anyway.

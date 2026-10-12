@@ -164,6 +164,20 @@ desensambla volcados de RAM (IOP o EE).
   profundidad pasa a otro búfer de color, etiquetada con su dirección. El Z del PS2 crece hacia la
   cámara: flag `DepthInverted`. Log: `PS2X_DLSS_DEPTH_LOG=1`.
 
+### 5.3 Grabar y reproducir una sesión (videos comparativos, capturas idénticas)
+- Todo lo que el host necesita llega por el anillo (GS, VIF1 para microVU, vsyncs, registros), así
+  que grabar esos bytes reproduce la sesión exacta sin el juego. `PS2X_LIVE_RECORD=<archivo>` en el
+  entorno del juego (el host lo hereda) los guarda: ~85 MB/s, unos 15 GB por 3 minutos.
+- `tools\play_capture.ps1 -Stream <archivo> -Ini <ini>` lo reproduce sin límite de velocidad
+  (3 minutos de juego en ~25 s) con otros ajustes: `-Shots` (capturas por número de vsync),
+  `-Video/-From/-Frames` (video con la captura de PCSX2; necesita las DLL de FFmpeg 8.x,
+  avcodec-62, junto al exe, solo en local), `-ExitAt`, `-Window WxH` (`PS2X_HOST_WINDOW`).
+- El video sale de la imagen final (tras CAS/FSR/DLSS, `m_nba_final`), no de la salida interna.
+  En reproducción el modo de video del replayer no es fiable: la captura se abre a 59,94 fps fijos.
+- `tools\sheet.ps1 -Dir <carpeta>` hace hojas de miniaturas para localizar escenas.
+- Ruta de botones probada hasta un partido real: `97:START,101:CROSS,104:CROSS,...` (GAME ON + valores
+  por defecto); el partido empieza hacia el vsync 7150 de la grabación.
+
 ## Texturas HD (packs PCSX2) — qué NO reemplazar
 * Volcado: menú del host -> "Texturas HD" -> "Activadas + volcar originales"; `tools\texturas_preparar.ps1`
   copia a `texturas_hd\originales`; el usuario reescala con IA a `texturas_hd\hd`; `tools\texturas_instalar.ps1`.

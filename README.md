@@ -13,15 +13,26 @@ Play **NBA Street V3** (PS2) natively on Windows: high resolution, HD textures, 
 
 | | |
 |---|---|
-| ![Title screen](docs/screenshots/title.jpg) | ![Loading screen](docs/screenshots/loading.jpg) |
-| ![Tip-off](docs/screenshots/tipoff.jpg) | ![In a match](docs/screenshots/match.jpg) |
+| ![Title screen](docs/screenshots/title.jpg) | ![Main menu](docs/screenshots/menu.jpg) |
+| ![Tip-off](docs/screenshots/tipoff.jpg) | ![Dunk](docs/screenshots/match.jpg) |
+| ![Court](docs/screenshots/court.jpg) | ![Loading screen](docs/screenshots/loading.jpg) |
 
-<sub>Captured from this port (Vulkan, 4x internal resolution, 16:9). Screenshots of NBA Street V3 © Electronic Arts.</sub>
+<sub>Captured from this port at 1920x1080: Vulkan, 2x internal resolution + NVIDIA DLSS, HD textures,
+16x anisotropic filtering, 16:9. Screenshots of NBA Street V3 © Electronic Arts.</sub>
+
+### Original PS2 vs. this port
+
+[![Original PS2 on the left, this port with DLSS and HD textures on the right](docs/screenshots/comparison.jpg)](docs/videos/comparison.mp4)
+
+**[▶ Watch the comparison video](docs/videos/comparison.mp4)** (1080p60, 1 minute of a real match, the
+same frames rendered twice: left half at the PS2's native 640x448, right half with 2x internal
+resolution + NVIDIA DLSS + HD textures). The full-screen versions of both are attached to the
+[latest release](https://github.com/recomp-code/street-recomp-v3/releases/latest).
 
 ## How to play
 
 1. Go to [**Releases**](https://github.com/recomp-code/street-recomp-v3/releases/latest) and download
-   **`NBAStreetV3-PC-1.0.zip`** (the only file you need).
+   **`NBAStreetV3-PC-<version>.zip`** (the only file you need).
 2. Unzip it anywhere and double-click **`Launcher.cmd`**.
 3. Click **Browse...** and choose your NBA Street V3 ISO.
 4. Click **Prepare game**. This happens **only once**: it downloads the tools it needs and builds the
