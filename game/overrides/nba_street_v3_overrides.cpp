@@ -52,6 +52,10 @@ extern uint64_t g_iopStatSpu2Ticks;
 extern uint64_t g_iopStatRunTicks;
 extern uint64_t g_iopStatRunCalls;
 extern uint64_t g_iopStatEeCalls;
+extern uint64_t g_ps2StatChainTicks;
+extern uint64_t g_ps2StatChainTags;
+extern uint64_t g_ps2StatChainCopyTicks;
+extern uint64_t g_ps2StatChainBytes;
 
 namespace
 {
@@ -408,6 +412,20 @@ namespace
                              static_cast<double>(g_ps2StatRingTicks - s_lastRing) / span,
                              static_cast<double>(g_ps2StatRingWaitTicks - s_lastRingWait) / span);
             }
+            // DMA chain walk: ticks per tag is scene independent (comparable between runs).
+            static uint64_t s_lastChainTicks = 0, s_lastChainTags = 0, s_lastChainCopy = 0, s_lastChainBytes = 0;
+            const uint64_t chainTags = g_ps2StatChainTags - s_lastChainTags;
+            if (s_lastTsc && chainTags)
+                std::fprintf(stderr, "[frame] dma chains: %llu tags/frame, %.1f ticks/tag, %.1f%% of time (copy %.1f%%, %.0f KB/frame)\n",
+                             static_cast<unsigned long long>(chainTags / std::max<uint32_t>(1u, s_frames)),
+                             static_cast<double>(g_ps2StatChainTicks - s_lastChainTicks) / static_cast<double>(chainTags),
+                             static_cast<double>(g_ps2StatChainTicks - s_lastChainTicks) / (static_cast<double>(tsc - s_lastTsc) / 100.0),
+                             static_cast<double>(g_ps2StatChainCopyTicks - s_lastChainCopy) / (static_cast<double>(tsc - s_lastTsc) / 100.0),
+                             static_cast<double>(g_ps2StatChainBytes - s_lastChainBytes) / 1024.0 / std::max<uint32_t>(1u, s_frames));
+            s_lastChainTicks = g_ps2StatChainTicks;
+            s_lastChainTags = g_ps2StatChainTags;
+            s_lastChainCopy = g_ps2StatChainCopyTicks;
+            s_lastChainBytes = g_ps2StatChainBytes;
             static uint64_t s_lastRunTicks = 0, s_lastRunCalls = 0, s_lastEeCalls = 0;
             if (s_lastRunCalls)
                 std::fprintf(stderr, "[frame] iop slices %.1f%% (%llu slices/5s), advance calls %llu/5s\n",

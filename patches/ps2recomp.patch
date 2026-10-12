@@ -23482,10 +23482,10 @@ index 0000000..0acb31b
 +    }
 +}
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index 37b6a4d..4c2c504 100644
+index 37b6a4d..6d97c8d 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
-@@ -2,14 +2,123 @@
+@@ -2,14 +2,163 @@
  #include "runtime/ps2_address.h"
  #include "runtime/gs/gs_frontend.h"
  #include "ps2_log.h"
@@ -23493,6 +23493,11 @@ index 37b6a4d..4c2c504 100644
 +#include "gs/gs_dump_writer.h"
  #include <atomic>
 +#include <chrono>
++#if defined(_MSC_VER)
++#include <intrin.h>
++#else
++#include <x86intrin.h>
++#endif
 +#include <cstdlib>
  #include <cstring>
 +#include <deque>
@@ -23503,6 +23508,11 @@ index 37b6a4d..4c2c504 100644
  #include <string>
  #include <vector>
  
++extern uint64_t g_ps2StatChainTicks; // defined below; frame-budget report
++extern uint64_t g_ps2StatChainTags;
++extern uint64_t g_ps2StatChainCopyTicks;
++extern uint64_t g_ps2StatChainBytes;
++
 +namespace ps2_vif1_irq
 +{
 +    namespace
@@ -23510,6 +23520,8 @@ index 37b6a4d..4c2c504 100644
 +        std::mutex g_mutex;
 +        std::deque<uint32_t> g_pending;
 +        bool g_inService = false;
++        // Lock-free fast path: takeNext() runs after every special store (drainCompletedDmacHandlers).
++        std::atomic<uint32_t> g_pendingCount{0u};
 +        constexpr size_t kMaxPending = 256u;
 +    }
 +
@@ -23519,11 +23531,14 @@ index 37b6a4d..4c2c504 100644
 +        if (g_pending.size() < kMaxPending)
 +        {
 +            g_pending.push_back(vifCode);
++            g_pendingCount.store(static_cast<uint32_t>(g_pending.size()), std::memory_order_release);
 +        }
 +    }
 +
 +    bool takeNext(uint32_t &vifCode)
 +    {
++        if (g_pendingCount.load(std::memory_order_acquire) == 0u)
++            return false;
 +        std::lock_guard<std::mutex> lock(g_mutex);
 +        if (g_inService || g_pending.empty())
 +        {
@@ -23531,6 +23546,7 @@ index 37b6a4d..4c2c504 100644
 +        }
 +        vifCode = g_pending.front();
 +        g_pending.pop_front();
++        g_pendingCount.store(static_cast<uint32_t>(g_pending.size()), std::memory_order_release);
 +        g_inService = true;
 +        return true;
 +    }
@@ -23545,6 +23561,7 @@ index 37b6a4d..4c2c504 100644
 +    {
 +        std::lock_guard<std::mutex> lock(g_mutex);
 +        g_pending.clear();
++        g_pendingCount.store(0u, std::memory_order_release);
 +        g_inService = false;
 +    }
 +
@@ -23604,12 +23621,35 @@ index 37b6a4d..4c2c504 100644
 +        }
 +    };
 +    StalledVif1Chain g_vif1StalledChain;
++
++    // DMA chain buffers are a few MB per frame (in-match VIF1 display lists pass 4000 tags).
++    // Allocating a fresh vector per DMA start meant fresh pages from the OS and a page fault on
++    // every first write (~8% of the EE thread in heavy scenes): finished buffers are recycled.
++    std::vector<std::vector<uint8_t>> g_chainBufferPool;
++
++    std::vector<uint8_t> takeChainBuffer()
++    {
++        static const bool s_poolEnabled = [] { const char *e = std::getenv("PS2X_CHAIN_POOL"); return !(e && *e == '0'); }();
++        if (!s_poolEnabled || g_chainBufferPool.empty())
++            return {};
++        std::vector<uint8_t> buffer = std::move(g_chainBufferPool.back());
++        g_chainBufferPool.pop_back();
++        buffer.clear();
++        return buffer;
++    }
++
++    void recycleChainBuffer(std::vector<uint8_t> &&buffer)
++    {
++        constexpr size_t kMaxPooled = 8u;
++        if (buffer.capacity() != 0u && g_chainBufferPool.size() < kMaxPooled)
++            g_chainBufferPool.push_back(std::move(buffer));
++    }
 +}
 +
  namespace
  {
      inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
-@@ -107,7 +216,8 @@ namespace
+@@ -107,7 +256,8 @@ namespace
      // other threads, so a load-then-store here would race with them.
      inline void writeCsrHalf(std::atomic<uint64_t> &csr, uint32_t off, uint32_t value)
      {
@@ -23619,7 +23659,7 @@ index 37b6a4d..4c2c504 100644
          uint64_t expected = csr.load();
          uint64_t desired;
          do
-@@ -131,7 +241,7 @@ namespace
+@@ -131,7 +281,7 @@ namespace
      // write-one-to-clear against the current value).
      inline void writeCsrFull(std::atomic<uint64_t> &csr, uint64_t value)
      {
@@ -23628,7 +23668,7 @@ index 37b6a4d..4c2c504 100644
          uint64_t expected = csr.load();
          uint64_t desired;
          do
-@@ -406,10 +516,16 @@ void PS2Memory::resetEeTimers() noexcept
+@@ -406,10 +556,16 @@ void PS2Memory::resetEeTimers() noexcept
  
  uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
  {
@@ -23646,7 +23686,7 @@ index 37b6a4d..4c2c504 100644
  
      constexpr uint32_t kGifStat = 0x10003020u;
      constexpr uint32_t kGifFqcMask = 0x1F000000u;
-@@ -1222,6 +1338,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1222,6 +1378,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
      {
          m_vifWriteCount.fetch_add(1, std::memory_order_relaxed);
  
@@ -23657,7 +23697,7 @@ index 37b6a4d..4c2c504 100644
          switch (address)
          {
          case 0x10003C10u:     // VIF1_FBRST
-@@ -1234,10 +1354,48 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1234,10 +1394,52 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                  m_path3Masked = false;
                  if (wasPath3Masked)
                      flushMaskedPath3Packets();
@@ -23692,6 +23732,10 @@ index 37b6a4d..4c2c504 100644
 +                        g_vif1StalledChain = std::move(rest);
 +                        vif1_regs.stat |= (1u << 10);
 +                    }
++                    else
++                    {
++                        recycleChainBuffer(std::move(rest.data)); // chain finished: keep its pages
++                    }
 +                    if (m_gifArbiter)
 +                        m_gifArbiter->drain();
 +                    static int s_resumeLogs = 0;
@@ -23706,7 +23750,7 @@ index 37b6a4d..4c2c504 100644
              }
              break;
          case 0x10003C30u:
-@@ -1306,6 +1464,29 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1306,6 +1508,29 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
              const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
              m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
  
@@ -23736,26 +23780,58 @@ index 37b6a4d..4c2c504 100644
              if (tryProcessScratchpadDma(channelBase, value))
              {
                  return true;
-@@ -1344,8 +1525,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1344,8 +1569,30 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                      uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                      uint32_t asp = (chcr >> 4) & 0x3u;
                      const bool tieEnabled = (chcr & (1u << 7)) != 0u;
 -                    const int kMaxChainTags = 4096;
+-                    std::vector<uint8_t> chainBuf;
 +                    // Only a guard against corrupt (looping) chains: NBA Street V3's in-match VIF1
 +                    // display lists pass 4096 tags, and a truncated chain never reaches its END
 +                    // tag, so the game's end-of-frame wait (0x003E1910) times out and its thread
 +                    // falls into an endless error loop that eats the EE's time.
 +                    const int kMaxChainTags = 1 << 20;
-                     std::vector<uint8_t> chainBuf;
++                    const uint64_t chainWalkStart = __rdtsc(); // frame-budget report: cost per tag
++                    std::vector<uint8_t> chainBuf = takeChainBuffer(); // recycled: pages already mapped
 +                    // Chains are rebuilt every frame with similar sizes: start at the size of
 +                    // the last one instead of growing (and copying) tag by tag.
 +                    static thread_local size_t s_lastChainBytesPerChannel[3] = {64u * 1024u, 64u * 1024u, 64u * 1024u};
 +                    size_t &s_lastChainBytes = s_lastChainBytesPerChannel[channelBase == 0x10009000u ? 0 : (channelBase == 0x1000A000u ? 1 : 2)];
 +                    chainBuf.reserve(s_lastChainBytes);
++
++                    // Pass 1 (this walk) only records where each piece of the chain lives; pass 2
++                    // below copies them in one go into a buffer of the exact size, prefetching the
++                    // pieces ahead: the payloads are ~4000 small scattered reads per frame (3+ MB),
++                    // and copying them tag by tag while walking ran at memory latency.
++                    struct ChainSegment
++                    {
++                        const uint8_t *data;
++                        uint32_t size;
++                    };
++                    static thread_local std::vector<ChainSegment> chainSegments;
++                    chainSegments.clear();
  
                      auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                      {
-@@ -1521,6 +1711,21 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1376,7 +1623,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                                 chunk = maxSz2 - src;
+                             if (chunk == 0)
+                                 break;
+-                            chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
++                            chainSegments.push_back({base2 + src, chunk});
+                             bytes -= chunk;
+                             src += chunk;
+                         }
+@@ -1395,7 +1642,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+ 
+                         // CHCR.TTE sends the DMAtag's upper 64 bits to the channel before
+                         // the tag payload. VIF chains use those bytes for two VIFcodes.
+-                        chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
++                        chainSegments.push_back({localBase + tagPhys + 8u, 8u});
+                     };
+ 
+                     const bool isVifChannel =
+@@ -1521,6 +1768,44 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                              break;
                      }
  
@@ -23767,6 +23843,29 @@ index 37b6a4d..4c2c504 100644
 +                            std::fprintf(stderr, "[dma] ch=0x%X longest chain so far: %d tags\n", channelBase, tagsProcessed);
 +                        }
 +                    }
++                    {
++                        const uint64_t copyStart = __rdtsc();
++                        size_t total = 0;
++                        for (const ChainSegment &seg : chainSegments)
++                            total += seg.size;
++                        chainBuf.reserve(chainBuf.size() + total);
++                        constexpr size_t kAhead = 4u;
++                        for (size_t i = 0; i < chainSegments.size(); ++i)
++                        {
++                            if (i + kAhead < chainSegments.size())
++                            {
++                                const ChainSegment &next = chainSegments[i + kAhead];
++                                for (uint32_t line = 0; line < next.size && line < 512u; line += 64u)
++                                    _mm_prefetch(reinterpret_cast<const char *>(next.data + line), _MM_HINT_T0);
++                            }
++                            const ChainSegment &seg = chainSegments[i];
++                            chainBuf.insert(chainBuf.end(), seg.data, seg.data + seg.size);
++                        }
++                        g_ps2StatChainCopyTicks += __rdtsc() - copyStart;
++                        g_ps2StatChainBytes += total;
++                    }
++                    g_ps2StatChainTicks += __rdtsc() - chainWalkStart;
++                    g_ps2StatChainTags += static_cast<uint64_t>(tagsProcessed);
 +                    if (tagsProcessed >= kMaxChainTags)
 +                    {
 +                        static int s_limitLogs = 0;
@@ -23777,7 +23876,7 @@ index 37b6a4d..4c2c504 100644
                      m_ioRegisters[channelBase + 0x30] = tagAddr;
                      m_ioRegisters[channelBase + 0x40] = asr0;
                      m_ioRegisters[channelBase + 0x50] = asr1;
-@@ -1528,6 +1733,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1528,6 +1813,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                      chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                      m_ioRegisters[channelBase + 0x00] = chcr;
  
@@ -23785,7 +23884,21 @@ index 37b6a4d..4c2c504 100644
                      if (!chainBuf.empty())
                      {
                          PendingTransfer pt;
-@@ -1802,11 +2008,32 @@ void PS2Memory::processPendingTransfers()
+@@ -1741,6 +2027,8 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
++    for (auto &p : m_pendingGifTransfers)
++        recycleChainBuffer(std::move(p.chainData));
+     m_pendingGifTransfers.clear();
+ 
+     const bool hadVif0 = !m_pendingVif0Transfers.empty();
+@@ -1799,14 +2087,39 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
++    for (auto &p : m_pendingVif0Transfers)
++        recycleChainBuffer(std::move(p.chainData));
      m_pendingVif0Transfers.clear();
  
      const bool hadVif1 = !m_pendingVif1Transfers.empty();
@@ -23799,6 +23912,7 @@ index 37b6a4d..4c2c504 100644
 +            {
 +                // VIF1 is still stalled on an earlier i-bit: queue behind it.
 +                g_vif1StalledChain.append(p.chainData);
++                recycleChainBuffer(std::move(p.chainData));
 +                continue;
 +            }
 +            const uint32_t size = static_cast<uint32_t>(p.chainData.size());
@@ -23808,6 +23922,7 @@ index 37b6a4d..4c2c504 100644
 +            uint32_t consumed = 0u;
 +            if (ps2_vif1_irq::takeStall(consumed) && consumed < size)
 +            {
++                recycleChainBuffer(std::move(g_vif1StalledChain.data));
 +                g_vif1StalledChain.data = std::move(p.chainData);
 +                g_vif1StalledChain.offset = consumed;
 +                vif1Stalled = true;
@@ -23819,7 +23934,16 @@ index 37b6a4d..4c2c504 100644
          }
          else if (p.qwc > 0)
          {
-@@ -1896,7 +2123,7 @@ void PS2Memory::processPendingTransfers()
+@@ -1857,6 +2170,8 @@ void PS2Memory::processPendingTransfers()
+             }
+         }
+     }
++    for (auto &p : m_pendingVif1Transfers)
++        recycleChainBuffer(std::move(p.chainData)); // no-op for the one kept as the stalled chain
+     m_pendingVif1Transfers.clear();
+ 
+     if (m_gifArbiter)
+@@ -1896,7 +2211,7 @@ void PS2Memory::processPendingTransfers()
          m_ioRegisters[VIF0_CHANNEL + 0x00] &= ~0x100u;
          m_ioRegisters[VIF0_CHANNEL + 0x20] = 0;
      }
@@ -23828,7 +23952,37 @@ index 37b6a4d..4c2c504 100644
      {
          raiseDStatChannel(1u); // VIF1 channel
          queueCompletedDmacCause(1u);
-@@ -1943,11 +2170,27 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+@@ -1905,15 +2220,29 @@ void PS2Memory::processPendingTransfers()
+     }
+ }
+ 
++// DMA chain walk cost (rdtsc ticks) and tags walked, for the game override's frame report.
++uint64_t g_ps2StatChainTicks = 0;
++uint64_t g_ps2StatChainTags = 0;
++uint64_t g_ps2StatChainCopyTicks = 0; // of which: copying tag payloads into the chain buffer
++uint64_t g_ps2StatChainBytes = 0;
++
++// Lock-free fast path for consumeCompletedDmacCauses(), which runs after every special store.
++// File-scope (one PS2Memory) so ps2_memory.h, included by all generated code, stays unchanged.
++static std::atomic<bool> g_completedDmacPending{false};
++
+ void PS2Memory::queueCompletedDmacCause(uint32_t cause)
+ {
+     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
+     m_completedDmacCauses.push_back(cause);
++    g_completedDmacPending.store(true, std::memory_order_release);
+ }
+ 
+ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
+ {
++    if (!g_completedDmacPending.load(std::memory_order_acquire))
++        return {};
+     std::lock_guard<std::mutex> lock(m_completedDmacMutex);
++    g_completedDmacPending.store(false, std::memory_order_release);
+     std::vector<uint32_t> causes;
+     causes.swap(m_completedDmacCauses);
+     return causes;
+@@ -1943,11 +2272,27 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
          m_gifArbiter->drain();
  }
  
@@ -23856,7 +24010,7 @@ index 37b6a4d..4c2c504 100644
      if (pathId == GifPathId::Path3)
      {
          if (m_path3Masked)
-@@ -2003,6 +2246,9 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+@@ -2003,6 +2348,9 @@ void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
  
  bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint32_t chcr)
  {
@@ -23866,7 +24020,7 @@ index 37b6a4d..4c2c504 100644
      static constexpr uint32_t GIF_CHANNEL = 0x1000A000u;
      static constexpr uint32_t D_STAT = 0x1000E010u;
      static constexpr uint32_t D_CTRL = 0x1000E000u;
-@@ -2195,6 +2441,8 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
+@@ -2195,6 +2543,8 @@ bool PS2Memory::tryProcessNativeGifImageUploadChain(GS &gs, uint32_t tadr, uint3
  
  bool PS2Memory::tryProcessNativeGifPackedChain(GS &gs, uint32_t tadr, uint32_t chcr)
  {
