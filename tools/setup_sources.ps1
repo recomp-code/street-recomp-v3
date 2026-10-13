@@ -14,6 +14,15 @@ $sources = @(
     @{ Name = 'pcsx2';     Url = 'https://github.com/PCSX2/pcsx2.git';     Commit = 'd073d75'; Patch = 'pcsx2.patch' }
 )
 
+# git prints to stderr even when it works (progress) and `apply --check` reports a mismatch there.
+# With $ErrorActionPreference = 'Stop', Windows PowerShell 5.1 turns redirected stderr into a
+# terminating error, so the checks run with 'Continue' and are judged by their exit code.
+function Test-Git([string[]]$arguments) {
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try { & git @arguments 2>&1 | Out-Null; return $LASTEXITCODE -eq 0 } finally { $ErrorActionPreference = $saved }
+}
+
 foreach ($s in $sources) {
     $dir = Join-Path $Root $s.Name
     if (-not (Test-Path $dir)) {
@@ -26,11 +35,11 @@ foreach ($s in $sources) {
     if ($LASTEXITCODE) { throw "git checkout $($s.Commit) fallo en $($s.Name)" }
 
     $patch = Join-Path $Repo "patches\$($s.Patch)"
-    git -C $dir apply --check --whitespace=nowarn $patch 2>$null
-    if ($LASTEXITCODE) {
+    if (-not (Test-Git @('-C', $dir, 'apply', '--check', '--whitespace=nowarn', $patch))) {
         # Ya aplicado (se vuelve a ejecutar el script)?
-        git -C $dir apply --check --reverse --whitespace=nowarn $patch 2>$null
-        if ($LASTEXITCODE) { throw "El parche $($s.Patch) no aplica sobre $($s.Name) $($s.Commit)" }
+        if (-not (Test-Git @('-C', $dir, 'apply', '--check', '--reverse', '--whitespace=nowarn', $patch))) {
+            throw "El parche $($s.Patch) no aplica sobre $($s.Name) $($s.Commit)"
+        }
         Write-Host "  $($s.Patch) ya estaba aplicado"
         continue
     }
