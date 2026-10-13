@@ -39,6 +39,11 @@
 #endif
 #include <windows.h>
 #include <intrin.h>
+#else
+#include "ps2x/host_intrin.h"
+#include <strings.h>
+#include <time.h>
+#define _stricmp strcasecmp
 #endif
 
 // Runtime frame-budget counters (ps2_runtime.cpp).
@@ -87,17 +92,29 @@ namespace
         g_originalCallbackDispatch(rdram, ctx, runtime);
     }
 
-    bool envFlagSet(const char *name)
+    // Environment variable or "" (MSVC: _dupenv_s, getenv is deprecated there).
+    std::string envValue(const char *name)
     {
+        std::string value;
+#if defined(_MSC_VER)
         char *env = nullptr;
         size_t envLength = 0;
-        bool set = false;
         if (_dupenv_s(&env, &envLength, name) == 0 && env)
         {
-            set = env[0] != '\0' && env[0] != '0';
+            value = env;
             std::free(env);
         }
-        return set;
+#else
+        if (const char *env = std::getenv(name))
+            value = env;
+#endif
+        return value;
+    }
+
+    bool envFlagSet(const char *name)
+    {
+        const std::string env = envValue(name);
+        return !env.empty() && env[0] != '0';
     }
 
     // The game's EA file system parses the disc itself (reads LBN 16 = ISO9660 volume
@@ -107,13 +124,8 @@ namespace
     {
         PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
         std::filesystem::path image;
-        char *env = nullptr;
-        size_t envLength = 0;
-        if (_dupenv_s(&env, &envLength, "PS2X_CD_IMAGE") == 0 && env)
-        {
+        if (const std::string env = envValue("PS2X_CD_IMAGE"); !env.empty())
             image = env;
-            std::free(env);
-        }
         if (image.empty() && !paths.elfDirectory.empty())
         {
             image = paths.elfDirectory.parent_path() / "NBAStreetV3.iso";
@@ -388,6 +400,11 @@ namespace
             GetThreadTimes(GetCurrentThread(), &created, &exited, &kernel, &user);
             cpu = (static_cast<uint64_t>(kernel.dwHighDateTime) << 32 | kernel.dwLowDateTime) +
                   (static_cast<uint64_t>(user.dwHighDateTime) << 32 | user.dwLowDateTime);
+#else
+            timespec threadCpu{};
+            clock_gettime(CLOCK_THREAD_CPUTIME_ID, &threadCpu);
+            // Same 100 ns units as GetThreadTimes.
+            cpu = static_cast<uint64_t>(threadCpu.tv_sec) * 10000000ull + static_cast<uint64_t>(threadCpu.tv_nsec) / 100u;
 #endif
             const double windowMs = std::chrono::duration<double, std::milli>(end - s_windowStart).count();
             const double cpuPct = s_lastCpu ? 100.0 * static_cast<double>(cpu - s_lastCpu) / 10000.0 / windowMs : 0.0;

@@ -1,0 +1,129 @@
+# Keeps Windows and macOS building: applies patches/ to the pinned PS2Recomp and PCSX2 commits and
+# builds everything that does not need the game (recompiler, runtime + IOP libraries, the PCSX2
+# GS host). The game itself is generated from each player's ISO, so it can not be built here.
+name: Build check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  PS2RECOMP_COMMIT: 2c5fbb9
+  PCSX2_COMMIT: d073d75
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: nbastreet-v3-recomp
+
+      - name: Sources + patches
+        shell: bash
+        run: |
+          git clone -q https://github.com/ran-j/PS2Recomp.git PS2Recomp
+          git -C PS2Recomp checkout -q "$PS2RECOMP_COMMIT"
+          git -C PS2Recomp apply --whitespace=nowarn ../nbastreet-v3-recomp/patches/ps2recomp.patch
+          git clone -q https://github.com/PCSX2/pcsx2.git pcsx2
+          git -C pcsx2 checkout -q "$PCSX2_COMMIT"
+          git -C pcsx2 apply --whitespace=nowarn ../nbastreet-v3-recomp/patches/pcsx2.patch
+
+      - name: PS2Recomp (recompiler, runtime, IOP)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`vswhere -latest -property installationPath`) do set "VSINSTPATH=%%i"
+          call "%VSINSTPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S PS2Recomp -B PS2Recomp\out\build -G Ninja -DCMAKE_BUILD_TYPE=Release || exit /b 1
+          cmake --build PS2Recomp\out\build --target ps2_recomp ps2_runtime ps2_iop || exit /b 1
+
+      - name: Cache PCSX2 dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: pcsx2/deps
+          key: windows pcsx2 deps ${{ env.PCSX2_COMMIT }} ${{ hashFiles('pcsx2/.github/workflows/scripts/windows/build-dependencies.bat') }}
+
+      - name: PCSX2 dependencies (first run only, ~1 h)
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        shell: cmd
+        working-directory: pcsx2
+        env:
+          DEBUG: 0
+          BUILD_FFMPEG: 0
+        run: .github\workflows\scripts\windows\build-dependencies.bat
+
+      - name: PCSX2 GS host (pcsx2-gsrunner, clang-cl)
+        shell: cmd
+        run: |
+          for /f "usebackq tokens=*" %%i in (`vswhere -latest -property installationPath`) do set "VSINSTPATH=%%i"
+          call "%VSINSTPATH%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          cmake -S pcsx2 -B pcsx2\build -G Ninja -DCMAKE_BUILD_TYPE=Release ^
+            -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_LINKER=lld-link -DCMAKE_RC_COMPILER=llvm-rc ^
+            -DCMAKE_PREFIX_PATH="%CD%\pcsx2\deps" -DENABLE_QT_UI=OFF -DENABLE_GSRUNNER=ON -DENABLE_TESTS=OFF || exit /b 1
+          cmake --build pcsx2\build --target pcsx2-gsrunner || exit /b 1
+
+  macos:
+    name: macOS arm64
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      NBA_ROOT: ${{ github.workspace }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          path: nbastreet-v3-recomp
+
+      - name: Tools
+        run: |
+          for f in ninja pkgconf ffmpeg; do brew list "$f" > /dev/null 2>&1 || brew install "$f"; done
+
+      - name: Sources + patches
+        run: |
+          git clone -q https://github.com/ran-j/PS2Recomp.git PS2Recomp
+          git -C PS2Recomp checkout -q "$PS2RECOMP_COMMIT"
+          git -C PS2Recomp apply --whitespace=nowarn ../nbastreet-v3-recomp/patches/ps2recomp.patch
+          git clone -q https://github.com/PCSX2/pcsx2.git pcsx2
+          git -C pcsx2 checkout -q "$PCSX2_COMMIT"
+          git -C pcsx2 apply --whitespace=nowarn ../nbastreet-v3-recomp/patches/pcsx2.patch
+
+      - name: PS2Recomp (recompiler, runtime, IOP)
+        run: |
+          nbastreet-v3-recomp/tools/macos/build.sh recomp
+          nbastreet-v3-recomp/tools/macos/build.sh lib
+
+      - name: Cache PCSX2 dependencies
+        id: cache-deps
+        uses: actions/cache@v4
+        with:
+          path: deps-mac
+          key: macos-arm64 pcsx2 deps ${{ env.PCSX2_COMMIT }} ${{ hashFiles('nbastreet-v3-recomp/tools/macos/build_pcsx2_deps.sh') }}
+
+      - name: PCSX2 dependencies (first run only)
+        if: steps.cache-deps.outputs.cache-hit != 'true'
+        run: nbastreet-v3-recomp/tools/macos/build_pcsx2.sh deps
+
+      - name: PCSX2 GS host + gshost folder (Metal, arm64 microVU)
+        run: |
+          nbastreet-v3-recomp/tools/macos/build_pcsx2.sh build
+          nbastreet-v3-recomp/tools/macos/build_pcsx2.sh gshost
+
+      - name: Live ring smoke test (game side <-> GS host)
+        # Needs a Metal device; GitHub's macOS VMs usually expose a paravirtual one.
+        continue-on-error: true
+        run: |
+          clang++ -std=c++20 -O2 -Wno-deprecated-declarations -I PS2Recomp/ps2xRuntime/src/lib/gs \
+            nbastreet-v3-recomp/tools/macos/live_ring_smoke.cpp -o live_ring_smoke
+          ./live_ring_smoke "$NBA_ROOT/gshost" 3
+
+      - name: Logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-logs
+          path: logs/
