@@ -16,7 +16,8 @@ param(
     [string]$Root = "C:\NBAStreetRecomp",
     [string[]]$GsHostUrl = @(),       # prebuilt renderer zip(s) to download (when not shipped next to the launcher)
     [switch]$BuildPcsx2,              # build the renderer from source instead
-    [switch]$Rebuild                  # regenerate and rebuild the game even if it exists
+    [switch]$Rebuild,                 # regenerate and rebuild the game even if it exists
+    [switch]$RecompilerOnly           # stop after the recompiler, no ISO needed (CI / troubleshooting)
 )
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -25,8 +26,10 @@ $Tools = Join-Path $Root 'tools'
 $Logs = Join-Path $Root 'logs'
 New-Item -ItemType Directory -Force $Root, $Tools, $Logs, "$Tools\dl", "$Root\game\iso" | Out-Null
 
+# Portable copies, used only when CMake / Git are not already installed (see step 2).
 $CMakeDir = "$Tools\cmake\cmake-4.4.4-windows-x86_64\bin"
 $GitDir = "$Tools\mingit\cmd"
+$MinCMake = [version]'3.21'   # PS2Recomp's cmake_minimum_required
 $Downloads = @{
     VsBuildTools = 'https://aka.ms/vs/17/release/vs_BuildTools.exe'
     CMake        = 'https://github.com/Kitware/CMake/releases/download/v4.4.4/cmake-4.4.4-windows-x86_64.zip'
@@ -47,12 +50,36 @@ function Download($url, $file) {
 }
 function Run($exe, [string[]]$arguments, $log) {
     Write-Host "    $([IO.Path]::GetFileName($exe)) $($arguments -join ' ')"
-    if ($log) {
-        & $exe @arguments *> $log
-    } else {
-        & $exe @arguments
+    # Native tools print warnings on stderr (CMake's deprecation notices, for one). With
+    # $ErrorActionPreference = 'Stop', Windows PowerShell 5.1 turns every redirected stderr line
+    # into a terminating error, so a configure that only warned stopped the install. Run them with
+    # 'Continue' and judge them by their exit code alone.
+    $saved = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        if ($log) {
+            & $exe @arguments 2>&1 | ForEach-Object { "$_" } | Out-File -FilePath $log -Encoding utf8
+        } else {
+            & $exe @arguments
+        }
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $saved
     }
-    if ($LASTEXITCODE) { throw "$exe failed with code $LASTEXITCODE$(if ($log) { " (see $log)" })" }
+    if ($code) { throw "$([IO.Path]::GetFileName($exe)) failed with code $code$(if ($log) { " (see $log)" })" }
+}
+
+# A tool already installed and on PATH (with a minimum version), or $null.
+function Find-OnPath($name, [version]$minVersion) {
+    $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $cmd) { return $null }
+    if ($minVersion) {
+        $saved = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try { $text = (& $cmd.Source --version 2>&1 | Select-Object -First 1) -as [string] } finally { $ErrorActionPreference = $saved }
+        if ($text -notmatch '(\d+\.\d+(\.\d+)?)' -or [version]$Matches[1] -lt $minVersion) { return $null }
+    }
+    return Split-Path -Parent $cmd.Source
 }
 
 try {
@@ -75,16 +102,27 @@ if (-not (Find-VS)) {
 Write-Host "    OK: $(Find-VS)"
 
 # ---------------------------------------------------------------- 2. portable tools
-Step "Portable CMake and Git"
+Step "CMake and Git"
+# Use the ones already installed when there are; otherwise portable copies in $Tools.
 if (-not (Test-Path "$CMakeDir\cmake.exe")) {
-    Download $Downloads.CMake "$Tools\dl\cmake.zip"
-    Expand-Archive "$Tools\dl\cmake.zip" "$Tools\cmake" -Force
+    if ($found = Find-OnPath 'cmake' $MinCMake) {
+        $CMakeDir = $found
+    } else {
+        Download $Downloads.CMake "$Tools\dl\cmake.zip"
+        Expand-Archive "$Tools\dl\cmake.zip" "$Tools\cmake" -Force
+    }
 }
 if (-not (Test-Path "$GitDir\git.exe")) {
-    Download $Downloads.MinGit "$Tools\dl\mingit.zip"
-    Expand-Archive "$Tools\dl\mingit.zip" "$Tools\mingit" -Force
+    if ($found = Find-OnPath 'git') {
+        $GitDir = $found
+    } else {
+        Download $Downloads.MinGit "$Tools\dl\mingit.zip"
+        Expand-Archive "$Tools\dl\mingit.zip" "$Tools\mingit" -Force
+    }
 }
 $env:Path = "$GitDir;$CMakeDir;$env:Path"
+Write-Host "    CMake: $CMakeDir"
+Write-Host "    Git:   $GitDir"
 # Repository scripts next to the tools (the build .cmd files look for them there).
 Copy-Item "$Repo\tools\*" $Tools -Recurse -Force -Exclude 'dl'
 Write-Host "    OK"
@@ -93,6 +131,9 @@ Write-Host "    OK"
 Step "Your copy of the game"
 $isoTarget = Join-Path $Root 'game\NBAStreetV3.iso'
 $elf = Join-Path $Root 'game\iso\SLUS_211.26'
+if ($RecompilerOnly) {
+    Write-Host "    skipped (-RecompilerOnly)"
+} else {
 if (-not (Test-Path $elf)) {
     if (-not $Iso) { throw "Choose your ISO in the launcher first" }
     if (-not (Test-Path $Iso)) { throw "File not found: $Iso" }
@@ -118,6 +159,7 @@ if (-not (Test-Path $isoTarget)) {
     }
 }
 Write-Host "    OK: $elf"
+}
 
 # ---------------------------------------------------------------- 4. sources
 Step "PS2Recomp and PCSX2 sources (with the patches)"
@@ -133,6 +175,11 @@ if (-not (Test-Path $recompExe)) {
     Run "$CMakeDir\cmake.exe" @('--build', $build, '--config', 'Release', '--target', 'ps2_recomp', '--parallel') "$Logs\install_recomp.log"
 }
 Write-Host "    OK"
+if ($RecompilerOnly) {
+    Write-Host ""
+    Write-Host "==> Recompiler ready (-RecompilerOnly)." -ForegroundColor Green
+    return
+}
 
 Step "Game code (generated from your ELF)"
 $runner = Join-Path $Root 'PS2Recomp\ps2xRuntime\src\runner'
@@ -222,4 +269,5 @@ catch {
     Write-Host "==> Something went wrong: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "    Press 'Prepare game' again to retry (finished steps are skipped)."
     Write-Host "    If it keeps failing, open an issue on GitHub and attach the files in $Logs."
+    if ($RecompilerOnly) { exit 1 }   # CI: report the failure (the launcher never passes this)
 }
