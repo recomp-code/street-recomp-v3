@@ -1,0 +1,2076 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index c7c7af5..97c9613 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -28,6 +28,14 @@ if(ANDROID)
+ endif()
+ 
+ set(PS2X_IS_ARM_TARGET OFF)
++# WebAssembly feasibility build (Emscripten, run in Node.js): headless raylib, no FFmpeg, no debug UI.
++if(EMSCRIPTEN)
++    option(PS2X_WASM_HEADLESS "Headless raylib for the WebAssembly build" ON)
++    set(PS2X_ENABLE_DEBUG_UI OFF CACHE BOOL "" FORCE)
++    add_compile_options(-msimd128 -msse4.2 -pthread -fwasm-exceptions)
++    add_link_options(-pthread -fwasm-exceptions)
++endif()
++
+ set(PS2X_IS_AARCH64_TARGET OFF)
+ if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
+     set(PS2X_IS_ARM_TARGET ON)
+diff --git a/ps2xIOP/include/ps2x/host_intrin.h b/ps2xIOP/include/ps2x/host_intrin.h
+index 43bc85f..f92bccb 100644
+--- a/ps2xIOP/include/ps2x/host_intrin.h
++++ b/ps2xIOP/include/ps2x/host_intrin.h
+@@ -9,6 +9,12 @@
+ // sse2neon spells the cycle counter _rdtsc (CNTVCT_EL0); callers use the MSVC/GCC name. The rate
+ // differs from an x86 TSC, but every user either calibrates it or only compares ticks.
+ static inline uint64_t __rdtsc() { return _rdtsc(); }
++#elif defined(__EMSCRIPTEN__)
++// WebAssembly: Emscripten maps the SSE intrinsics onto wasm SIMD; there is no cycle counter, so
++// __rdtsc counts nanoseconds of the monotonic clock (every user calibrates it or subtracts).
++#include <immintrin.h>
++#include <emscripten.h>
++static inline uint64_t __rdtsc() { return static_cast<uint64_t>(emscripten_get_now() * 1000000.0); }
+ #else
+ #include <x86intrin.h>
+ #endif
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
+index c8b9ef1..f1fcbca 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.cpp
++++ b/ps2xIOP/src/emulator/core/iop_memory.cpp
+@@ -371,9 +371,19 @@ namespace ps2x::iop::detail
+             }
+             m_hardware[madrAddress] = madr + bytes;
+         }
++        // The SPU2 double-buffers AutoDMA: it asks for the next block while the previous one is
++        // still playing. Completing when one block is left queued (instead of when the queue runs
++        // dry) gives the sound driver that block of time to answer; otherwise the gap until the
++        // next block plays as silence, which sounds like crackling.
++        uint64_t completion = delay;
++        if (autoDma && (value & 1u) != 0u)
++        {
++            const uint64_t queued = m_spu2.autoDmaQueued(core);
++            completion = queued > transferWords ? (queued - transferWords) * Spu2::kIopCyclesPerSample : 0u;
++        }
+         m_dmaStart = DmaStart{
+             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
+-            delay,
++            completion,
+         };
+     }
+ 
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+index 1bbdb22..45479cf 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
++++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
+@@ -135,6 +135,12 @@ namespace ps2x::iop::detail
+         return m_cores[static_cast<size_t>(core) & 1u].admas != 0u;
+     }
+ 
++    size_t Spu2::autoDmaQueued(int core) const
++    {
++        const Core &c = m_cores[static_cast<size_t>(core) & 1u];
++        return std::max(c.admaL.size(), c.admaR.size());
++    }
++
+     void Spu2::checkIrq(uint32_t address)
+     {
+         address &= kRamMask;
+diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
+index be7a058..7d6a785 100644
+--- a/ps2xIOP/src/emulator/core/iop_spu2.h
++++ b/ps2xIOP/src/emulator/core/iop_spu2.h
+@@ -27,6 +27,7 @@ namespace ps2x::iop::detail
+         void write16(uint32_t phys, uint16_t value);
+ 
+         [[nodiscard]] bool autoDmaActive(int core) const;
++        [[nodiscard]] size_t autoDmaQueued(int core) const; // stereo samples waiting to be played
+         // IOP DMA channel 4 (core 0) / 7 (core 1), memory -> SPU2.
+         void dmaWrite(int core, const uint8_t *data, uint32_t bytes);
+         // SPU2 -> memory.
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/AdapterUtils.cpp b/ps2xIOP/src/emulator/dev9/DEV9/AdapterUtils.cpp
+index 9478c33..5612800 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/AdapterUtils.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/AdapterUtils.cpp
+@@ -518,7 +518,7 @@ std::vector<IP_Address> AdapterUtils::GetGateways(const Adapter* adapter)
+ 	return collection;
+ }
+ #else
+-std::vector<IP_Address> AdapterUtils::GetGateways(Adapter* adapter)
++std::vector<IP_Address> AdapterUtils::GetGateways(const Adapter* adapter)
+ {
+ 	Console.Error("DEV9: Unsupported OS, can't find Gateway");
+ 	return {};
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index f29c1d1..f1b7a19 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -81,7 +81,18 @@ else()
+         GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
+         GIT_PROGRESS TRUE
+     )
+-    FetchContent_MakeAvailable(raylib)
++    if(EMSCRIPTEN AND PS2X_WASM_HEADLESS)
++        # WebAssembly feasibility build (Node.js): raylib's header only, and the headless subset
++        # in web/raylib_headless.cpp instead of the library (no window, input or audio).
++        FetchContent_GetProperties(raylib)
++        if(NOT raylib_POPULATED)
++            FetchContent_Populate(raylib)
++        endif()
++        add_library(raylib STATIC "${CMAKE_CURRENT_SOURCE_DIR}/web/raylib_headless.cpp")
++        target_include_directories(raylib PUBLIC "${raylib_SOURCE_DIR}/src")
++    else()
++        FetchContent_MakeAvailable(raylib)
++    endif()
+ 
+     if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
+         FetchContent_Declare(
+@@ -242,7 +253,7 @@ else()
+     endif()
+ endif()
+ 
+-if(PS2X_IS_ANDROID)
++if(PS2X_IS_ANDROID OR EMSCRIPTEN)
+     set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
+ else()
+     set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
+@@ -517,12 +528,89 @@ target_include_directories(ps2_runtime PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
+ )
+ 
+-target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
++target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ps2_iop)
++# FFmpeg is only used inside the runtime (MPEG video): keep its headers out of the game's code.
++target_link_libraries(ps2_runtime PRIVATE ffmpeg)
+ target_link_libraries(ps2EntryRunner
+     PRIVATE
+     ps2_runtime
+ )
+ 
++if(EMSCRIPTEN)
++    # WebAssembly build. PS2X_WASM_TARGET:
++    #   node  headless test in Node.js (real files through NODERAWFS, PS2X_GS_NULL=1 sink)
++    #   web   the browser: the page is the GS host (web/play_gs_host.cpp, Play!'s GS on WebGL2 and
++    #         VU1 JIT), files on demand over HTTP (web/web_platform.cpp). Needs PS2X_PLAY_ROOT (a
++    #         Play! checkout) and PS2X_PLAY_BUILD (its Emscripten build with PLAY_WASM_EXCEPTIONS=ON).
++    set(PS2X_WASM_TARGET "node" CACHE STRING "node or web")
++    # -O1 links in ~3 min while iterating; -O3 (~13 min) is ~10% smaller, same speed.
++    set(PS2X_WASM_LINK_OPT "-O3" CACHE STRING "Optimization level of the final wasm link")
++    set_target_properties(ps2EntryRunner PROPERTIES SUFFIX ".js")
++    target_link_options(ps2EntryRunner PRIVATE
++        ${PS2X_WASM_LINK_OPT}
++        -sINITIAL_MEMORY=1024MB
++        -sALLOW_MEMORY_GROWTH=1
++        -sMAXIMUM_MEMORY=2GB # Play!'s JIT modules import the memory with a 2 GB maximum
++        -sSTACK_SIZE=16MB
++        -sDEFAULT_PTHREAD_STACK_SIZE=8MB
++        -sMALLOC=mimalloc
++        # The runtime is built with ThinLTO: reuse unchanged modules' code between links.
++        "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache"
++    )
++    if(PS2X_WASM_TARGET STREQUAL "web")
++        set(PS2X_PLAY_ROOT "" CACHE PATH "Play! source checkout")
++        set(PS2X_PLAY_BUILD "" CACHE PATH "Play! Emscripten build directory")
++        set(PS2X_WEB_SOURCES web/play_gs_host.cpp web/web_platform.cpp)
++        target_sources(ps2EntryRunner PRIVATE ${PS2X_WEB_SOURCES})
++        set(_play_deps "${PS2X_PLAY_ROOT}/deps")
++        set_source_files_properties(web/play_gs_host.cpp PROPERTIES
++            SKIP_PRECOMPILE_HEADERS ON
++            SKIP_UNITY_BUILD_INCLUSION ON
++            COMPILE_DEFINITIONS "GLES_COMPATIBILITY;LOGGING_ENABLED=0;HAVE_UNISTD_H;_IOP_EMULATE_MODULES=1;ZWRAP_USE_ZSTD"
++            INCLUDE_DIRECTORIES "${PS2X_PLAY_ROOT}/Source;${_play_deps}/CodeGen/include;${_play_deps}/Framework/include;${_play_deps}/Dependencies/ghc_filesystem/include;${_play_deps}/libchdr/include;${PS2X_PLAY_ROOT}/Source/app_shared")
++        set_source_files_properties(web/web_platform.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON SKIP_UNITY_BUILD_INCLUSION ON)
++        set(_pb "${PS2X_PLAY_BUILD}/Source/ui_js")
++        target_link_libraries(ps2EntryRunner PRIVATE
++            "${_pb}/gs/GSH_OpenGL/libgsh_opengl.a"
++            "${_pb}/gs/GSH_OpenGL/FrameworkOpenGl/libFramework_OpenGl.a"
++            "${_pb}/Source/libPlayCore.a"
++            "${_pb}/Source/CodeGen/libCodeGen.a"
++            "${_pb}/Source/Framework/libFramework.a"
++            "${_pb}/Source/Framework/zstd_zlibwrapper/liblibzstd_zlibwrapper_static.a"
++            "${_pb}/Source/Framework/zstd_zlibwrapper/zstd/lib/libzstd.a"
++            "${_pb}/Source/Framework/zstd_zlibwrapper/zlib/libzlibstatic.a"
++            "${_pb}/Source/libchdr/libchdr-static.a"
++            "${_pb}/Source/libchdr/deps/lzma-24.05/liblzma.a"
++            "${_pb}/Source/bzip2-1.0.6/libbz2.a"
++            "${_pb}/Source/xxHash/libxxhash.a"
++            "${_pb}/Source/app_shared/libapp_shared.a"
++            embind
++        )
++        target_link_options(ps2EntryRunner PRIVATE
++            -sENVIRONMENT=web,worker
++            -sPROXY_TO_PTHREAD
++            -sWASMFS
++            -sUSE_WEBGL2=1
++            -sMIN_WEBGL_VERSION=2
++            -sMAX_WEBGL_VERSION=2
++            -sALLOW_TABLE_GROWTH
++            -sPTHREAD_POOL_SIZE=16
++            -sEXIT_RUNTIME=0
++            "-sEXPORTED_RUNTIME_METHODS=['addRunDependency','removeRunDependency']"
++            "-sEXPORTED_FUNCTIONS=['_main','_EmptyBlockHandler','_MemoryUtils_GetByteProxy','_MemoryUtils_GetHalfProxy','_MemoryUtils_GetWordProxy','_MemoryUtils_GetDoubleProxy','_MemoryUtils_SetByteProxy','_MemoryUtils_SetHalfProxy','_MemoryUtils_SetWordProxy','_MemoryUtils_SetDoubleProxy','_LWL_Proxy','_LWR_Proxy','_LDL_Proxy','_LDR_Proxy','_SWL_Proxy','_SWR_Proxy','_SDL_Proxy','_SDR_Proxy']"
++        )
++    else()
++        target_sources(ps2EntryRunner PRIVATE web/node_platform.cpp)
++        set_source_files_properties(web/node_platform.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON SKIP_UNITY_BUILD_INCLUSION ON)
++        target_link_options(ps2EntryRunner PRIVATE
++            -sENVIRONMENT=node
++            -sNODERAWFS=1
++            -sPTHREAD_POOL_SIZE=16
++            -sEXIT_RUNTIME=1
++        )
++    endif()
++endif()
++
+ if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+     target_sources(ps2EntryRunner PRIVATE
+         src/lib/ps2_debug_panel.cpp
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index 0e1a2ad..721e03b 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -13,6 +13,9 @@ namespace
+         uint32_t sizeBytes = 0;
+         uint32_t baseLbn = 0;
+         uint32_t sectors = 0;
++        // Found in the disc image's own ISO9660 directory (no extracted copy, e.g. the browser
++        // build): baseLbn is the file's real sector and its data is read from the image.
++        bool inImage = false;
+     };
+ 
+     std::unordered_map<std::string, CdFileEntry> g_cdFilesByKey;
+@@ -323,6 +326,85 @@ namespace
+         }
+     }
+ 
++    bool readHostRange(const std::filesystem::path &path, uint64_t offsetBytes, uint8_t *dst, size_t byteCount);
++    std::filesystem::path getCdImagePath();
++
++    // Looks a disc path up in the CD image's ISO9660 directory: its first sector and size.
++    bool findInCdImage(const std::string &ps2Path, uint32_t &lbnOut, uint32_t &sizeOut)
++    {
++        const std::filesystem::path image = getCdImagePath();
++        if (image.empty())
++            return false;
++        auto readLe32 = [](const uint8_t *p) { return static_cast<uint32_t>(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24)); };
++        uint8_t sector[kCdSectorSize];
++        if (!readHostRange(image, 16ull * kCdSectorSize, sector, sizeof(sector)) || sector[0] != 1 ||
++            std::memcmp(sector + 1, "CD001", 5) != 0)
++            return false;
++        uint32_t dirLbn = readLe32(sector + 156 + 2);
++        uint32_t dirSize = readLe32(sector + 156 + 10);
++
++        std::string rel = normalizeCdPathNoPrefix(ps2Path);
++        for (char &ch : rel)
++            ch = (ch == '\\') ? '/' : static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
++        std::vector<std::string> parts;
++        for (size_t pos = 0; pos <= rel.size();)
++        {
++            const size_t end = rel.find('/', pos);
++            std::string part = rel.substr(pos, end == std::string::npos ? std::string::npos : end - pos);
++            if (const size_t semi = part.find(';'); semi != std::string::npos)
++                part.resize(semi);
++            if (!part.empty())
++                parts.push_back(part);
++            if (end == std::string::npos)
++                break;
++            pos = end + 1;
++        }
++        if (parts.empty())
++            return false;
++
++        for (size_t i = 0; i < parts.size(); ++i)
++        {
++            const bool last = i + 1 == parts.size();
++            bool found = false;
++            std::vector<uint8_t> dir(dirSize);
++            if (dirSize == 0 || !readHostRange(image, static_cast<uint64_t>(dirLbn) * kCdSectorSize, dir.data(), dir.size()))
++                return false;
++            for (size_t off = 0; off < dir.size();)
++            {
++                const uint8_t len = dir[off];
++                if (len == 0)
++                {
++                    off = (off / kCdSectorSize + 1) * kCdSectorSize; // records never cross a sector
++                    continue;
++                }
++                if (off + len > dir.size() || len < 34)
++                    break;
++                const uint8_t *rec = dir.data() + off;
++                std::string name(reinterpret_cast<const char *>(rec + 33), rec[32]);
++                if (const size_t semi = name.find(';'); semi != std::string::npos)
++                    name.resize(semi);
++                if (!name.empty() && name.back() == '.')
++                    name.pop_back();
++                for (char &ch : name)
++                    ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
++                const bool isDir = (rec[25] & 2) != 0;
++                if (name == parts[i] && isDir != last)
++                {
++                    dirLbn = readLe32(rec + 2);
++                    dirSize = readLe32(rec + 10);
++                    found = true;
++                    break;
++                }
++                off += len;
++            }
++            if (!found)
++                return false;
++        }
++        lbnOut = dirLbn;
++        sizeOut = dirSize;
++        return true;
++    }
++
+     bool registerCdFile(const std::string &ps2Path, CdFileEntry &entryOut)
+     {
+         const std::string key = cdPathKey(ps2Path);
+@@ -373,8 +455,23 @@ namespace
+                     }
+                     else
+                     {
+-                        g_lastCdError = -1;
+-                        return false;
++                        // No extracted copy: the file in the image itself.
++                        uint32_t lbn = 0, size = 0;
++                        if (!findInCdImage(ps2Path, lbn, size))
++                        {
++                            g_lastCdError = -1;
++                            return false;
++                        }
++                        CdFileEntry entry;
++                        entry.hostPath = getCdImagePath();
++                        entry.sizeBytes = size;
++                        entry.baseLbn = lbn;
++                        entry.sectors = sectorsForBytes(size);
++                        entry.inImage = true;
++                        g_cdFilesByKey.emplace(key, entry);
++                        entryOut = entry;
++                        g_lastCdError = 0;
++                        return true;
+                     }
+                 }
+             }
+@@ -444,7 +541,7 @@ namespace
+             }
+ 
+             const uint64_t relativeLbn = static_cast<uint64_t>(lbn - entry.baseLbn);
+-            const uint64_t offset = relativeLbn * kCdSectorSize;
++            const uint64_t offset = (entry.inImage ? static_cast<uint64_t>(lbn) : relativeLbn) * kCdSectorSize;
+             return readHostRange(entry.hostPath, offset, dst, byteCount);
+         }
+ 
+diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
+index db0ff1d..93ca363 100644
+--- a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
+@@ -21,7 +21,7 @@
+ #endif
+ #include <windows.h>
+ #include <intrin.h>
+-#elif defined(__APPLE__) || defined(__linux__)
++#elif defined(__APPLE__) || defined(__linux__) || defined(__EMSCRIPTEN__)
+ #include "ps2x/host_intrin.h"
+ #include <cerrno>
+ #include <chrono>
+@@ -36,10 +36,16 @@ extern char **environ;
+ #endif
+ 
+ // The live ring to the PCSX2 GS host exists on Windows and on POSIX hosts with a futex-like wait.
+-#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
++// WebAssembly (feasibility build) only has the null sink (PS2X_GS_NULL) for now.
++#if defined(_WIN32) || defined(__APPLE__) || defined(__linux__) || defined(__EMSCRIPTEN__)
+ #define PS2X_GS_LIVE_RING 1
+ #endif
+ 
++#if defined(__EMSCRIPTEN__)
++// web/play_gs_host.cpp: starts the in-page GS host on the browser's main thread.
++bool ps2xWebStartGsHost(ps2live::RingHeader *header);
++#endif
++
+ // ps2_runtime.cpp, frame-budget report (PS2X_NBA_FRAME_LOG): time the game blocked on a full ring.
+ extern uint64_t g_ps2StatRingWaitTicks;
+ 
+@@ -192,6 +198,80 @@ namespace ps2_gsdump
+                     SetEvent(dataEvent);
+             }
+         };
++#elif defined(__EMSCRIPTEN__)
++        // Browser: the GS host is the page itself (web/play_gs_host.cpp, on the browser's main
++        // thread), so the ring is plain memory of this module, shared with it. Same protocol and
++        // write logic as the POSIX ring; the host never blocks, so it never needs the data event.
++        struct LiveRing
++        {
++            ps2live::RingHeader *header = nullptr;
++            ps2live::RingEvents *events = nullptr;
++            uint8_t *data = nullptr;
++            uint64_t capacity = 0;
++            bool hostExited = false;
++            int hostStatus = 0;
++
++            bool open()
++            {
++                capacity = 64ull << 20; // the web build keeps memory small
++                void *block = std::aligned_alloc(64, static_cast<size_t>(ps2live::mappingSize(capacity)));
++                if (!block)
++                    return false;
++                header = static_cast<ps2live::RingHeader *>(block);
++                std::memset(header, 0, sizeof(*header));
++                header->capacity = capacity;
++                header->padAxes = 0x80808080u;
++                header->version = ps2live::kVersion;
++                header->producerAlive = 1u;
++                header->producerFlags = 1u;
++                data = ps2live::ringData(header);
++                events = ps2live::ringEvents(header);
++                std::memset(events, 0, sizeof(*events));
++                __atomic_thread_fence(__ATOMIC_SEQ_CST);
++                header->magic = ps2live::kMagic;
++                return true;
++            }
++
++            bool launchHost()
++            {
++                return ps2xWebStartGsHost(header);
++            }
++
++            bool hostGone() { return header && header->consumerQuit; }
++
++            bool write(const uint8_t *src, size_t size)
++            {
++                while (size != 0u)
++                {
++                    const int64_t w = header->writePos;
++                    const int64_t r = header->readPos;
++                    const uint64_t freeBytes = capacity - static_cast<uint64_t>(w - r);
++                    if (freeBytes == 0u)
++                    {
++                        if (hostGone())
++                            return false;
++                        const uint64_t waitStart = __rdtsc();
++                        header->producerWaiting = 1u;
++                        __atomic_thread_fence(__ATOMIC_SEQ_CST);
++                        if (header->readPos == r)
++                            ps2live::eventWait(&events->space, 20);
++                        header->producerWaiting = 0u;
++                        g_ps2StatRingWaitTicks += __rdtsc() - waitStart;
++                        continue;
++                    }
++                    const uint64_t offset = static_cast<uint64_t>(w) % capacity;
++                    const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
++                    std::memcpy(data + offset, src, chunk);
++                    __atomic_thread_fence(__ATOMIC_RELEASE);
++                    header->writePos = w + static_cast<int64_t>(chunk);
++                    src += chunk;
++                    size -= chunk;
++                }
++                return true;
++            }
++
++            void signal() {} // the host polls once per browser frame
++        };
+ #elif defined(__APPLE__) || defined(__linux__)
+         // POSIX version of the live ring above: shm_open mapping, events as shared words
+         // (ps2live::eventSet/eventWait), the host started with posix_spawn.
+@@ -342,6 +422,11 @@ namespace ps2_gsdump
+ #if defined(PS2X_GS_LIVE_RING)
+             LiveRing live;
+             bool liveActive = false;
++            // PS2X_GS_NULL=1: the game streams to the GS host as usual (remote VU1, same packets,
++            // copied out) but nothing draws them. Measures the game side alone.
++            bool liveNull = false;
++            std::vector<uint8_t> nullScratch;
++            size_t nullPos = 0;
+ #endif
+             bool headerWritten = false;
+             bool finished = false;
+@@ -373,6 +458,22 @@ namespace ps2_gsdump
+                 if (size == 0)
+                     return;
+ #if defined(PS2X_GS_LIVE_RING)
++                if (liveActive && liveNull)
++                {
++                    // Copy like the ring would, into a 4 MB circular scratch buffer.
++                    const uint8_t *src = static_cast<const uint8_t *>(data);
++                    size_t left = size;
++                    while (left)
++                    {
++                        const size_t chunk = std::min(left, nullScratch.size() - nullPos);
++                        std::memcpy(nullScratch.data() + nullPos, src, chunk);
++                        nullPos = (nullPos + chunk) % nullScratch.size();
++                        src += chunk;
++                        left -= chunk;
++                    }
++                    bytes += size;
++                    return;
++                }
+                 if (liveActive)
+                 {
+                     if (!live.write(static_cast<const uint8_t *>(data), size))
+@@ -410,7 +511,7 @@ namespace ps2_gsdump
+             void endPacket()
+             {
+ #if defined(PS2X_GS_LIVE_RING)
+-                if (liveActive)
++                if (liveActive && !liveNull)
+                     live.signal();
+ #endif
+             }
+@@ -471,8 +572,16 @@ namespace ps2_gsdump
+             {
+                 Writer &init = w;
+ #if defined(PS2X_GS_LIVE_RING)
++                const char *nullEnv = std::getenv("PS2X_GS_NULL");
+                 const char *liveEnv = std::getenv("PS2X_GS_LIVE");
+-                if (liveEnv && *liveEnv == '1')
++                if (nullEnv && *nullEnv == '1')
++                {
++                    init.liveActive = true;
++                    init.liveNull = true;
++                    init.nullScratch.resize(4u << 20);
++                    std::fprintf(stderr, "[gslive] null GS sink (PS2X_GS_NULL=1): nothing is drawn\n");
++                }
++                else if (liveEnv && *liveEnv == '1')
+                 {
+                     if (init.live.open() && init.live.launchHost())
+                     {
+diff --git a/ps2xRuntime/src/lib/gs/ps2_live_ring.h b/ps2xRuntime/src/lib/gs/ps2_live_ring.h
+index 7532552..b8c6172 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_live_ring.h
++++ b/ps2xRuntime/src/lib/gs/ps2_live_ring.h
+@@ -11,6 +11,8 @@
+ 
+ #if defined(__APPLE__)
+ #include <os/os_sync_wait_on_address.h>
++#elif defined(__EMSCRIPTEN__)
++#include <emscripten/threading.h>
+ #elif defined(__linux__)
+ #include <climits>
+ #include <ctime>
+@@ -98,6 +100,8 @@ namespace ps2live
+         __atomic_store_n(word, 1u, __ATOMIC_SEQ_CST);
+ #if defined(__APPLE__)
+         os_sync_wake_by_address_any(word, sizeof(*word), OS_SYNC_WAKE_BY_ADDRESS_SHARED);
++#elif defined(__EMSCRIPTEN__)
++        emscripten_futex_wake(word, 1);
+ #elif defined(__linux__)
+         syscall(SYS_futex, word, FUTEX_WAKE, 1, nullptr, nullptr, 0);
+ #endif
+@@ -111,6 +115,8 @@ namespace ps2live
+ #if defined(__APPLE__)
+         os_sync_wait_on_address_with_timeout(word, 0u, sizeof(*word), OS_SYNC_WAIT_ON_ADDRESS_SHARED,
+                                              OS_CLOCK_MACH_ABSOLUTE_TIME, static_cast<uint64_t>(timeoutMs) * 1000000ull);
++#elif defined(__EMSCRIPTEN__)
++        emscripten_futex_wait(word, 0u, static_cast<double>(timeoutMs)); // never on the browser's main thread
+ #elif defined(__linux__)
+         const timespec timeout{static_cast<time_t>(timeoutMs / 1000u), static_cast<long>(timeoutMs % 1000u) * 1000000l};
+         syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, nullptr, 0);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 5c92038..734938c 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -91,6 +91,20 @@ namespace
+                 std::vector<int16_t> discard((queued - kTrimTo) * 2u);
+                 (void)ps2x::iop::readAudioFrames(discard.data(), queued - kTrimTo);
+             }
++#if defined(__EMSCRIPTEN__)
++            // Browser: the ring buffer takes any amount, so only real samples go out (no zero
++            // padding, which sounds like crackles); the page's worklet absorbs the jitter.
++            for (;;)
++            {
++                const size_t got = ps2x::iop::readAudioFrames(buffer.data(), kFrames);
++                if (got == 0)
++                    break;
++                UpdateAudioStream(stream, buffer.data(), static_cast<int>(got));
++                if (got < kFrames)
++                    break;
++            }
++            return;
++#endif
+             while (IsAudioStreamProcessed(stream))
+             {
+                 const size_t got = ps2x::iop::readAudioFrames(buffer.data(), kFrames);
+diff --git a/ps2xRuntime/src/lib/ps2_vfs.cpp b/ps2xRuntime/src/lib/ps2_vfs.cpp
+index aff25e6..1de2f76 100644
+--- a/ps2xRuntime/src/lib/ps2_vfs.cpp
++++ b/ps2xRuntime/src/lib/ps2_vfs.cpp
+@@ -298,6 +298,10 @@ bool PS2Vfs::resolveHostPath(std::string_view path, const PS2VfsMounts &mounts,
+     if (base.empty() || !safeRelativePath(parsed.path, relative))
+         return false;
+     result = (base / relative).lexically_normal();
++    // PS2X_VFS_LOG=1: every cdrom0:/host: path the game opens (which disc files a build must serve).
++    static const bool s_vfsLog = [] { const char *e = std::getenv("PS2X_VFS_LOG"); return e && e[0] == '1'; }();
++    if (s_vfsLog && parsed.device != ps2x::iop::Ps2PathDevice::MemoryCard0)
++        std::fprintf(stderr, "[vfs] %.*s -> %s\n", static_cast<int>(path.size()), path.data(), result.string().c_str());
+     return true;
+ }
+ 
+diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
+index 563bcbd..66ce2e9 100644
+--- a/ps2xRuntime/src/main.cpp
++++ b/ps2xRuntime/src/main.cpp
+@@ -164,10 +164,18 @@ namespace
+     }
+ }
+ 
++#if defined(__EMSCRIPTEN__)
++// web/web_platform.cpp (browser: files, environment) or web/node_platform.cpp (Node.js test).
++void ps2xWasmPlatformInit(int &argc, char **&argv);
++#endif
++
+ int main(int argc, char *argv[])
+ {
+ #if defined(__ANDROID__)
+     redirectStdioToLogcat();
++#endif
++#if defined(__EMSCRIPTEN__)
++    ps2xWasmPlatformInit(argc, argv);
+ #endif
+     setupTerminateLogger();
+ 
+diff --git a/ps2xRuntime/web/disc_files.inc b/ps2xRuntime/web/disc_files.inc
+new file mode 100644
+index 0000000..96f355f
+--- /dev/null
++++ b/ps2xRuntime/web/disc_files.inc
+@@ -0,0 +1,3 @@
++// Disc files the game opens through cdrom0: (PS2X_VFS_LOG=1 run to a match), besides the ELF.
++"SLUS_211.26",
++"DEV9.IRX",
+diff --git a/ps2xRuntime/web/node_platform.cpp b/ps2xRuntime/web/node_platform.cpp
+new file mode 100644
+index 0000000..b5ea934
+--- /dev/null
++++ b/ps2xRuntime/web/node_platform.cpp
+@@ -0,0 +1,32 @@
++// Node.js platform for the WebAssembly build (headless test with the null GS sink): real files
++// through NODERAWFS, nothing to set up, and no in-page GS host.
++
++#include <cstdint>
++
++namespace ps2live
++{
++	struct RingHeader;
++}
++
++void ps2xWasmPlatformInit(int&, char**&)
++{
++}
++
++bool ps2xWebStartGsHost(ps2live::RingHeader*)
++{
++	return false;
++}
++
++bool ps2xHostAudioInit()
++{
++	return false;
++}
++
++bool ps2xHostAudioWantsFrames(int)
++{
++	return false;
++}
++
++void ps2xHostAudioWrite(const int16_t*, int)
++{
++}
+diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
+new file mode 100644
+index 0000000..e76ffdd
+--- /dev/null
++++ b/ps2xRuntime/web/play_gs_host.cpp
+@@ -0,0 +1,939 @@
++// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
++// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
++// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
++// WebAssembly JIT.
++//
++// It does what pcsx2-gsrunner -live does with the same stream (GSDumpReplayer.cpp):
++//   header + privileged GS registers, then packets
++//   Transfer(path, data) -> GIF path 1/2/3      VSync(field) -> vblank, flip
++//   Registers(8 KB)      -> privileged regs     ReadFIFO2    -> local->host transfer
++//   0x10 VIF1 stream     -> VIF1 (UNPACK/MPG fill VU1, MSCAL runs it, XGKICK/DIRECT reach the GIF)
++//   0x11 VIF1 register   -> FBRST / ERR / MARK
++// It runs once per browser frame (requestAnimationFrame) and never blocks: whole packets only,
++// the rest waits for the next frame. The game side runs on workers and blocks on a full ring.
++// Keyboard and gamepad are read here and published through the ring header, like the Mac host.
++
++#include "../src/lib/gs/ps2_live_ring.h"
++
++#include <emscripten.h>
++#include <emscripten/html5.h>
++
++#include "BasicBlock.h"
++#include "FrameDump.h"
++#include "Jitter_CodeGen_Wasm.h"
++#include "MIPS.h"
++#include "MemoryUtils.h"
++#include "Ps2Const.h"
++#include "ee/DMAC.h"
++#include "ee/GIF.h"
++#include "ee/INTC.h"
++#include "ee/MA_VU.h"
++#include "ee/Vif.h"
++#include "ee/Vpu.h"
++#include "ee/VuExecutor.h"
++#include "gs/GSH_OpenGL/GSH_OpenGL.h"
++#include "gs/GsPixelFormats.h"
++#include "DefaultAppConfig.h" // CAppConfig::GetBasePath, defined once per Play! app
++
++#include <array>
++#include <map>
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <memory>
++#include <vector>
++
++extern "C" uint32 LWL_Proxy(uint32, uint32, CMIPS*);
++extern "C" uint32 LWR_Proxy(uint32, uint32, CMIPS*);
++extern "C" uint64 LDL_Proxy(uint32, uint64, CMIPS*);
++extern "C" uint64 LDR_Proxy(uint32, uint64, CMIPS*);
++extern "C" void SWL_Proxy(uint32, uint32, CMIPS*);
++extern "C" void SWR_Proxy(uint32, uint32, CMIPS*);
++extern "C" void SDL_Proxy(uint32, uint64, CMIPS*);
++extern "C" void SDR_Proxy(uint32, uint64, CMIPS*);
++
++namespace
++{
++	// PCSX2 GS dump packet types and the live extensions (gs_dump_writer.cpp).
++	constexpr uint8_t kTypeTransfer = 0;
++	constexpr uint8_t kTypeVSync = 1;
++	constexpr uint8_t kTypeReadFifo2 = 2;
++	constexpr uint8_t kTypeRegisters = 3;
++	constexpr uint8_t kTypeLiveVif1 = 0x10;
++	constexpr uint8_t kTypeLiveVif1Reg = 0x11;
++	constexpr uint8_t kPath2 = 1, kPath3 = 2, kPath1New = 3;
++	constexpr uint32_t kPrivRegsSize = 8192;
++
++	// Where VIF1 data is staged in the emulated EE RAM for CVif::ReceiveDMA (end of the 32 MB).
++	constexpr uint32_t kVifStageAddr = 0x01F00000;
++	constexpr uint32_t kVifStageSize = 0x00100000;
++
++	class CGSH_Web : public CGSH_OpenGL
++	{
++	public:
++		explicit CGSH_Web(EMSCRIPTEN_WEBGL_CONTEXT_HANDLE context)
++		    : CGSH_OpenGL(false) // not threaded: everything runs on the page's main thread
++		    , m_context(context)
++		{
++		}
++
++		// Runs the GS calls queued by the GIF / vblank (draws, flip) on this thread.
++		void Pump()
++		{
++			ProcessPendingCalls();
++		}
++
++	protected:
++		void InitializeImpl() override
++		{
++			emscripten_webgl_make_context_current(m_context);
++			CGSH_OpenGL::InitializeImpl();
++		}
++	public:
++		bool debug = false;
++		uint64_t regCounts[0x80] = {};
++		bool traceOn = false;
++		uint32_t traceVertexRun = 0, traceLines = 0, traceWb = 0;
++		std::map<uint64, uint64_t> regValues[0x80];
++
++	protected:
++		void WriteRegisterImpl(uint8 reg, uint64 value) override
++		{
++			if(!debug)
++			{
++				CGSH_OpenGL::WriteRegisterImpl(reg, value);
++				return;
++			}
++			regCounts[reg & 0x7F]++;
++			if(traceOn)
++			{
++				const bool vertex = reg == 0x01 || reg == 0x02 || reg == 0x03 || reg == 0x04 || reg == 0x05 || reg == 0x0C || reg == 0x0D;
++				if(vertex && traceVertexRun > 8)
++					traceVertexRun++;
++				else
++				{
++					if(!vertex && traceVertexRun > 8)
++						std::printf("[trace]   ... %u vertex writes\n", traceVertexRun - 8);
++					traceVertexRun = vertex ? traceVertexRun + 1 : 0;
++					if(traceLines++ < 4000)
++						std::printf("[trace] %02x %016llx%s\n", reg, (unsigned long long)value, m_framebufferWriteBacks != traceWb ? " (after write-back)" : "");
++					traceWb = m_framebufferWriteBacks;
++				}
++			}
++			if(reg == 0x06 || reg == 0x07 || reg == 0x4C || reg == 0x4D || reg == 0x4E || reg == 0x4F || reg == 0x00 || reg == 0x50 || reg == 0x52)
++				regValues[reg][value]++;
++			CGSH_OpenGL::WriteRegisterImpl(reg, value);
++		}
++		void PresentBackbuffer() override
++		{
++			// The browser presents the canvas when the animation frame returns.
++		}
++
++	private:
++		EMSCRIPTEN_WEBGL_CONTEXT_HANDLE m_context;
++	};
++
++	struct alignas(16) Host
++	{
++		ps2live::RingHeader* ring = nullptr;
++		uint8_t* ringData = nullptr;
++		uint64_t ringCapacity = 0;
++		bool headerDone = false;
++
++		uint8* ram = nullptr;
++		uint8* spr = nullptr;
++		uint8* vuMem0 = nullptr;
++		uint8* vuMem1 = nullptr;
++		uint8* microMem1 = nullptr;
++
++		CMIPS ee{MEMORYMAP_ENDIAN_LSBF, true};
++		CMIPS vu1{MEMORYMAP_ENDIAN_LSBF};
++		CMA_VU maVu1{PS2::VUMEM1SIZE - 1};
++		CINTC intc;
++		std::unique_ptr<CDMAC> dmac;
++		CGSHandler* gs = nullptr;
++		CGSH_Web* gsWeb = nullptr;
++		std::unique_ptr<CGIF> gif;
++		std::shared_ptr<CVpu> vpu1;
++
++		std::vector<uint8_t> packet;
++		std::vector<uint8_t> vifCarry; // VIF1 bytes not yet a whole quadword
++		std::vector<uint8_t> privRegs = std::vector<uint8_t>(kPrivRegsSize, 0);
++		uint64_t lastSmode2 = ~0ull;
++
++		uint32_t frames = 0;
++		double statsStart = 0.0;
++		// Debug counters (printed every 2 s from inside the packet loop).
++		uint64_t nVif = 0, nVifReg = 0, nXfer = 0, nVsync = 0, nRegs = 0, nFifo = 0;
++		double vuMs = 0.0, gsMs = 0.0, debugStart = 0.0;
++		uint64_t vuSlices = 0;
++		uint64_t drawCalls = 0;
++		uint64_t totalVsyncs = 0;
++		uint32 presentWidth = 0, presentHeight = 0;
++		uint64_t flips = 0;
++		Framework::CSignal<void()>::Connection flipConnection;
++		uint64_t pathBytes[4] = {};
++		uint64_t xgkicks = 0;
++		uint64_t vuStarts = 0;
++		std::map<uint32_t, uint64_t> vifRegWrites; // address -> count (last value in vifRegLast)
++		std::map<uint32_t, uint32_t> vifRegLast;
++		CVpu::VuStateChangedEvent::Connection vuStateConnection;
++		CGSHandler::NewFrameEvent::Connection newFrameConnection;
++	};
++
++	Host* g_host = nullptr;
++	EMSCRIPTEN_WEBGL_CONTEXT_HANDLE g_context = 0;
++
++	// --- input -----------------------------------------------------------------------------
++
++	// libpad bit order (active high in the ring): 0 SELECT 1 L3 2 R3 3 START 4 UP 5 RIGHT 6 DOWN
++	// 7 LEFT 8 L2 9 R2 10 L1 11 R1 12 TRIANGLE 13 CIRCLE 14 CROSS 15 SQUARE.
++	std::atomic<uint32_t> g_keyButtons{0};
++	std::atomic<uint32_t> g_keyStick{0}; // bit0 left, bit1 right, bit2 up, bit3 down
++
++	uint32_t KeyBit(const char* code, uint32_t* stick)
++	{
++		struct Map { const char* code; uint32_t bit; uint32_t stick; };
++		static const Map kMap[] = {
++			{"ArrowUp", 1u << 4, 0}, {"ArrowRight", 1u << 5, 0}, {"ArrowDown", 1u << 6, 0}, {"ArrowLeft", 1u << 7, 0},
++			{"KeyZ", 1u << 15, 0}, {"KeyX", 1u << 14, 0}, {"KeyC", 1u << 13, 0}, {"KeyV", 1u << 12, 0},
++			{"KeyQ", 1u << 10, 0}, {"KeyE", 1u << 11, 0}, {"Digit1", 1u << 8, 0}, {"Digit3", 1u << 9, 0},
++			{"Enter", 1u << 3, 0}, {"Backspace", 1u << 0, 0}, {"ShiftRight", 1u << 0, 0},
++			{"ControlLeft", 1u << 1, 0}, {"ControlRight", 1u << 1, 0},
++			{"KeyA", 0, 1}, {"KeyD", 0, 2}, {"KeyW", 0, 4}, {"KeyS", 0, 8},
++		};
++		for(const Map& m : kMap)
++		{
++			if(std::strcmp(code, m.code) == 0)
++			{
++				*stick = m.stick;
++				return m.bit;
++			}
++		}
++		*stick = 0;
++		return 0;
++	}
++
++	bool g_dumpRequested = false;
++	bool g_debug = false; // <page>?debug: GS statistics every 2 s, F8/F9 dumps
++	int g_traceState = 0; // F9: 1 = start at the next vsync, 2 = tracing this frame
++
++	EM_BOOL OnKey(int eventType, const EmscriptenKeyboardEvent* e, void*)
++	{
++		if(eventType == EMSCRIPTEN_EVENT_KEYDOWN && std::strcmp(e->code, "F9") == 0 && g_traceState == 0)
++			g_traceState = 1;
++		if(eventType == EMSCRIPTEN_EVENT_KEYDOWN && std::strcmp(e->code, "F8") == 0)
++			g_dumpRequested = true;
++		uint32_t stick = 0;
++		const uint32_t bit = KeyBit(e->code, &stick);
++		if(!bit && !stick)
++			return EM_FALSE;
++		if(eventType == EMSCRIPTEN_EVENT_KEYDOWN)
++		{
++			g_keyButtons |= bit;
++			g_keyStick |= stick;
++		}
++		else
++		{
++			g_keyButtons &= ~bit;
++			g_keyStick &= ~stick;
++		}
++		return EM_TRUE; // no page scrolling with the arrows
++	}
++
++	EM_BOOL OnBlur(int, const EmscriptenFocusEvent*, void*)
++	{
++		g_keyButtons = 0;
++		g_keyStick = 0;
++		return EM_FALSE;
++	}
++
++	uint32_t AxisByte(double value)
++	{
++		const int v = static_cast<int>(128.0 + value * 127.5);
++		return static_cast<uint32_t>(v < 0 ? 0 : (v > 255 ? 255 : v));
++	}
++
++	// Keyboard + first gamepad (W3C standard mapping) into the ring header.
++	void PublishPad(ps2live::RingHeader* ring)
++	{
++		uint32_t buttons = g_keyButtons.load();
++		const uint32_t stick = g_keyStick.load();
++		uint32_t lx = (stick & 1) ? 0x00 : ((stick & 2) ? 0xFF : 0x80);
++		uint32_t ly = (stick & 4) ? 0x00 : ((stick & 8) ? 0xFF : 0x80);
++		uint32_t rx = 0x80, ry = 0x80;
++
++		if(emscripten_sample_gamepad_data() == EMSCRIPTEN_RESULT_SUCCESS && emscripten_get_num_gamepads() > 0)
++		{
++			EmscriptenGamepadEvent pad;
++			for(int i = 0; i < emscripten_get_num_gamepads(); i++)
++			{
++				if(emscripten_get_gamepad_status(i, &pad) != EMSCRIPTEN_RESULT_SUCCESS || !pad.connected)
++					continue;
++				if(std::strcmp(pad.mapping, "standard") == 0)
++				{
++					// Standard mapping: 0 A 1 B 2 X 3 Y 4 LB 5 RB 6 LT 7 RT 8 Back 9 Start
++					// 10 L3 11 R3 12 Up 13 Down 14 Left 15 Right.
++					static const int kBitForButton[16] = {14, 13, 15, 12, 10, 11, 8, 9, 0, 3, 1, 2, 4, 6, 7, 5};
++					for(int b = 0; b < 16 && b < pad.numButtons; b++)
++						if(pad.digitalButton[b])
++							buttons |= 1u << kBitForButton[b];
++					if(!stick && pad.numAxes >= 2)
++					{
++						lx = AxisByte(pad.axis[0]);
++						ly = AxisByte(pad.axis[1]);
++					}
++					if(pad.numAxes >= 4)
++					{
++						rx = AxisByte(pad.axis[2]);
++						ry = AxisByte(pad.axis[3]);
++					}
++				}
++				break;
++			}
++		}
++		ring->padButtons = buttons;
++		ring->padAxes = lx | (ly << 8) | (rx << 16) | (ry << 24);
++		ring->padSequence = ring->padSequence + 1;
++	}
++
++	// --- ring reading ------------------------------------------------------------------------
++
++	uint64_t Available(Host& h)
++	{
++		return static_cast<uint64_t>(h.ring->writePos - h.ring->readPos);
++	}
++
++	// Copies size bytes at offset `skip` past the read position, without consuming them.
++	void Peek(Host& h, uint64_t skip, void* dst, uint64_t size)
++	{
++		uint8_t* out = static_cast<uint8_t*>(dst);
++		uint64_t pos = static_cast<uint64_t>(h.ring->readPos) + skip;
++		while(size)
++		{
++			const uint64_t offset = pos % h.ringCapacity;
++			const uint64_t chunk = std::min(size, h.ringCapacity - offset);
++			std::memcpy(out, h.ringData + offset, chunk);
++			out += chunk;
++			pos += chunk;
++			size -= chunk;
++		}
++	}
++
++	void Consume(Host& h, uint64_t size)
++	{
++		__atomic_thread_fence(__ATOMIC_RELEASE);
++		h.ring->readPos = h.ring->readPos + static_cast<int64_t>(size);
++		__atomic_thread_fence(__ATOMIC_SEQ_CST); // readPos store before the producerWaiting load
++		if(h.ring->producerWaiting)
++			ps2live::eventSet(&ps2live::ringEvents(h.ring)->space);
++	}
++
++	template <typename T>
++	T PeekValue(Host& h, uint64_t skip)
++	{
++		T value;
++		Peek(h, skip, &value, sizeof(T));
++		return value;
++	}
++
++	// --- GS / VIF1 ---------------------------------------------------------------------------
++
++	// PS2MEM_GS layout (as PCSX2 dumps it) -> Play!'s privileged register writes (0x12000000 + offset).
++	void ApplyPrivRegisters(Host& h)
++	{
++		static const uint32_t kRegs[] = {0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0x1010};
++		for(uint32_t offset : kRegs)
++		{
++			uint64_t value;
++			std::memcpy(&value, h.privRegs.data() + offset, sizeof(value));
++			h.gs->WritePrivRegister(0x12000000 + offset, static_cast<uint32_t>(value));
++			h.gs->WritePrivRegister(0x12000000 + offset + 4, static_cast<uint32_t>(value >> 32));
++		}
++		{
++			// Display changes (PMODE, SMODE2, DISPFB1/2, DISPLAY1/2), for the "flashes" hunt
++			static uint64_t s_last[6] = {};
++			static int s_logged = 0;
++			static const uint32_t kShown[6] = {0x00, 0x20, 0x70, 0x80, 0x90, 0xA0};
++			for(int i = 0; i < 6; i++)
++			{
++				uint64_t value;
++				std::memcpy(&value, h.privRegs.data() + kShown[i], sizeof(value));
++				if(value != s_last[i] && s_logged < 400)
++				{
++					s_logged++;
++					std::printf("[display] vsync %llu reg %02x: %llx -> %llx\n", (unsigned long long)h.totalVsyncs, kShown[i],
++					            (unsigned long long)s_last[i], (unsigned long long)value);
++					s_last[i] = value;
++				}
++			}
++		}
++		uint64_t smode2;
++		std::memcpy(&smode2, h.privRegs.data() + 0x20, sizeof(smode2));
++		if(smode2 != h.lastSmode2)
++		{
++			h.lastSmode2 = smode2;
++			// NTSC (the game is SLUS); SMODE2: bit 0 INT (interlaced), bit 1 FFMD (frame mode).
++			h.gs->SetCrt((smode2 & 1) != 0, 2, (smode2 & 2) != 0);
++		}
++	}
++
++	void RunVu1(Host& h)
++	{
++		const double start = emscripten_get_now();
++		for(int i = 0; i < 100000 && h.vpu1->IsVuRunning(); i++)
++		{
++			h.vpu1->Execute(5000);
++			h.vuSlices++;
++		}
++		h.vuMs += emscripten_get_now() - start;
++	}
++
++	void DebugStats(Host& h)
++	{
++		const double now = emscripten_get_now();
++		if(now - h.debugStart < 2000.0)
++			return;
++		uint64_t pmode = 0, dispfb1 = 0, display1 = 0;
++		std::memcpy(&pmode, h.privRegs.data() + 0x00, 8);
++		std::memcpy(&dispfb1, h.privRegs.data() + 0x70, 8);
++		std::memcpy(&display1, h.privRegs.data() + 0x80, 8);
++		std::printf("[webgs] 2s: draws %llu, PMODE %llx DISPFB1 %llx DISPLAY1 %llx\n", (unsigned long long)h.drawCalls,
++		            (unsigned long long)pmode, (unsigned long long)dispfb1, (unsigned long long)display1);
++		h.drawCalls = 0;
++		{
++			// What is on screen: flips, GS RAM where DISPFB1 points, and the canvas centre.
++			const uint32_t fbp = static_cast<uint32_t>(dispfb1 & 0x1FF) * 8192u;
++			const uint8* gsRam = h.gs->GetRam();
++			uint64_t nonzero = 0, sum = 0;
++			for(uint32_t i = 0; i < 640u * 448u * 4u && fbp + i < 4u * 1024u * 1024u; i += 4)
++			{
++				const uint32_t v = gsRam[fbp + i] | (gsRam[fbp + i + 1] << 8) | (gsRam[fbp + i + 2] << 16);
++				nonzero += v != 0;
++				sum += v;
++			}
++			uint64_t ramNonzero = 0;
++			uint32_t firstNz = 0xFFFFFFFF, lastNz = 0;
++			for(uint32_t i = 0; i < 4u * 1024u * 1024u; i += 4)
++			{
++				if(*reinterpret_cast<const uint32_t*>(gsRam + i) != 0)
++				{
++					ramNonzero++;
++					if(firstNz == 0xFFFFFFFF)
++						firstNz = i;
++					lastNz = i;
++				}
++			}
++			const uint64* r = h.gs->GetRegisters();
++			std::printf("[webgs] 2s: gs ram nonzero words %llu [%x..%x], BITBLTBUF %llx TRXPOS %llx TRXREG %llx TRXDIR %llx\n",
++			            (unsigned long long)ramNonzero, firstNz, lastNz, (unsigned long long)r[0x50], (unsigned long long)r[0x51],
++			            (unsigned long long)r[0x52], (unsigned long long)r[0x53]);
++			uint8_t px[4] = {};
++			glBindFramebuffer(GL_FRAMEBUFFER, 0);
++			int cw = 0, ch = 0;
++			emscripten_get_canvas_element_size("#canvas", &cw, &ch);
++			glReadPixels(cw / 2, ch / 2, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, px);
++			std::printf("[webgs] 2s: flips %llu, gs ram @%x nonzero %llu sum %llx, canvas %dx%d centre %02x%02x%02x glerr %x\n",
++			            (unsigned long long)h.flips, fbp, (unsigned long long)nonzero, (unsigned long long)sum, cw, ch, px[0], px[1], px[2],
++			            glGetError());
++			h.flips = 0;
++		}
++		const uint64* gsRegs = h.gs->GetRegisters();
++		std::printf("[webgs] 2s: path1 %llu B (xgkick %llu) path2 %llu B path3 %llu B, GS PRIM %llx FRAME_1 %llx XYZ2 %llx\n",
++		            (unsigned long long)h.pathBytes[1], (unsigned long long)h.xgkicks, (unsigned long long)h.pathBytes[2],
++		            (unsigned long long)h.pathBytes[3], (unsigned long long)gsRegs[0x00], (unsigned long long)gsRegs[0x4C],
++		            (unsigned long long)gsRegs[0x05]);
++		h.pathBytes[1] = h.pathBytes[2] = h.pathBytes[3] = h.xgkicks = 0;
++		std::printf("[webgs] 2s: framebuffer write-backs %u, software sprites %u\n", h.gsWeb->m_framebufferWriteBacks, h.gsWeb->m_softwareSprites);
++		h.gsWeb->m_framebufferWriteBacks = 0;
++		h.gsWeb->m_softwareSprites = 0;
++		std::printf("[webgs] 2s: gs reg writes:");
++		for(int i = 0; i < 0x80; i++)
++		{
++			if(h.gsWeb->regCounts[i])
++				std::printf(" %02x:%llu", i, (unsigned long long)h.gsWeb->regCounts[i]);
++			h.gsWeb->regCounts[i] = 0;
++		}
++		std::printf("\n");
++		for(int reg : {0x00, 0x06, 0x07, 0x4C, 0x4D, 0x4E, 0x4F, 0x50, 0x52})
++		{
++			auto& values = h.gsWeb->regValues[reg];
++			std::printf("[webgs] 2s: reg %02x values (%zu):", reg, values.size());
++			int shown = 0;
++			for(const auto& [value, count] : values)
++				if(shown++ < 64)
++					std::printf(" %llx x%llu", (unsigned long long)value, (unsigned long long)count);
++			std::printf("\n");
++			values.clear();
++		}
++		std::printf("[webgs] 2s: vu starts %llu, VIF1 STAT %08x, reg writes:", (unsigned long long)h.vuStarts,
++		            h.vpu1->GetVif().GetRegister(0x10003C00));
++		for(const auto& [address, count] : h.vifRegWrites)
++			std::printf(" %08x x%llu (last %08x)", address, (unsigned long long)count, h.vifRegLast[address]);
++		std::printf("\n");
++		h.vuStarts = 0;
++		h.vifRegWrites.clear();
++		std::printf("[webgs] 2s: vif %llu (vu %.0f ms, %llu slices) vifreg %llu xfer %llu vsync %llu regs %llu fifo %llu gs %.0f ms, ring pending %lld KB, vu running %d\n",
++		            (unsigned long long)h.nVif, h.vuMs, (unsigned long long)h.vuSlices, (unsigned long long)h.nVifReg,
++		            (unsigned long long)h.nXfer, (unsigned long long)h.nVsync, (unsigned long long)h.nRegs,
++		            (unsigned long long)h.nFifo, h.gsMs, (long long)(Available(h) / 1024), h.vpu1->IsVuRunning() ? 1 : 0);
++		h.nVif = h.nVifReg = h.nXfer = h.nVsync = h.nRegs = h.nFifo = h.vuSlices = 0;
++		h.vuMs = h.gsMs = 0.0;
++		h.debugStart = now;
++	}
++
++	// Feeds whole quadwords of the game's VIF1 stream; a VIF waiting for the VU gets it run.
++	void FeedVif1(Host& h, const uint8_t* bytes, uint32_t size)
++	{
++		static int s_dumped = 0;
++		if(s_dumped < 12 && size >= 16)
++		{
++			s_dumped++;
++			uint32_t w[8] = {};
++			std::memcpy(w, bytes, std::min<uint32_t>(size, sizeof(w)));
++			std::printf("[webgs] vif1 #%d size %u carry %zu: %08x %08x %08x %08x %08x %08x %08x %08x\n", s_dumped, size,
++			            h.vifCarry.size(), w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
++		}
++		h.vifCarry.insert(h.vifCarry.end(), bytes, bytes + size);
++		const uint32_t whole = static_cast<uint32_t>(h.vifCarry.size()) & ~15u;
++		CVif& vif = h.vpu1->GetVif();
++		uint32_t done = 0;
++		while(done < whole)
++		{
++			const uint32_t chunk = std::min(whole - done, kVifStageSize);
++			std::memcpy(h.ram + kVifStageAddr, h.vifCarry.data() + done, chunk);
++			const uint32_t qwc = chunk / 16;
++			uint32_t consumed = 0;
++			int stalls = 0;
++			while(consumed < qwc)
++			{
++				const uint32_t n = vif.ReceiveDMA(kVifStageAddr + consumed * 16, qwc - consumed, Dmac::CChannel::CHCR_DIR_FROM, false);
++				static int s_logged = 0;
++				if(s_logged < 12)
++				{
++					s_logged++;
++					std::printf("[webgs] ReceiveDMA qwc %u -> %u, VIF STAT %08x, vu running %d\n", qwc - consumed, n,
++					            vif.GetRegister(0x10003C00), h.vpu1->IsVuRunning() ? 1 : 0);
++				}
++				consumed += n;
++				if(n == 0)
++				{
++					if(!h.vpu1->IsVuRunning() || ++stalls > 64)
++					{
++						std::printf("[webgs] VIF1 stuck, dropping %u qwords\n", qwc - consumed);
++						consumed = qwc;
++						break;
++					}
++					RunVu1(h);
++				}
++			}
++			done += chunk;
++		}
++		h.vifCarry.erase(h.vifCarry.begin(), h.vifCarry.begin() + whole);
++		RunVu1(h); // MSCAL at the end of the chunk
++	}
++
++	void Transfer(Host& h, uint8_t path, const uint8_t* data, uint32_t size)
++	{
++		const unsigned pathIndex = path == kPath1New ? 1 : path == kPath2 ? 2 : path == kPath3 ? 3 : 0;
++		if(!pathIndex || !size)
++			return;
++		h.pathBytes[pathIndex] += size;
++		uint32_t done = 0;
++		int stalls = 0;
++		while(done < size)
++		{
++			const uint32_t n = h.gif->ProcessMultiplePackets(data, size, done, size, CGsPacketMetadata(pathIndex));
++			if(n == 0)
++			{
++				// Another path has the GIF: let the VU finish its XGKICK first.
++				RunVu1(h);
++				if(++stalls > 64)
++				{
++					std::printf("[webgs] GIF path %u busy, dropping %u bytes\n", pathIndex, size - done);
++					break;
++				}
++				continue;
++			}
++			done += n;
++		}
++	}
++
++	// Processes whole packets until a vsync (drawn) or the data runs out. True if a frame was drawn.
++	bool ProcessPackets(Host& h)
++	{
++		if(!h.headerDone)
++		{
++			if(Available(h) < 8)
++				return false;
++			const uint32_t crc = PeekValue<uint32_t>(h, 0);
++			const uint32_t headerSize = PeekValue<uint32_t>(h, 4);
++			uint64_t stateSize = headerSize;
++			uint64_t headerBytes = 0;
++			if(crc == 0xFFFFFFFFu)
++			{
++				headerBytes = headerSize;
++				if(Available(h) < 8 + headerBytes)
++					return false;
++				std::vector<uint8_t> header(headerBytes);
++				Peek(h, 8, header.data(), headerBytes);
++				uint32_t dumpStateSize = 0;
++				std::memcpy(&dumpStateSize, header.data() + 4, sizeof(dumpStateSize)); // GSDumpHeader.state_size
++				stateSize = dumpStateSize;
++			}
++			const uint64_t total = 8 + headerBytes + stateSize + kPrivRegsSize;
++			if(Available(h) < total)
++				return false;
++			Peek(h, 8 + headerBytes + stateSize, h.privRegs.data(), kPrivRegsSize);
++			Consume(h, total);
++			ApplyPrivRegisters(h);
++			h.headerDone = true;
++			std::printf("[webgs] live GS stream connected\n");
++		}
++
++		for(;;)
++		{
++			if(g_debug)
++				DebugStats(h);
++			const uint64_t avail = Available(h);
++			if(avail < 1)
++				return false;
++			const uint8_t id = PeekValue<uint8_t>(h, 0);
++			switch(id)
++			{
++			case kTypeLiveVif1:
++			{
++				if(avail < 5)
++					return false;
++				const uint32_t length = PeekValue<uint32_t>(h, 1);
++				if(avail < 5ull + length)
++					return false;
++				h.packet.resize(length);
++				Peek(h, 5, h.packet.data(), length);
++				Consume(h, 5ull + length);
++				h.nVif++;
++				FeedVif1(h, h.packet.data(), length & ~3u);
++				break;
++			}
++			case kTypeLiveVif1Reg:
++			{
++				if(avail < 9)
++					return false;
++				const uint32_t address = PeekValue<uint32_t>(h, 1);
++				const uint32_t value = PeekValue<uint32_t>(h, 5);
++				Consume(h, 9);
++				h.nVifReg++;
++				h.vifRegWrites[address]++;
++				h.vifRegLast[address] = value;
++				h.vpu1->GetVif().SetRegister(address, value);
++				break;
++			}
++			case kTypeTransfer:
++			{
++				if(avail < 6)
++					return false;
++				const uint8_t path = PeekValue<uint8_t>(h, 1);
++				const uint32_t length = PeekValue<uint32_t>(h, 2);
++				if(avail < 6ull + length)
++					return false;
++				h.packet.resize(length);
++				Peek(h, 6, h.packet.data(), length);
++				Consume(h, 6ull + length);
++				h.nXfer++;
++				Transfer(h, path, h.packet.data(), length);
++				break;
++			}
++			case kTypeVSync:
++			{
++				if(avail < 2)
++					return false;
++				Consume(h, 2);
++				h.nVsync++;
++				h.totalVsyncs++;
++				if(g_dumpRequested)
++				{
++					// F8: GS RAM of the main menu's V3 logo, as T8 128x128 (TBP 0x2b40, TBW 2)
++					g_dumpRequested = false;
++					uint8* gsRam = h.gs->GetRam();
++					CGsPixelFormats::CPixelIndexorPSMT8 t8(gsRam, 0x2b40 * 256, 2);
++					for(uint32_t y = 0; y < 128; y++)
++					{
++						std::printf("[dump] t8 %3u ", y);
++						for(uint32_t x = 0; x < 128; x++)
++							std::printf("%02x", t8.GetPixel(x, y));
++						std::printf("\n");
++					}
++					CGsPixelFormats::CPixelIndexorPSMCT32 res(gsRam, 0x2b40 * 256, 1);
++					for(uint32_t y = 0; y < 64; y++)
++					{
++						std::printf("[dump] r %3u ", y);
++						for(uint32_t x = 0; x < 64; x++)
++							std::printf("%08x", res.GetPixel(x, y));
++						std::printf("\n");
++					}
++					CGsPixelFormats::CPixelIndexorPSMCT32 srcA(gsRam, 0x2b80 * 256, 1);
++					for(uint32_t y = 0; y < 32; y++)
++					{
++						std::printf("[dump] a %3u ", y);
++						for(uint32_t x = 0; x < 16; x++)
++							std::printf("%08x", srcA.GetPixel(x, y));
++						std::printf("\n");
++					}
++					CGsPixelFormats::CPixelIndexorPSMT8 srcB(gsRam, 0x2bc0 * 256, 2);
++					for(uint32_t y = 0; y < 64; y++)
++					{
++						std::printf("[dump] b %3u ", y);
++						for(uint32_t x = 0; x < 64; x++)
++							std::printf("%02x", srcB.GetPixel(x, y));
++						std::printf("\n");
++					}
++					CGsPixelFormats::CPixelIndexorPSMCT32 clut(gsRam, 0x3ffc * 256, 1);
++					std::printf("[dump] clut ");
++					for(uint32_t i = 0; i < 256; i++)
++						std::printf("%08x", clut.GetPixel(i % 16, i / 16));
++					std::printf("\n");
++					const uint64* r = h.gs->GetRegisters();
++					std::printf("[dump] regs alpha2 %llx clamp2 %llx tex1_2 %llx texa %llx colclamp %llx test2 %llx pabe %llx fba2 %llx dthe %llx\n",
++					            (unsigned long long)r[0x43], (unsigned long long)r[0x09], (unsigned long long)r[0x15], (unsigned long long)r[0x3b],
++					            (unsigned long long)r[0x46], (unsigned long long)r[0x48], (unsigned long long)r[0x49], (unsigned long long)r[0x4b], (unsigned long long)r[0x45]);
++				}
++				if(g_traceState == 2)
++				{
++					h.gsWeb->traceOn = false;
++					g_traceState = 0;
++					std::printf("[trace] end\n");
++				}
++				else if(g_traceState == 1)
++				{
++					g_traceState = 2;
++					h.gsWeb->traceOn = true;
++					h.gsWeb->traceLines = 0;
++					std::printf("[trace] begin\n");
++				}
++				const double gsStart = emscripten_get_now();
++				h.gs->SetVBlank();
++				h.gsWeb->Pump();
++				h.gs->ResetVBlank();
++				h.gsMs += emscripten_get_now() - gsStart;
++				h.frames++;
++				return true;
++			}
++			case kTypeReadFifo2:
++			{
++				if(avail < 5)
++					return false;
++				const uint32_t qwc = PeekValue<uint32_t>(h, 1);
++				Consume(h, 5);
++				h.nFifo++;
++				h.gsWeb->Pump();
++				std::vector<uint8_t> discard((static_cast<size_t>(qwc) + 1) * 16);
++				h.gs->ReadImageData(discard.data(), qwc * 16);
++				h.gsWeb->Pump();
++				break;
++			}
++			case kTypeRegisters:
++			{
++				if(avail < 1 + kPrivRegsSize)
++					return false;
++				Peek(h, 1, h.privRegs.data(), kPrivRegsSize);
++				Consume(h, 1 + kPrivRegsSize);
++				h.nRegs++;
++				ApplyPrivRegisters(h);
++				break;
++			}
++			default:
++				std::printf("[webgs] unknown packet 0x%02X, stopping\n", id);
++				h.ring->consumerQuit = 1;
++				return false;
++			}
++		}
++	}
++
++	// Follows the canvas' size on the page (window resize, fullscreen): drawing buffer and GS
++	// presentation in device pixels.
++	void UpdatePresentation(Host& h)
++	{
++		double cssWidth = 0.0, cssHeight = 0.0;
++		emscripten_get_element_css_size("#canvas", &cssWidth, &cssHeight);
++		const double ratio = emscripten_get_device_pixel_ratio();
++		const uint32 width = static_cast<uint32>(cssWidth * ratio + 0.5);
++		const uint32 height = static_cast<uint32>(cssHeight * ratio + 0.5);
++		if(width == 0 || height == 0 || (width == h.presentWidth && height == h.presentHeight))
++			return;
++		h.presentWidth = width;
++		h.presentHeight = height;
++		emscripten_set_canvas_element_size("#canvas", static_cast<int>(width), static_cast<int>(height));
++		CGSHandler::PRESENTATION_PARAMS presentation;
++		presentation.mode = CGSHandler::PRESENTATION_MODE_FIT;
++		presentation.windowWidth = width;
++		presentation.windowHeight = height;
++		h.gs->SetPresentationParams(presentation);
++	}
++
++	EM_BOOL OnAnimationFrame(double time, void*)
++	{
++		Host& h = *g_host;
++		UpdatePresentation(h);
++		PublishPad(h.ring);
++		// The game paces itself at 60. Frames queued behind (a load, a hitch) are drawn now, within
++		// ~10 ms of this browser frame, so the picture never lags the game for long; only the
++		// last one is shown.
++		const double start = emscripten_get_now();
++		for(int i = 0; i < 8; i++)
++		{
++			if(!ProcessPackets(h))
++				break;
++			if(i >= 1 && emscripten_get_now() - start > 10.0)
++				break;
++		}
++		if(h.statsStart == 0.0)
++			h.statsStart = time; // rAF time is page-relative; emscripten_get_now() is absolute with pthreads
++		if(time - h.statsStart >= 5000.0)
++		{
++			std::printf("[webgs] %.1f game fps on screen\n", h.frames * 1000.0 / (time - h.statsStart));
++			h.frames = 0;
++			h.statsStart = time;
++		}
++		return h.ring->producerAlive ? EM_TRUE : EM_FALSE;
++	}
++
++	void RegisterJitFunctions()
++	{
++		using Jitter::CWasmFunctionRegistry;
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&EmptyBlockHandler), "_EmptyBlockHandler", "vi");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetByteProxy), "_MemoryUtils_GetByteProxy", "iii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetHalfProxy), "_MemoryUtils_GetHalfProxy", "iii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetWordProxy), "_MemoryUtils_GetWordProxy", "iii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_GetDoubleProxy), "_MemoryUtils_GetDoubleProxy", "jii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_SetByteProxy), "_MemoryUtils_SetByteProxy", "viii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_SetHalfProxy), "_MemoryUtils_SetHalfProxy", "viii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_SetWordProxy), "_MemoryUtils_SetWordProxy", "viii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&MemoryUtils_SetDoubleProxy), "_MemoryUtils_SetDoubleProxy", "viji");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&LWL_Proxy), "_LWL_Proxy", "iiii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&LWR_Proxy), "_LWR_Proxy", "iiii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&LDL_Proxy), "_LDL_Proxy", "jiji");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&LDR_Proxy), "_LDR_Proxy", "jiji");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&SWL_Proxy), "_SWL_Proxy", "viii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&SWR_Proxy), "_SWR_Proxy", "viii");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&SDL_Proxy), "_SDL_Proxy", "viji");
++		CWasmFunctionRegistry::RegisterFunction(reinterpret_cast<uintptr_t>(&SDR_Proxy), "_SDR_Proxy", "viji");
++	}
++
++	// Main thread: builds the GS/VIF1/VU1/GIF and starts the frame loop.
++	void StartOnMainThread(void* arg)
++	{
++		auto* ring = static_cast<ps2live::RingHeader*>(arg);
++		RegisterJitFunctions();
++
++		EmscriptenWebGLContextAttributes attr;
++		emscripten_webgl_init_context_attributes(&attr);
++		attr.majorVersion = 2;
++		attr.minorVersion = 0;
++		attr.alpha = EM_FALSE;
++		attr.antialias = EM_FALSE;
++		attr.preserveDrawingBuffer = EM_TRUE; // a vsync without changes keeps the last picture
++		attr.powerPreference = EM_WEBGL_POWER_PREFERENCE_HIGH_PERFORMANCE;
++		g_context = emscripten_webgl_create_context("#canvas", &attr);
++		if(g_context <= 0)
++		{
++			std::printf("[webgs] WebGL2 is not available (%d)\n", static_cast<int>(g_context));
++			ring->consumerQuit = 1;
++			return;
++		}
++
++		Host* h = new Host();
++		h->ring = ring;
++		h->ringData = ps2live::ringData(ring);
++		h->ringCapacity = ring->capacity;
++		h->ram = static_cast<uint8*>(std::aligned_alloc(16, PS2::EE_RAM_SIZE));
++		h->spr = static_cast<uint8*>(std::aligned_alloc(16, PS2::EE_SPR_SIZE));
++		h->vuMem0 = static_cast<uint8*>(std::aligned_alloc(16, PS2::VUMEM0SIZE));
++		h->vuMem1 = static_cast<uint8*>(std::aligned_alloc(16, PS2::VUMEM1SIZE));
++		h->microMem1 = new uint8[PS2::MICROMEM1SIZE];
++		std::memset(h->ram, 0, PS2::EE_RAM_SIZE);
++		std::memset(h->vuMem1, 0, PS2::VUMEM1SIZE);
++		std::memset(h->microMem1, 0, PS2::MICROMEM1SIZE);
++
++		// Internal resolution: <page>?scale=N (1 = native PS2, default 2)
++		const int scale = EM_ASM_INT({
++			const value = parseInt(new URLSearchParams(location.search).get('scale') || '2', 10);
++			return value >= 1 && value <= 4 ? value : 2;
++		});
++		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
++		CGSH_OpenGL::RegisterPreferences();
++		CAppConfig::GetInstance().SetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR, scale);
++		std::printf("[webgs] internal resolution x%d\n", scale);
++
++		h->dmac = std::make_unique<CDMAC>(h->ram, h->spr, h->vuMem0, h->vuMem1, h->ee);
++		h->gsWeb = new CGSH_Web(g_context);
++		h->gsWeb->debug = g_debug;
++		h->gs = h->gsWeb;
++		h->gs->SetIntc(&h->intc);
++		h->gif = std::make_unique<CGIF>(h->gs, *h->dmac, h->ram, h->spr);
++		h->vpu1 = std::make_shared<CVpu>(1, CVpu::VPUINIT(h->microMem1, h->vuMem1, &h->vu1), *h->gif, h->intc, h->ram, h->spr);
++
++		// VU1 context, as Play!'s EE subsystem sets it up.
++		CMIPS& vu1 = h->vu1;
++		vu1.m_executor = std::make_unique<CVuExecutor>(vu1, PS2::MICROMEM1SIZE);
++		vu1.m_pMemoryMap->InsertReadMap(0x00000000, 0x00003FFF, h->vuMem1, 0x00);
++		vu1.m_pMemoryMap->InsertReadMap(0x00008000, 0x00008FFF, [h](uint32 address, uint32) -> uint32 {
++			if(address == CVpu::VU_ADDR_ITOP)
++				return h->vpu1->GetVif().GetITOP();
++			if(address == CVpu::VU_ADDR_TOP)
++				return h->vpu1->GetVif().GetTOP();
++			return 0xCCCCCCCC;
++		}, 0x01);
++		vu1.m_pMemoryMap->InsertWriteMap(0x00000000, 0x00003FFF, h->vuMem1, 0x00);
++		vu1.m_pMemoryMap->InsertWriteMap(0x00008000, 0x00008FFF, [h](uint32 address, uint32 value) -> uint32 {
++			if(address == CVpu::VU_ADDR_XGKICK)
++			{
++				h->xgkicks++;
++				h->vpu1->ProcessXgKick(value);
++			}
++			return 0;
++		}, 0x01);
++		vu1.m_pMemoryMap->InsertInstructionMap(0x00000000, 0x00003FFF, h->microMem1, 0x01);
++		vu1.m_pArch = &h->maVu1;
++		vu1.m_pAddrTranslator = CMIPS::TranslateAddress64;
++		vu1.m_vuMem = h->vuMem1;
++
++		h->newFrameConnection = h->gs->OnNewFrame.Connect([h](uint32 drawCalls) { h->drawCalls += drawCalls; });
++		h->flipConnection = h->gs->OnFlipComplete.Connect([h]() { h->flips++; });
++		h->vuStateConnection = h->vpu1->VuStateChanged.Connect([h](CVpu::VU_STATE state) {
++			if(state == CVpu::VU_STATE_RUNNING)
++				h->vuStarts++;
++		});
++		h->gs->Initialize();
++		h->gsWeb->Pump();
++		CGSHandler::PRESENTATION_PARAMS presentation;
++		presentation.mode = CGSHandler::PRESENTATION_MODE_FIT;
++		double cssWidth = 1280.0, cssHeight = 960.0;
++		emscripten_get_element_css_size("#canvas", &cssWidth, &cssHeight);
++		const double ratio = emscripten_get_device_pixel_ratio();
++		presentation.windowWidth = static_cast<uint32>(cssWidth * ratio);
++		presentation.windowHeight = static_cast<uint32>(cssHeight * ratio);
++		emscripten_set_canvas_element_size("#canvas", static_cast<int>(presentation.windowWidth), static_cast<int>(presentation.windowHeight));
++		h->gs->SetPresentationParams(presentation);
++		h->gs->Reset();
++		h->vpu1->Reset();
++		h->gsWeb->Pump();
++
++		emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
++		emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
++		emscripten_set_blur_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnBlur);
++
++		ring->consumerAlive = 1;
++		ring->consumerFlags = 1; // never waits on the data event: no wake-ups needed
++		g_host = h;
++		h->statsStart = 0.0;
++		std::printf("[webgs] GS host started (Play! GS on WebGL2, VU1 JIT to WebAssembly)\n");
++		emscripten_request_animation_frame_loop(&OnAnimationFrame, nullptr);
++	}
++} // namespace
++
++// Called by gs_dump_writer.cpp on the game's thread when PS2X_GS_LIVE=1.
++bool ps2xWebStartGsHost(ps2live::RingHeader* header)
++{
++	emscripten_async_run_in_main_runtime_thread(EM_FUNC_SIG_VI, &StartOnMainThread, header);
++	return true;
++}
+diff --git a/ps2xRuntime/web/raylib_headless.cpp b/ps2xRuntime/web/raylib_headless.cpp
+new file mode 100644
+index 0000000..ac06b4b
+--- /dev/null
++++ b/ps2xRuntime/web/raylib_headless.cpp
+@@ -0,0 +1,122 @@
++// Headless raylib for the WebAssembly build: the subset of raylib the runtime uses, with no
++// window or input (the page reads those), and audio handed to the platform. The main loop still runs at the target FPS
++// (EndDrawing paces it) and PS2X_WASM_SECONDS makes WindowShouldClose() end the run.
++
++#include "raylib.h"
++
++#include <chrono>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <thread>
++
++namespace
++{
++    using Clock = std::chrono::steady_clock;
++    int s_targetFps = 60;
++    Clock::time_point s_start = Clock::now();
++    Clock::time_point s_nextFrame = Clock::now();
++    double s_runSeconds = []
++    {
++        const char* value = std::getenv("PS2X_WASM_SECONDS");
++        return value && *value ? std::atof(value) : 0.0;
++    }();
++} // namespace
++
++void InitWindow(int, int, const char*) { s_start = s_nextFrame = Clock::now(); }
++void CloseWindow(void) {}
++void SetConfigFlags(unsigned int) {}
++bool IsWindowReady(void) { return false; } // no input backend: the pad code skips raylib
++bool WindowShouldClose(void)
++{
++    return s_runSeconds > 0.0 && std::chrono::duration<double>(Clock::now() - s_start).count() >= s_runSeconds;
++}
++void SetTargetFPS(int fps) { s_targetFps = fps > 0 ? fps : 60; }
++int GetScreenWidth(void) { return 640; }
++int GetScreenHeight(void) { return 448; }
++
++void BeginDrawing(void) {}
++void EndDrawing(void)
++{
++    s_nextFrame += std::chrono::microseconds(1000000 / s_targetFps);
++    const Clock::time_point now = Clock::now();
++    if (s_nextFrame < now)
++        s_nextFrame = now;
++    std::this_thread::sleep_until(s_nextFrame);
++}
++void ClearBackground(Color) {}
++void DrawTexturePro(Texture2D, Rectangle, Rectangle, Vector2, float, Color) {}
++
++Image GenImageColor(int width, int height, Color)
++{
++    Image image{};
++    image.width = width;
++    image.height = height;
++    image.mipmaps = 1;
++    image.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
++    return image; // no pixel data: textures are never drawn
++}
++void UnloadImage(Image) {}
++Texture2D LoadTextureFromImage(Image image)
++{
++    Texture2D texture{};
++    texture.width = image.width;
++    texture.height = image.height;
++    texture.mipmaps = 1;
++    texture.format = image.format;
++    return texture;
++}
++void UpdateTexture(Texture2D, const void*) {}
++void UnloadTexture(Texture2D) {}
++
++bool IsKeyDown(int) { return false; }
++bool IsKeyPressed(int) { return false; }
++bool IsGamepadAvailable(int) { return false; }
++bool IsGamepadButtonDown(int, int) { return false; }
++float GetGamepadAxisMovement(int, int) { return 0.0f; }
++
++// Audio goes to the platform (web_platform.cpp: a ring buffer read by an AudioWorklet;
++// node_platform.cpp: none). Only the runtime's 48 kHz 16-bit stereo stream is supported.
++bool ps2xHostAudioInit();
++bool ps2xHostAudioWantsFrames(int frames);
++void ps2xHostAudioWrite(const int16_t* samples, int frames);
++
++namespace
++{
++    bool s_audioReady = false;
++}
++
++void InitAudioDevice(void) { s_audioReady = ps2xHostAudioInit(); }
++void CloseAudioDevice(void) { s_audioReady = false; }
++bool IsAudioDeviceReady(void) { return s_audioReady; }
++void SetAudioStreamBufferSizeDefault(int) {}
++AudioStream LoadAudioStream(unsigned int sampleRate, unsigned int sampleSize, unsigned int channels)
++{
++    AudioStream stream{};
++    stream.sampleRate = sampleRate;
++    stream.sampleSize = sampleSize;
++    stream.channels = channels;
++    return stream;
++}
++void UnloadAudioStream(AudioStream) {}
++void UpdateAudioStream(AudioStream, const void* data, int frames)
++{
++    ps2xHostAudioWrite(static_cast<const int16_t*>(data), frames);
++}
++void PlayAudioStream(AudioStream) {}
++bool IsAudioStreamProcessed(AudioStream) { return s_audioReady && ps2xHostAudioWantsFrames(1024); }
++bool IsAudioStreamValid(AudioStream stream)
++{
++    return s_audioReady && stream.sampleRate == 48000 && stream.sampleSize == 16 && stream.channels == 2;
++}
++void StopAudioStream(AudioStream) {}
++
++Wave LoadWaveFromMemory(const char*, const unsigned char*, int) { return Wave{}; }
++void UnloadWave(Wave) {}
++Sound LoadSoundFromWave(Wave) { return Sound{}; }
++void UnloadSound(Sound) {}
++void PlaySound(Sound) {}
++void StopSound(Sound) {}
++bool IsSoundPlaying(Sound) { return false; }
++void SetSoundVolume(Sound, float) {}
++void SetSoundPitch(Sound, float) {}
+diff --git a/ps2xRuntime/web/site/index.html b/ps2xRuntime/web/site/index.html
+new file mode 100644
+index 0000000..54446f7
+--- /dev/null
++++ b/ps2xRuntime/web/site/index.html
+@@ -0,0 +1,184 @@
++<!doctype html>
++<html lang="es">
++<head>
++<meta charset="utf-8">
++<meta name="viewport" content="width=device-width, initial-scale=1">
++<title>NBA Street V3</title>
++<style>
++  :root { color-scheme: dark; --bg: #0b0b0d; --fg: #e8e6e3; --dim: #8b8a88; --accent: #e8792b; }
++  * { box-sizing: border-box; }
++  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
++  main { height: 100%; display: grid; grid-template-rows: 1fr auto; }
++  #stage { position: relative; display: grid; place-items: center; overflow: hidden; }
++  #canvas { width: min(100vw, calc((100vh - 40px) * 4 / 3)); aspect-ratio: 4 / 3; background: #000; outline: none; }
++  /* Fullscreen: the whole screen; the game keeps 4:3 inside (black bars) */
++  #stage:fullscreen { background: #000; }
++  #stage:fullscreen #canvas { width: 100vw; height: 100vh; aspect-ratio: auto; }
++  #status { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; text-align: center; }
++  #status[hidden] { display: none; }
++  #status b { display: block; font-size: 18px; margin-bottom: 6px; }
++  #play { pointer-events: auto; margin-top: 18px; font: 600 16px system-ui, sans-serif; color: #111; background: var(--accent);
++          border: 0; border-radius: 6px; padding: 10px 28px; cursor: pointer; }
++  #bar { width: 260px; height: 4px; background: #222; border-radius: 2px; overflow: hidden; margin: 10px auto 0; }
++  #bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
++  footer { display: flex; gap: 16px; align-items: center; padding: 8px 16px; color: var(--dim); font-size: 12px; }
++  footer button { background: none; border: 1px solid #333; color: var(--fg); border-radius: 4px; padding: 3px 8px; cursor: pointer; }
++  #log { display: none; position: fixed; right: 0; bottom: 36px; width: min(640px, 100vw); height: 40vh; overflow: auto;
++         background: rgba(0,0,0,.85); color: #bdbdbd; font: 11px/1.35 ui-monospace, monospace; padding: 8px; white-space: pre-wrap; }
++  #log.open { display: block; }
++</style>
++</head>
++<body>
++<main>
++  <div id="stage">
++    <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
++    <div id="status"><div><b id="statusTitle">Cargando…</b><span id="statusText">Descargando el juego (solo la primera vez)</span><div id="bar"><i></i></div>
++      <button id="play">▶ Jugar</button></div></div>
++  </div>
++  <footer>
++    <span>Flechas/WASD · Z X C V · Q E 1 3 · Enter = START · mando compatible</span>
++    <span id="fps"></span>
++    <button id="sound" hidden>Activar sonido</button>
++    <span style="flex:1"></span>
++    <button id="full">Pantalla completa</button>
++    <button id="logBtn">Log</button>
++  </footer>
++</main>
++<pre id="log"></pre>
++<script>
++  const log = document.getElementById('log');
++  const statusBox = document.getElementById('status');
++  const statusTitle = document.getElementById('statusTitle');
++  const statusText = document.getElementById('statusText');
++  const bar = document.querySelector('#bar i');
++  const fps = document.getElementById('fps');
++  const lines = [];
++  const maxLines = new URLSearchParams(location.search).has('debug') ? 400000 : 2000;
++  function append(text) {
++    text = text.replace(/\[MC\][^\[]*/g, ''); // memory card chatter (several lines per frame)
++    if (!text.trim()) return;
++    lines.push(text);
++    if (lines.length > maxLines) lines.splice(0, maxLines / 4);
++    if (log.classList.contains('open')) { log.textContent = lines.join('\n'); log.scrollTop = log.scrollHeight; }
++    const m = /\[webgs\] ([\d.]+) game fps/.exec(text);
++    if (m) fps.textContent = m[1] + ' fps';
++    if (text.includes('[webgs] live GS stream connected')) statusBox.hidden = true;
++  }
++  document.getElementById('logBtn').onclick = () => { log.classList.toggle('open'); log.textContent = lines.join('\n'); };
++  document.getElementById('full').onclick = () => document.getElementById('stage').requestFullscreen?.();
++  if (!crossOriginIsolated) {
++    statusTitle.textContent = 'El navegador no permite hilos aquí';
++    statusText.textContent = 'La página necesita las cabeceras COOP/COEP del servidor.';
++  }
++  let audioContext = null;
++  var Module = {
++    canvas: document.getElementById('canvas'),
++    print: append,
++    printErr: append,
++    setStatus: (text) => {
++      const m = /\((\d+(\.\d+)?)\/(\d+)\)/.exec(text);
++      if (m) bar.style.width = (100 * m[1] / m[3]).toFixed(1) + '%';
++    },
++    onAbort: (what) => { statusBox.hidden = false; statusTitle.textContent = 'Se detuvo'; statusText.textContent = String(what); },
++    monitorRunDependencies: (left) => { if (!left) { statusText.textContent = 'Arrancando el juego…'; bar.style.width = '100%'; } },
++    // The game starts on the "Jugar" click: browsers only allow sound after one, and this way the
++    // sound is there from the first video. The download goes on meanwhile.
++    preRun: [() => Module.addRunDependency('play-click')],
++  };
++  const playButton = document.getElementById('play');
++  playButton.onclick = () => {
++    playButton.remove();
++    audioContext = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
++    audioContext.resume();
++    document.getElementById('canvas').focus();
++    Module.removeRunDependency('play-click');
++  };
++  document.getElementById('canvas').focus();
++
++  // Sound: the game writes 48 kHz stereo into a ring buffer in its (shared) memory and this
++  // worklet plays it from there. Browsers only start audio after a click or a key press.
++  const audioWorklet = `
++    class Ps2xOutput extends AudioWorkletProcessor {
++      constructor(options) {
++        super();
++        const o = options.processorOptions;
++        this.ring = new Int16Array(o.buffer, o.ring, o.frames * 2);
++        this.index = new Uint32Array(o.buffer, o.index, 2);
++        this.frames = o.frames;
++        this.waiting = true;
++        this.lastL = this.lastR = 0;
++        this.underruns = this.skips = this.blocks = 0;
++        this.frac = 0;
++        this.level = 2400;
++        this.capture = null;
++        this.port.onmessage = (e) => { if (e.data === 'capture') this.capture = []; };
++      }
++      sample(pos) {
++        const k = (pos % this.frames) * 2;
++        return [this.ring[k] / 32768, this.ring[k + 1] / 32768];
++      }
++      process(inputs, outputs) {
++        const left = outputs[0][0], right = outputs[0][1];
++        const written = Atomics.load(this.index, 0);
++        let read = Atomics.load(this.index, 1);
++        let queued = (written - read) >>> 0;
++        if (queued > 14000) { read = (written - 2400) >>> 0; queued = 2400; this.frac = 0; this.skips++; }
++        if (this.waiting && queued >= 1600) this.waiting = false;
++        if (!this.waiting && queued < left.length + 2) { this.waiting = true; this.underruns++; }
++        // The game's clock and the sound card's differ (the game makes ~49 kHz): play slightly
++        // faster or slower (up to 4%) to keep ~60 ms queued, instead of dropping samples (clicks)
++        this.level += (queued - this.level) * 0.01;
++        const step = 1 + Math.max(-0.04, Math.min(0.04, (this.level - 2400) / 2400 * 0.06));
++        for (let i = 0; i < left.length; i++) {
++          if (!this.waiting && ((written - read) >>> 0) > 1) {
++            const [l0, r0] = this.sample(read), [l1, r1] = this.sample((read + 1) >>> 0);
++            this.lastL = l0 + (l1 - l0) * this.frac;
++            this.lastR = r0 + (r1 - r0) * this.frac;
++            this.frac += step;
++            const whole = Math.floor(this.frac);
++            this.frac -= whole;
++            read = (read + whole) >>> 0;
++          } else {
++            this.lastL *= 0.995; this.lastR *= 0.995;
++          }
++          left[i] = this.lastL;
++          right[i] = this.lastR;
++          if (this.capture && !this.waiting) { this.capture.push(this.lastL); if (this.capture.length >= 48000 * 8) { this.port.postMessage({ capture: this.capture }); this.capture = null; } }
++        }
++        Atomics.store(this.index, 1, read);
++        if (++this.blocks % 1500 === 0) {
++          const produced = ((written - (this.lastWritten ?? written)) >>> 0) / (currentTime - (this.lastTime ?? currentTime) || 1);
++          this.lastWritten = written; this.lastTime = currentTime;
++          this.port.postMessage({ underruns: this.underruns, skips: this.skips, queued, step, produced });
++        }
++        return true;
++      }
++    }
++    registerProcessor('ps2x-output', Ps2xOutput);`;
++  async function ps2xStartAudio(buffer, ring, frames, index) {
++    audioContext ??= new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
++    const url = URL.createObjectURL(new Blob([audioWorklet], { type: 'text/javascript' }));
++    await audioContext.audioWorklet.addModule(url);
++    const node = new AudioWorkletNode(audioContext, 'ps2x-output', {
++      numberOfInputs: 0, outputChannelCount: [2],
++      processorOptions: { buffer, ring, frames, index },
++    });
++    node.connect(audioContext.destination);
++    node.port.onmessage = (e) => {
++      if (e.data.capture) { window.ps2xAudioCapture = e.data.capture; return; }
++      append(`[audio] underruns ${e.data.underruns}, skips ${e.data.skips}, queued ${e.data.queued}, rate ${e.data.step.toFixed(4)}, game makes ${e.data.produced.toFixed(0)} Hz`);
++    };
++    window.ps2xAudioNode = node;
++    if (audioContext.state !== 'running') sound.hidden = false;
++  }
++  const sound = document.getElementById('sound');
++  function resumeAudio() {
++    if (audioContext && audioContext.state !== 'running') audioContext.resume().then(() => { sound.hidden = true; });
++  }
++  for (const type of ['pointerdown', 'keydown']) window.addEventListener(type, resumeAudio, { capture: true });
++  window.addEventListener('gamepadconnected', resumeAudio);
++  sound.onclick = resumeAudio;
++</script>
++<script src="ps2EntryRunner.js"></script>
++</body>
++</html>
+diff --git a/ps2xRuntime/web/web_platform.cpp b/ps2xRuntime/web/web_platform.cpp
+new file mode 100644
+index 0000000..393f9ac
+--- /dev/null
++++ b/ps2xRuntime/web/web_platform.cpp
+@@ -0,0 +1,130 @@
++// Browser platform for the WebAssembly build, run at the start of main() (on a worker: the build
++// uses PROXY_TO_PTHREAD, so the page's main thread stays free for the GS host).
++//
++// Files (WasmFS):
++//   /game        fetch backend on <page>/data/: read on demand in 1 MB HTTP Range requests,
++//                so the 4.7 GB ISO is never downloaded whole, only the sectors the game reads
++//   /saves/mc0   OPFS (the browser's private file system): the memory card survives reloads
++// Environment: the GS host is the page (PS2X_GS_LIVE=1), no network yet.
++// Audio: the runtime's 48 kHz stereo stream goes into a ring buffer in the wasm memory, which an
++// AudioWorklet on the page reads directly (the memory is a SharedArrayBuffer).
++
++#include <emscripten.h>
++#include <emscripten/wasmfs.h>
++
++#include <atomic>
++#include <cerrno>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fcntl.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++// Opens a file the way the runtime will and reports what WasmFS answers (size, first bytes).
++static void ProbeFile(const char* path)
++{
++	const int fd = open(path, O_RDONLY);
++	if(fd < 0)
++	{
++		std::printf("[web] %s: open failed (%s)\n", path, std::strerror(errno));
++		return;
++	}
++	const off_t size = lseek(fd, 0, SEEK_END);
++	lseek(fd, 0, SEEK_SET);
++	unsigned char head[4] = {};
++	const ssize_t got = read(fd, head, sizeof(head));
++	std::printf("[web] %s: size %lld, read %d -> %02x %02x %02x %02x\n", path, static_cast<long long>(size),
++	            static_cast<int>(got), head[0], head[1], head[2], head[3]);
++	close(fd);
++}
++
++// web/disc_files.inc: the disc files the game opens through cdrom0: besides the raw ISO sectors
++// (found with PS2X_VFS_LOG=1), served under data/iso/.
++static const char* const kDiscFiles[] = {
++#include "disc_files.inc"
++};
++
++void ps2xWasmPlatformInit(int& argc, char**& argv)
++{
++	backend_t data = wasmfs_create_fetch_backend("data", 1u << 20);
++	int rc = wasmfs_create_directory("/game", 0777, data);
++	std::printf("[web] mkdir /game -> %d\n", rc);
++	rc = wasmfs_create_file("/game/NBAStreetV3.iso", 0444, data);
++	std::printf("[web] create /game/NBAStreetV3.iso -> %d\n", rc);
++	if(rc >= 0)
++		close(rc);
++	rc = mkdir("/game/iso", 0777); // a directory in the fetch backend: its files map to data/iso/
++	std::printf("[web] mkdir /game/iso -> %d\n", rc);
++	for(const char* name : kDiscFiles)
++	{
++		char path[256];
++		std::snprintf(path, sizeof(path), "/game/iso/%s", name);
++		rc = wasmfs_create_file(path, 0444, data);
++		std::printf("[web] create %s -> %d\n", path, rc);
++		if(rc >= 0)
++			close(rc);
++	}
++	ProbeFile("/game/iso/SLUS_211.26");
++	ProbeFile("/game/NBAStreetV3.iso");
++
++	backend_t opfs = wasmfs_create_opfs_backend();
++	wasmfs_create_directory("/saves", 0777, opfs);
++	mkdir("/saves/mc0", 0777);
++
++	setenv("PS2X_GS_LIVE", "1", 1);
++	// The page reads keyboard and gamepads and publishes them in the live ring; the raylib pad
++	// backend is headless here and would answer "no buttons" ahead of it.
++	setenv("PS2X_NO_GAMEPAD", "1", 1);
++	setenv("PS2X_MC_ROOT", "/saves/mc0", 1);
++	setenv("PS2X_CD_IMAGE", "/game/NBAStreetV3.iso", 1);
++	chdir("/game/iso");
++
++	static char arg0[] = "ps2EntryRunner";
++	static char arg1[] = "/game/iso/SLUS_211.26";
++	static char* args[] = {arg0, arg1, nullptr};
++	argc = 2;
++	argv = args;
++	std::printf("[web] files: /game -> data/ (on demand), saves: OPFS\n");
++}
++
++namespace
++{
++	// Single producer (the game thread) and single consumer (the AudioWorklet), counted in frames.
++	constexpr uint32_t kAudioRingFrames = 16384; // ~340 ms
++	alignas(16) int16_t g_audioRing[kAudioRingFrames * 2];
++	alignas(8) std::atomic<uint32_t> g_audioIndex[2]; // [0] written, [1] read (by the worklet)
++}
++
++bool ps2xHostAudioInit()
++{
++	// The page owns the AudioContext (it may only start after a click or key press).
++	MAIN_THREAD_ASYNC_EM_ASM(
++	    {
++		    if(typeof ps2xStartAudio == 'function')
++			    ps2xStartAudio(HEAP16.buffer, $0, $1, $2);
++	    },
++	    g_audioRing, kAudioRingFrames, g_audioIndex);
++	return true;
++}
++
++bool ps2xHostAudioWantsFrames(int)
++{
++	return true; // ps2xHostAudioWrite drops what doesn't fit
++}
++
++void ps2xHostAudioWrite(const int16_t* samples, int frames)
++{
++	uint32_t write = g_audioIndex[0].load(std::memory_order_relaxed);
++	const uint32_t queued = write - g_audioIndex[1].load(std::memory_order_acquire);
++	if(queued + static_cast<uint32_t>(frames) > kAudioRingFrames - 256)
++		return; // the page isn't playing (no click yet) or fell far behind: drop
++	for(int i = 0; i < frames; i++, write++)
++	{
++		const uint32_t slot = (write % kAudioRingFrames) * 2;
++		g_audioRing[slot] = samples[i * 2];
++		g_audioRing[slot + 1] = samples[i * 2 + 1];
++	}
++	g_audioIndex[0].store(write, std::memory_order_release);
++}

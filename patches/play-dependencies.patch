@@ -1,0 +1,19 @@
+diff --git a/cmake-modules/Header.cmake b/cmake-modules/Header.cmake
+index 3195f06..91d59dc 100644
+--- a/cmake-modules/Header.cmake
++++ b/cmake-modules/Header.cmake
+@@ -24,7 +24,13 @@ if(CMAKE_CURRENT_SOURCE_DIR STREQUAL "${CMAKE_SOURCE_DIR}")
+ 	elseif(EMSCRIPTEN)
+ 		message("-- Generating for JavaScript -- ")
+ 		set(TARGET_PLATFORM_JS TRUE)
+-		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
++		if(PLAY_WASM_EXCEPTIONS)
++			# Native WebAssembly exceptions (faster; needed to link with code built the same way).
++			set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fwasm-exceptions -msimd128")
++			set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -msimd128 -pthread")
++		else()
++			set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
++		endif()
+ 		set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
+ 		add_definitions(-DHAVE_UNISTD_H) # Needed for zlib to build properly
+ 	else()
