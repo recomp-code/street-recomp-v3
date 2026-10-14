@@ -75,7 +75,8 @@ nbastreet-v3-recomp/tools/web/serve.sh      # después abre http://localhost:808
 
 - Pulsa **Jugar** (los navegadores solo permiten sonido tras un clic). La primera carga descarga el
   código del juego (~27 MB comprimido) y luego el navegador lo guarda; el disco llega en trozos de
-  1 MB según se necesita.
+  1 MB según se necesita
+  (con lectura anticipada) y se queda en el navegador: lo que ya jugaste carga local la próxima vez.
 - Teclas como en la tabla de abajo (START = Enter, SELECT = Retroceso); los mandos también funcionan.
   `?scale=1..4` fija la resolución interna (2 por defecto), `?debug` muestra estadísticas del render.
 - Las partidas se guardan en el navegador (OPFS). Todavía no hay online en el navegador.

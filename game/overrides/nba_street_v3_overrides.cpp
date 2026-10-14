@@ -46,6 +46,9 @@
 #define _stricmp strcasecmp
 #endif
 
+// EE scheduler (EeScheduler.cpp): a guest PC range that only polls for an event, slept instead.
+void ps2xAddEeIdleLoop(uint32_t begin, uint32_t end);
+
 // Runtime frame-budget counters (ps2_runtime.cpp).
 extern uint64_t g_ps2StatIopTicks;
 extern uint64_t g_ps2StatVif1Ticks;
@@ -506,6 +509,13 @@ namespace
             runtime.replaceFunction(0x003E1910u, untimedVif1Wait);
             runtime.replaceFunction(0x003E1530u, untimedGifWait);
         }
+#if defined(__EMSCRIPTEN__)
+        // 0x003E3920 waits for the next frame: "while (count < target) { callback; 256 NOPs }"
+        // (the vsync interrupt moves count), then polls GS CSR.VSINT. In the browser both loops
+        // sleep until the next vsync instead of keeping a CPU core at 100%.
+        ps2xAddEeIdleLoop(0x003E3948u, 0x003E3D88u);
+        ps2xAddEeIdleLoop(0x003E3DA8u, 0x003E3DD0u);
+#endif
         if (envFlagSet("PS2X_NBA_FRAME_LOG"))
         {
             g_originalVsyncWait = runtime.lookupFunction(0x003E3920u);

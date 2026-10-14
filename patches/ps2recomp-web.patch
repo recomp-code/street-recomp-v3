@@ -102,7 +102,7 @@ index 9478c33..5612800 100644
  	Console.Error("DEV9: Unsupported OS, can't find Gateway");
  	return {};
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index f29c1d1..0100db3 100644
+index f29c1d1..ce02270 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -81,7 +81,18 @@ else()
@@ -134,7 +134,7 @@ index f29c1d1..0100db3 100644
      set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
  else()
      set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
-@@ -517,12 +528,90 @@ target_include_directories(ps2_runtime PUBLIC
+@@ -517,12 +528,96 @@ target_include_directories(ps2_runtime PUBLIC
      ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
  )
  
@@ -208,9 +208,15 @@ index f29c1d1..0100db3 100644
 +            -sPTHREAD_POOL_SIZE=16
 +            -sEXIT_RUNTIME=0
 +            "--profiling-funcs"
++            # WebGL from a thread: the page's canvas is handed over as an OffscreenCanvas
++            "-sOFFSCREENCANVAS_SUPPORT=1"
++            "-sOFFSCREENCANVASES_TO_PTHREAD=''"
++            # The disc's on-demand reader with read-ahead (replaces Emscripten's fetch backend JS)
++            "--js-library=${CMAKE_CURRENT_SOURCE_DIR}/web/library_fetch_stream.js"
 +            "-sEXPORTED_RUNTIME_METHODS=['addRunDependency','removeRunDependency']"
 +            "-sEXPORTED_FUNCTIONS=['_main','_EmptyBlockHandler','_MemoryUtils_GetByteProxy','_MemoryUtils_GetHalfProxy','_MemoryUtils_GetWordProxy','_MemoryUtils_GetDoubleProxy','_MemoryUtils_SetByteProxy','_MemoryUtils_SetHalfProxy','_MemoryUtils_SetWordProxy','_MemoryUtils_SetDoubleProxy','_LWL_Proxy','_LWR_Proxy','_LDL_Proxy','_LDR_Proxy','_SWL_Proxy','_SWR_Proxy','_SDL_Proxy','_SDR_Proxy']"
 +        )
++        set_property(TARGET ps2EntryRunner APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/library_fetch_stream.js")
 +    else()
 +        target_sources(ps2EntryRunner PRIVATE web/node_platform.cpp)
 +        set_source_files_properties(web/node_platform.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON SKIP_UNITY_BUILD_INCLUSION ON)
@@ -226,6 +232,334 @@ index f29c1d1..0100db3 100644
  if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
      target_sources(ps2EntryRunner PRIVATE
          src/lib/ps2_debug_panel.cpp
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 31a296b..f3532df 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -237,6 +237,7 @@ enum class EeEventType : uint8_t
+     ExternalWake,
+     Alarm,
+     DelayedInvocation,
++    HostTask,
+ };
+ 
+ struct EeEvent
+@@ -279,6 +280,9 @@ public:
+     void run();
+     void requestStop();
+     void postEvent(EeEvent event);
++    // From any thread: runs task on the EE thread at its next checkpoint (where it may queue
++    // guest invocations, e.g. a completion callback for work done by another host thread).
++    void postHostTask(std::function<void()> task);
+     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+     void accountCycles(uint32_t cycles) noexcept;
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+@@ -442,6 +446,8 @@ private:
+ 
+     mutable std::mutex m_eventMutex;
+     std::condition_variable m_eventCv;
++    std::unordered_map<uint32_t, std::function<void()>> m_hostTasks; // under m_eventMutex
++    uint32_t m_nextHostTaskId = 0;
+     std::deque<EeEvent> m_events;
+     std::vector<ScheduledEvent> m_deadlines;
+     std::deque<GuestInvocation> m_pendingInvocations;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index f09ec48..abf2923 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -10,6 +10,7 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
+ 
+ #include <algorithm>
+ #include <array>
++#include <vector>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdio>
+@@ -462,6 +463,18 @@ void EeScheduler::requestStop()
+     m_eventCv.notify_all();
+ }
+ 
++void EeScheduler::postHostTask(std::function<void()> task)
++{
++    {
++        std::lock_guard lock(m_eventMutex);
++        const uint32_t id = ++m_nextHostTaskId;
++        m_hostTasks.emplace(id, std::move(task));
++        m_events.push_back(EeEvent{EeEventType::HostTask, id, 0});
++        m_checkpointPending.store(true, std::memory_order_release);
++    }
++    m_eventCv.notify_one();
++}
++
+ void EeScheduler::postEvent(EeEvent event)
+ {
+     if (event.type == EeEventType::Stop)
+@@ -478,6 +491,37 @@ void EeScheduler::postEvent(EeEvent event)
+     m_eventCv.notify_one();
+ }
+ 
++namespace
++{
++    // Guest PC ranges where a game only spins waiting for an event (see ps2xAddEeIdleLoop).
++    struct EeIdleLoop
++    {
++        uint32_t begin;
++        uint32_t end;
++    };
++    std::vector<EeIdleLoop> g_eeIdleLoops;
++
++    bool eeIdleLoopAt(uint32_t pc) noexcept
++    {
++        static const bool s_disabled = std::getenv("PS2X_NO_IDLE_SLEEP") != nullptr;
++        if (s_disabled)
++            return false;
++        for (const EeIdleLoop &loop : g_eeIdleLoops)
++        {
++            if (pc >= loop.begin && pc < loop.end)
++                return true;
++        }
++        return false;
++    }
++}
++
++// Called by game overrides at startup: [begin, end) is a loop that only polls memory written by
++// interrupt handlers or other threads.
++void ps2xAddEeIdleLoop(uint32_t begin, uint32_t end)
++{
++    g_eeIdleLoops.push_back({begin, end});
++}
++
+ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+ {
+     accountCycles(cycles);
+@@ -541,6 +585,18 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+         return true;
+     }
+ 
++    // A game wait loop (registered by its override, e.g. "spin until the vsync counter moves"):
++    // nothing can change until the next timed event or a posted one, so sleep until then
++    // instead of spinning through the loop on a whole host core.
++    if (running != nullptr && hostDeadline != INT64_MAX && eeIdleLoopAt(running->activeContext().pc))
++    {
++        std::unique_lock lock(m_eventMutex);
++        const auto until = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(hostDeadline));
++        m_eventCv.wait_until(lock, until, [this]()
++                             { return !m_events.empty() || m_checkpointPending.load(std::memory_order_acquire) ||
++                                      m_stopRequested.load(std::memory_order_acquire); });
++    }
++
+     renewTimeSlice();
+     return false;
+ }
+@@ -2293,6 +2349,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+         queueInvocation(std::move(invocation));
+         break;
+     }
++    case EeEventType::HostTask:
++    {
++        std::function<void()> task;
++        {
++            std::lock_guard lock(m_eventMutex);
++            auto it = m_hostTasks.find(event.id);
++            if (it != m_hostTasks.end())
++            {
++                task = std::move(it->second);
++                m_hostTasks.erase(it);
++            }
++        }
++        if (task)
++            task();
++        break;
++    }
+     case EeEventType::DelayedInvocation:
+     {
+         auto it = m_delayedInvocations.find(event.id);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 4928e86..d29ccdf 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -4,7 +4,11 @@
+ #include "runtime/ee_scheduler.h"
+ 
+ #include <chrono>
++#include <condition_variable>
+ #include <cstring>
++#include <deque>
++#include <mutex>
++#include <thread>
+ #include <iostream>
+ 
+ namespace ps2_stubs
+@@ -247,13 +251,109 @@ namespace ps2_stubs
+         }
+     }
+ 
++#if defined(__EMSCRIPTEN__)
++    namespace
++    {
++        // Browser: the disc comes over the network, and a read can take a few hundred
++        // milliseconds. Like a real drive, sceCdRead only starts the read: a host thread fetches
++        // the sectors into RAM while the game (and the IOP, and the sound) keep running, and the
++        // completion callback fires when the data is there. sceCdSync reports the drive busy.
++        struct CdReadJob
++        {
++            uint32_t lbn;
++            uint32_t sectors;
++            uint32_t offset;
++            size_t bytes;
++        };
++        std::mutex g_cdJobMutex;
++        std::condition_variable g_cdJobCv;
++        std::condition_variable g_cdIdleCv;
++        std::deque<CdReadJob> g_cdJobs;
++        uint32_t g_cdReadsInFlight = 0u; // under g_cdJobMutex
++        std::mutex g_cdIoMutex;          // readCdSectors (shared file handles) one at a time
++
++        void cdReaderThread(PS2Runtime *runtime, uint8_t *rdram)
++        {
++            for (;;)
++            {
++                CdReadJob job;
++                {
++                    std::unique_lock lock(g_cdJobMutex);
++                    g_cdJobCv.wait(lock, [] { return !g_cdJobs.empty(); });
++                    job = g_cdJobs.front();
++                    g_cdJobs.pop_front();
++                }
++                bool ok;
++                {
++                    std::lock_guard io(g_cdIoMutex);
++                    ok = readCdSectors(job.lbn, job.sectors, rdram + job.offset, job.bytes);
++                    if (!ok)
++                        std::memset(rdram + job.offset, 0, job.bytes);
++                }
++                {
++                    std::lock_guard lock(g_cdJobMutex);
++                    --g_cdReadsInFlight;
++                }
++                g_cdIdleCv.notify_all();
++                runtime->eeScheduler().postHostTask([runtime, job]()
++                                                    { queueCdUserCallback(runtime, kCdFuncRead, job.sectors); });
++            }
++        }
++
++        void startCdRead(PS2Runtime *runtime, uint8_t *rdram, const CdReadJob &job)
++        {
++            static const bool s_started = [runtime, rdram]()
++            {
++                std::thread(cdReaderThread, runtime, rdram).detach();
++                return true;
++            }();
++            (void)s_started;
++            {
++                std::lock_guard lock(g_cdJobMutex);
++                ++g_cdReadsInFlight;
++                g_cdJobs.push_back(job);
++            }
++            g_cdJobCv.notify_one();
++        }
++
++        bool cdReadsInFlight()
++        {
++            std::lock_guard lock(g_cdJobMutex);
++            return g_cdReadsInFlight != 0u;
++        }
++
++        // Synchronous readers (blocking sync, other read commands) go after the queued reads.
++        void waitCdReadsDone()
++        {
++            std::unique_lock lock(g_cdJobMutex);
++            g_cdIdleCv.wait(lock, [] { return g_cdReadsInFlight == 0u; });
++        }
++    }
++#endif
++
++    // Reads that complete before returning (read chains, streaming): in the browser they come
++    // after any queued sceCdRead, one at a time with the reader thread.
++    static bool readCdSectorsAfterQueued(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t bytes)
++    {
++#if defined(__EMSCRIPTEN__)
++        waitCdReadsDone();
++        std::lock_guard io(g_cdIoMutex);
++#endif
++        return readCdSectors(lbn, sectors, dst, bytes);
++    }
++
+     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         struct CompletionNotifier
+         {
+             PS2Runtime *runtime;
+             uint32_t sectors;
+-            ~CompletionNotifier() { queueCdUserCallback(runtime, kCdFuncRead, sectors); }
++            bool armed = true;
++            ~CompletionNotifier()
++            {
++                if (armed)
++                    queueCdUserCallback(runtime, kCdFuncRead, sectors);
++            }
+         } completionNotifier{runtime, getRegU32(ctx, 5)};
+ 
+         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
+@@ -304,6 +404,23 @@ namespace ps2_stubs
+             return readCdSectors(args.lbn, args.sectors, rdram + offset, bytes);
+         };
+ 
++#if defined(__EMSCRIPTEN__)
++        if (runtime != nullptr && isResolvableCdLbn(a0))
++        {
++            const uint32_t offset = a2 & PS2_RAM_MASK;
++            const size_t bytes = clampReadBytes(a1, offset);
++            g_cdStreamingLbn = a0 + a1;
++            if (bytes != 0)
++            {
++                startCdRead(runtime, rdram, CdReadJob{a0, a1, offset, bytes});
++                completionNotifier.armed = false; // the reader thread delivers it
++            }
++            setReturnS32(ctx, 1); // command accepted
++            return;
++        }
++        waitCdReadsDone();
++        std::lock_guard cdIo(g_cdIoMutex);
++#endif
+         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
+         bool ok = tryRead(selected);
+ 
+@@ -386,6 +503,16 @@ namespace ps2_stubs
+ 
+     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++#if defined(__EMSCRIPTEN__)
++        // mode 0 waits for the drive, 1 only asks whether it is still busy
++        if (getRegU32(ctx, 4) == 0u)
++            waitCdReadsDone();
++        else if (cdReadsInFlight())
++        {
++            setReturnS32(ctx, 1);
++            return;
++        }
++#endif
+         setReturnS32(ctx, 0); // 0 = completed/not busy
+     }
+ 
+@@ -563,7 +690,7 @@ namespace ps2_stubs
+                 bytes = maxBytes;
+             }
+ 
+-            if (!readCdSectors(lbn, sectors, rdram + offset, bytes))
++            if (!readCdSectorsAfterQueued(lbn, sectors, rdram + offset, bytes))
+             {
+                 ok = false;
+                 break;
+@@ -899,7 +1026,7 @@ namespace ps2_stubs
+ 
+                 const uint32_t readLbn = g_cdStreamingLbn;
+                 const size_t readBytes = static_cast<size_t>(sectors) * kCdSectorSize;
+-                if (!readCdSectors(readLbn, sectors, rdram + offset, readBytes))
++                if (!readCdSectorsAfterQueued(readLbn, sectors, rdram + offset, readBytes))
+                 {
+                     finishCdStRead(rdram, ctx, state, g_lastCdError);
+                     return;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
 index 0e1a2ad..721e03b 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
@@ -649,6 +983,240 @@ index 0000000..96f355f
 +// Disc files the game opens through cdrom0: (PS2X_VFS_LOG=1 run to a match), besides the ELF.
 +"SLUS_211.26",
 +"DEV9.IRX",
+diff --git a/ps2xRuntime/web/library_fetch_stream.js b/ps2xRuntime/web/library_fetch_stream.js
+new file mode 100644
+index 0000000..ca0810a
+--- /dev/null
++++ b/ps2xRuntime/web/library_fetch_stream.js
+@@ -0,0 +1,228 @@
++/**
++ * WasmFS fetch backend for the game disc, replacing Emscripten's (src/lib/libwasmfs_fetch.js):
++ * the same on-demand HTTP Range reads, plus
++ *  - read-ahead: sequential reads (streamed music, videos, loading) fetch the next chunks in
++ *    the background, several requests at once, so the game rarely waits for the network;
++ *  - one request per chunk: a read waits for a chunk already on its way instead of asking again;
++ *  - a bounded cache (least recently used chunks go), instead of keeping every chunk ever read;
++ *  - a persistent copy in the browser's Cache Storage: what was played once is read locally the
++ *    next time (keyed by the server's ETag, so a changed file is fetched again).
++ */
++
++addToLibrary({
++  $wasmFS$JSMemoryRanges: {},
++
++  _wasmfs_create_fetch_backend_js__deps: [
++    '$wasmFS$backends',
++    '$wasmFS$JSMemoryRanges',
++    '_wasmfs_fetch_get_file_url',
++    '_wasmfs_fetch_get_chunk_size',
++  ],
++  _wasmfs_create_fetch_backend_js: async function(backend) {
++    const READ_AHEAD_CHUNKS = 8;     // chunks fetched ahead of a sequential read
++    const STREAMS = 4;               // interleaved sequential readers followed at once (video, audio...)
++    const MAX_CACHED_CHUNKS = 384;   // per file (x chunk size, 1 MB here)
++
++    // Persistent chunk store (absent in some private modes: then memory only).
++    var diskCache = (typeof caches !== 'undefined') ? caches.open('ps2x-disc-v1').catch(() => null) : Promise.resolve(null);
++
++    function chunkKey(info, i) {
++      return `${info.url}?ps2x-chunk=${i}&size=${info.chunkSize}&v=${encodeURIComponent(info.version)}`;
++    }
++
++    function fileUrl(file) {
++      var name = UTF8ToString(__wasmfs_fetch_get_file_url(file));
++      if (name.indexOf('://') !== -1) return name;
++      try {
++        return new URL(name, self.location.origin).toString();
++      } catch (_e) {
++        throw {status: 404};
++      }
++    }
++
++    // First access: size and range support (HEAD), or the whole file when it is small or the
++    // server can't do ranges.
++    async function openFile(file) {
++      var info = wasmFS$JSMemoryRanges[file];
++      if (info) return info.ready ? info : await info.opening;
++      var url = fileUrl(file);
++      var chunkSize = __wasmfs_fetch_get_chunk_size(file);
++      info = wasmFS$JSMemoryRanges[file] = {url, chunkSize, size: 0, chunks: new Map(), pending: new Map(),
++                                            ready: false, streams: []};
++      info.opening = (async () => {
++        var head = await fetch(url, {method: 'HEAD', headers: {'Range': 'bytes=0-'}});
++        var length = head.ok && head.headers.has('Content-Length') ? parseInt(head.headers.get('Content-Length'), 10) : 0;
++        if (head.ok && head.headers.get('Accept-Ranges') == 'bytes' && length > chunkSize * 2) {
++          info.size = length;
++          info.version = head.headers.get('ETag') || head.headers.get('Last-Modified') || String(length);
++        } else {
++          var whole = await fetch(url);
++          if (!whole.ok) throw whole;
++          var data = new Uint8Array(await whole.arrayBuffer());
++          info.size = data.byteLength;
++          info.chunkSize = Math.max(1, data.byteLength);
++          info.chunks.set(0, data);
++        }
++        info.ready = true;
++        return info;
++      })();
++      try {
++        return await info.opening;
++      } catch (e) {
++        wasmFS$JSMemoryRanges[file] = undefined;
++        throw e;
++      }
++    }
++
++    function chunkCount(info) {
++      return Math.ceil(info.size / info.chunkSize);
++    }
++
++    // Fetches chunks [first, last] that are neither cached nor on their way, as one request.
++    function requestChunks(info, first, last) {
++      last = Math.min(last, chunkCount(info) - 1);
++      while (first <= last && (info.chunks.has(first) || info.pending.has(first))) first++;
++      while (last >= first && (info.chunks.has(last) || info.pending.has(last))) last--;
++      if (first > last) return;
++      // One promise per chunk, settled as soon as that chunk is in: a read never waits for its
++      // neighbours in the same request.
++      var settle = new Map();
++      for (var i = first; i <= last; i++) {
++        let resolve, reject;
++        var promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
++        promise.catch(() => {});
++        settle.set(i, {resolve, reject});
++        info.pending.set(i, promise);
++      }
++      var arrived = (i, chunk) => {
++        if (!info.chunks.has(i)) info.chunks.set(i, chunk);
++        info.pending.delete(i);
++        settle.get(i).resolve();
++        settle.delete(i);
++      };
++      (async () => {
++        // Chunks already in the browser's store come from there; the rest from the network.
++        var cache = await diskCache;
++        var missing = [];
++        for (var i = first; i <= last; i++) {
++          var hit = cache ? await cache.match(chunkKey(info, i)).catch(() => null) : null;
++          if (hit) arrived(i, new Uint8Array(await hit.arrayBuffer()));
++          else missing.push(i);
++        }
++        while (missing.length) {
++          var a = missing[0], b = a;
++          while (missing.length > b - a + 1 && missing[b - a + 1] === b + 1) b++;
++          missing.splice(0, b - a + 1);
++          var start = a * info.chunkSize;
++          var end = Math.min((b + 1) * info.chunkSize, info.size);
++          var response = await fetch(info.url, {headers: {'Range': `bytes=${start}-${end - 1}`}});
++          if (!response.ok) throw response;
++          var bytes = new Uint8Array(await response.arrayBuffer());
++          for (var j = a; j <= b; j++) {
++            var chunk = bytes.slice(j * info.chunkSize - start, (j + 1) * info.chunkSize - start);
++            arrived(j, chunk);
++            if (cache) cache.put(chunkKey(info, j), new Response(chunk)).catch(() => {});
++          }
++        }
++      })().catch((error) => {
++        for (var [i, s] of settle) { info.pending.delete(i); s.reject(error); }
++      });
++    }
++
++    function evict(info, keepFrom, keepTo) {
++      // Maps keep insertion order and touch() re-inserts on use: the first ones are the oldest.
++      for (var key of info.chunks.keys()) {
++        if (info.chunks.size <= MAX_CACHED_CHUNKS) break;
++        if (key >= keepFrom && key <= keepTo) continue;
++        info.chunks.delete(key);
++      }
++    }
++
++    function touch(info, i) {
++      var chunk = info.chunks.get(i);
++      info.chunks.delete(i);
++      info.chunks.set(i, chunk);
++      return chunk;
++    }
++
++    async function getFileRange(info, offset, len) {
++      if (info.chunks.size === 1 && info.chunkSize >= info.size) return; // whole file
++      var first = (offset / info.chunkSize) | 0;
++      var last = ((offset + len - 1) / info.chunkSize) | 0;
++      // Sequential reading? The game may interleave several streams (a video, its sound, music):
++      // a read continues one of them when it starts where that one ended (or in the same chunk).
++      var stream = info.streams.find((st) => first === st.chunk || first === st.chunk + 1);
++      if (stream) {
++        info.streams.splice(info.streams.indexOf(stream), 1);
++        stream.streak++;
++      } else {
++        stream = {chunk: last, streak: 0};
++        if (info.streams.length >= STREAMS) info.streams.shift();
++      }
++      stream.chunk = last;
++      info.streams.push(stream);
++      requestChunks(info, first, last);
++      if (stream.streak >= 1) {
++        // Ahead of the reader, in two requests so the next chunk arrives first.
++        requestChunks(info, last + 1, last + 2);
++        requestChunks(info, last + 3, last + READ_AHEAD_CHUNKS);
++      }
++      var waitStart = 0;
++      for (var i = first; i <= last; i++) {
++        if (!info.chunks.has(i)) {
++          waitStart ||= performance.now();
++          await info.pending.get(i);
++          if (!info.chunks.has(i)) requestChunks(info, i, i), await info.pending.get(i);
++        }
++      }
++      if (waitStart) {
++        // The game had to wait for the network: count it (and show long waits with ?debug)
++        var waited = performance.now() - waitStart;
++        info.waits = (info.waits || 0) + 1;
++        info.waitedMs = (info.waitedMs || 0) + waited;
++        if (waited > 20) err(`[disc] waited ${waited.toFixed(0)} ms for chunk ${first}-${last} (stream streak ${stream.streak}, ${info.waits} waits, ${info.waitedMs.toFixed(0)} ms total)`);
++      }
++      evict(info, first, last + READ_AHEAD_CHUNKS);
++    }
++
++    wasmFS$backends[backend] = {
++      allocFile: async (file) => { /* nop */ },
++      freeFile: async (file) => {
++        wasmFS$JSMemoryRanges[file] = undefined;
++      },
++      write: async (file, buffer, length, offset) => {
++        console.error('fetch backend: files are read-only');
++      },
++      read: async (file, buffer, length, offset) => {
++        if (offset < 0 || length <= 0) return 0;
++        var info;
++        try {
++          info = await openFile(file);
++          length = Math.min(length, info.size - offset);
++          if (length <= 0) return 0;
++          await getFileRange(info, offset, length);
++        } catch (failedResponse) {
++          return failedResponse.status === 404 ? -{{{ cDefs.ENOENT }}} : -{{{ cDefs.EBADF }}};
++        }
++        var chunkSize = info.chunkSize;
++        var first = (offset / chunkSize) | 0;
++        var last = ((offset + length - 1) / chunkSize) | 0;
++        for (var i = first; i <= last; i++) {
++          var chunk = touch(info, i);
++          var chunkStart = i * chunkSize;
++          var start = Math.max(chunkStart, offset);
++          var end = Math.min(chunkStart + chunkSize, offset + length);
++          HEAPU8.set(chunk.subarray(start - chunkStart, end - chunkStart), buffer + (start - offset));
++        }
++        return length;
++      },
++      getSize: async (file) => {
++        try {
++          return (await openFile(file)).size;
++        } catch (failedResponse) {
++          return 0;
++        }
++      },
++    };
++  },
++});
 diff --git a/ps2xRuntime/web/node_platform.cpp b/ps2xRuntime/web/node_platform.cpp
 new file mode 100644
 index 0000000..b5ea934
@@ -689,10 +1257,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..e36055c
+index 0000000..9d15ac6
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,929 @@
+@@ -0,0 +1,964 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -712,6 +1280,7 @@ index 0000000..e36055c
 +
 +#include <emscripten.h>
 +#include <emscripten/html5.h>
++#include <emscripten/threading.h>
 +
 +#include "BasicBlock.h"
 +#include "FrameDump.h"
@@ -914,6 +1483,11 @@ index 0000000..e36055c
 +	}
 +
 +	bool g_debug = false; // <page>?debug: GS statistics every 2 s, F8/F9 dumps
++	int g_scale = 2;      // internal resolution (decided on the page thread, from the URL)
++	ps2live::RingHeader* g_ring = nullptr;
++	// Canvas size in device pixels, measured on the page thread (the GL thread can't read CSS)
++	std::atomic<uint32_t> g_wantedWidth{0};
++	std::atomic<uint32_t> g_wantedHeight{0};
 +	int g_traceState = 0; // F9: 1 = start at the next vsync, 2 = tracing this frame
 +
 +	EM_BOOL OnKey(int eventType, const EmscriptenKeyboardEvent* e, void*)
@@ -1405,11 +1979,8 @@ index 0000000..e36055c
 +	// presentation in device pixels.
 +	void UpdatePresentation(Host& h)
 +	{
-+		double cssWidth = 0.0, cssHeight = 0.0;
-+		emscripten_get_element_css_size("#canvas", &cssWidth, &cssHeight);
-+		const double ratio = emscripten_get_device_pixel_ratio();
-+		const uint32 width = static_cast<uint32>(cssWidth * ratio + 0.5);
-+		const uint32 height = static_cast<uint32>(cssHeight * ratio + 0.5);
++		const uint32 width = g_wantedWidth.load();
++		const uint32 height = g_wantedHeight.load();
 +		if(width == 0 || height == 0 || (width == h.presentWidth && height == h.presentHeight))
 +			return;
 +		h.presentWidth = width;
@@ -1426,9 +1997,8 @@ index 0000000..e36055c
 +	{
 +		Host& h = *g_host;
 +		UpdatePresentation(h);
-+		PublishPad(h.ring);
-+		// The GS calls the worker thread queued (draws, transfers, flips) run here, where the WebGL
-+		// context lives; the last flip is what the page shows.
++		// The GS calls the worker thread queued (draws, transfers, flips) run here, in the thread
++		// that owns the canvas (OffscreenCanvas); the last flip is what the page shows.
 +		const double gsStart = emscripten_get_now();
 +		h.gsWeb->Pump();
 +		h.gsMs += emscripten_get_now() - gsStart;
@@ -1533,7 +2103,9 @@ index 0000000..e36055c
 +	}
 +
 +	// Main thread: builds the GS/VIF1/VU1/GIF and starts the frame loop.
-+	void StartOnMainThread(void* arg)
++	// GL thread: owns the canvas (transferred as an OffscreenCanvas), the WebGL context and Play!'s
++	// GS; draws in its own requestAnimationFrame loop.
++	void* GlThread(void* arg)
 +	{
 +		auto* ring = static_cast<ps2live::RingHeader*>(arg);
 +
@@ -1545,12 +2117,13 @@ index 0000000..e36055c
 +		attr.antialias = EM_FALSE;
 +		attr.preserveDrawingBuffer = EM_TRUE; // a vsync without changes keeps the last picture
 +		attr.powerPreference = EM_WEBGL_POWER_PREFERENCE_HIGH_PERFORMANCE;
++		attr.proxyContextToMainThread = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_DISALLOW;
 +		g_context = emscripten_webgl_create_context("#canvas", &attr);
 +		if(g_context <= 0)
 +		{
 +			std::printf("[webgs] WebGL2 is not available (%d)\n", static_cast<int>(g_context));
 +			ring->consumerQuit = 1;
-+			return;
++			return nullptr;
 +		}
 +
 +		Host* h = new Host();
@@ -1566,15 +2139,9 @@ index 0000000..e36055c
 +		std::memset(h->vuMem1, 0, PS2::VUMEM1SIZE);
 +		std::memset(h->microMem1, 0, PS2::MICROMEM1SIZE);
 +
-+		// Internal resolution: <page>?scale=N (1 = native PS2, default 2)
-+		const int scale = EM_ASM_INT({
-+			const value = parseInt(new URLSearchParams(location.search).get('scale') || '2', 10);
-+			return value >= 1 && value <= 4 ? value : 2;
-+		});
-+		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
 +		CGSH_OpenGL::RegisterPreferences();
-+		CAppConfig::GetInstance().SetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR, scale);
-+		std::printf("[webgs] internal resolution x%d\n", scale);
++		CAppConfig::GetInstance().SetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR, g_scale);
++		std::printf("[webgs] internal resolution x%d\n", g_scale);
 +
 +		h->gsWeb = new CGSH_Web(g_context);
 +		h->gsWeb->debug = g_debug;
@@ -1588,21 +2155,9 @@ index 0000000..e36055c
 +		h->flipConnection = h->gs->OnFlipComplete.Connect([h]() { h->flips++; });
 +		h->gs->Initialize();
 +		h->gsWeb->Pump();
-+		CGSHandler::PRESENTATION_PARAMS presentation;
-+		presentation.mode = CGSHandler::PRESENTATION_MODE_FIT;
-+		double cssWidth = 1280.0, cssHeight = 960.0;
-+		emscripten_get_element_css_size("#canvas", &cssWidth, &cssHeight);
-+		const double ratio = emscripten_get_device_pixel_ratio();
-+		presentation.windowWidth = static_cast<uint32>(cssWidth * ratio);
-+		presentation.windowHeight = static_cast<uint32>(cssHeight * ratio);
-+		emscripten_set_canvas_element_size("#canvas", static_cast<int>(presentation.windowWidth), static_cast<int>(presentation.windowHeight));
-+		h->gs->SetPresentationParams(presentation);
++		UpdatePresentation(*h);
 +		h->gs->Reset();
 +		h->gsWeb->Pump();
-+
-+		emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
-+		emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
-+		emscripten_set_blur_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnBlur);
 +
 +		ring->consumerAlive = 1;
 +		ring->consumerFlags = 1; // never waits on the data event: no wake-ups needed
@@ -1611,8 +2166,56 @@ index 0000000..e36055c
 +		pthread_t thread;
 +		pthread_create(&thread, nullptr, &HostThread, h);
 +		pthread_detach(thread);
-+		std::printf("[webgs] GS host started (Play! GS on WebGL2 in the page, VIF1/VU1/GIF in a worker)\n");
++		std::printf("[webgs] GS host started (Play! GS on WebGL2 in its own thread, VIF1/VU1/GIF in another)\n");
 +		emscripten_request_animation_frame_loop(&OnAnimationFrame, nullptr);
++		emscripten_exit_with_live_runtime(); // back to this worker's event loop, which runs the frames
++		return nullptr;
++	}
++
++	// Page thread: only what needs the DOM: keyboard, gamepads and the canvas size.
++	EM_BOOL OnPageFrame(double, void*)
++	{
++		double cssWidth = 0.0, cssHeight = 0.0;
++		emscripten_get_element_css_size("#canvas", &cssWidth, &cssHeight);
++		const double ratio = emscripten_get_device_pixel_ratio();
++		g_wantedWidth.store(static_cast<uint32_t>(cssWidth * ratio + 0.5));
++		g_wantedHeight.store(static_cast<uint32_t>(cssHeight * ratio + 0.5));
++		PublishPad(g_ring);
++		return g_ring->producerAlive ? EM_TRUE : EM_FALSE;
++	}
++
++	void StartOnMainThread(void* arg)
++	{
++		g_ring = static_cast<ps2live::RingHeader*>(arg);
++		// Internal resolution: <page>?scale=N (1 = native PS2). Default 2, or 1 on phones, tablets
++		// and machines with few cores, where the GPU has less room.
++		g_scale = EM_ASM_INT({
++			const small = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent) || (navigator.hardwareConcurrency || 8) <= 4;
++			const fallback = small ? 1 : 2;
++			const value = parseInt(new URLSearchParams(location.search).get('scale') || String(fallback), 10);
++			return value >= 1 && value <= 4 ? value : fallback;
++		});
++		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
++		OnPageFrame(0.0, nullptr); // first size, before the GL thread starts
++
++		emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
++		emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
++		emscripten_set_blur_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnBlur);
++		emscripten_request_animation_frame_loop(&OnPageFrame, nullptr);
++
++		pthread_attr_t attr;
++		pthread_attr_init(&attr);
++		emscripten_pthread_attr_settransferredcanvases(&attr, "#canvas");
++		pthread_t thread;
++		const int error = pthread_create(&thread, &attr, &GlThread, g_ring);
++		pthread_attr_destroy(&attr);
++		if(error != 0)
++		{
++			std::printf("[webgs] could not give the canvas to a thread (%d)\n", error);
++			g_ring->consumerQuit = 1;
++			return;
++		}
++		pthread_detach(thread);
 +	}
 +} // namespace
 +
@@ -1752,10 +2355,10 @@ index 0000000..ac06b4b
 +void SetSoundPitch(Sound, float) {}
 diff --git a/ps2xRuntime/web/site/index.html b/ps2xRuntime/web/site/index.html
 new file mode 100644
-index 0000000..54446f7
+index 0000000..933f8c2
 --- /dev/null
 +++ b/ps2xRuntime/web/site/index.html
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,189 @@
 +<!doctype html>
 +<html lang="es">
 +<head>
@@ -1868,6 +2471,7 @@ index 0000000..54446f7
 +        this.underruns = this.skips = this.blocks = 0;
 +        this.frac = 0;
 +        this.level = 2400;
++        this.target = 2400; // frames kept queued (~50 ms), grows after each underrun
 +        this.capture = null;
 +        this.port.onmessage = (e) => { if (e.data === 'capture') this.capture = []; };
 +      }
@@ -1880,13 +2484,17 @@ index 0000000..54446f7
 +        const written = Atomics.load(this.index, 0);
 +        let read = Atomics.load(this.index, 1);
 +        let queued = (written - read) >>> 0;
-+        if (queued > 14000) { read = (written - 2400) >>> 0; queued = 2400; this.frac = 0; this.skips++; }
-+        if (this.waiting && queued >= 1600) this.waiting = false;
-+        if (!this.waiting && queued < left.length + 2) { this.waiting = true; this.underruns++; }
++        if (queued > 14000) { read = (written - this.target) >>> 0; queued = this.target; this.frac = 0; this.skips++; }
++        if (this.waiting && queued >= this.target * 0.7) this.waiting = false;
++        if (!this.waiting && queued < left.length + 2) {
++          // Ran dry: keep a bit more sound queued from now on (up to 150 ms)
++          this.waiting = true; this.underruns++;
++          this.target = Math.min(this.target + 600, 7200);
++        }
 +        // The game's clock and the sound card's differ (the game makes ~49 kHz): play slightly
 +        // faster or slower (up to 4%) to keep ~60 ms queued, instead of dropping samples (clicks)
 +        this.level += (queued - this.level) * 0.01;
-+        const step = 1 + Math.max(-0.04, Math.min(0.04, (this.level - 2400) / 2400 * 0.06));
++        const step = 1 + Math.max(-0.04, Math.min(0.04, (this.level - this.target) / this.target * 0.06));
 +        for (let i = 0; i < left.length; i++) {
 +          if (!this.waiting && ((written - read) >>> 0) > 1) {
 +            const [l0, r0] = this.sample(read), [l1, r1] = this.sample((read + 1) >>> 0);
@@ -1907,7 +2515,7 @@ index 0000000..54446f7
 +        if (++this.blocks % 1500 === 0) {
 +          const produced = ((written - (this.lastWritten ?? written)) >>> 0) / (currentTime - (this.lastTime ?? currentTime) || 1);
 +          this.lastWritten = written; this.lastTime = currentTime;
-+          this.port.postMessage({ underruns: this.underruns, skips: this.skips, queued, step, produced });
++          this.port.postMessage({ underruns: this.underruns, skips: this.skips, queued, step, produced, target: this.target });
 +        }
 +        return true;
 +      }
@@ -1924,7 +2532,7 @@ index 0000000..54446f7
 +    node.connect(audioContext.destination);
 +    node.port.onmessage = (e) => {
 +      if (e.data.capture) { window.ps2xAudioCapture = e.data.capture; return; }
-+      append(`[audio] underruns ${e.data.underruns}, skips ${e.data.skips}, queued ${e.data.queued}, rate ${e.data.step.toFixed(4)}, game makes ${e.data.produced.toFixed(0)} Hz`);
++      append(`[audio] underruns ${e.data.underruns}, skips ${e.data.skips}, queued ${e.data.queued}, rate ${e.data.step.toFixed(4)}, target ${e.data.target}, game makes ${e.data.produced.toFixed(0)} Hz`);
 +    };
 +    window.ps2xAudioNode = node;
 +    if (audioContext.state !== 'running') sound.hidden = false;
@@ -1942,10 +2550,10 @@ index 0000000..54446f7
 +</html>
 diff --git a/ps2xRuntime/web/web_platform.cpp b/ps2xRuntime/web/web_platform.cpp
 new file mode 100644
-index 0000000..ec5e29c
+index 0000000..3dd37e3
 --- /dev/null
 +++ b/ps2xRuntime/web/web_platform.cpp
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,136 @@
 +// Browser platform for the WebAssembly build, run at the start of main() (on a worker: the build
 +// uses PROXY_TO_PTHREAD, so the page's main thread stays free for the GS host).
 +//
@@ -2025,6 +2633,9 @@ index 0000000..ec5e29c
 +	// The page reads keyboard and gamepads and publishes them in the live ring; the raylib pad
 +	// backend is headless here and would answer "no buttons" ahead of it.
 +	setenv("PS2X_NO_GAMEPAD", "1", 1);
++	// <page>?nosleep: the game's wait loops spin instead of sleeping (comparisons)
++	if(MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('nosleep') ? 1 : 0; }))
++		setenv("PS2X_NO_IDLE_SLEEP", "1", 1);
 +	// <page>?debug: also what the game reads from the pad
 +	if(MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }))
 +		setenv("PS2X_PAD_LOG", "1", 1);

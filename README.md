@@ -74,7 +74,8 @@ nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in
 ```
 
 - Click **Jugar** (browsers only allow sound after a click). The first load downloads the game code
-  (~27 MB compressed), then the browser keeps it; the disc streams in 1 MB pieces as needed.
+  (~27 MB compressed), then the browser keeps it; the disc streams in 1 MB pieces as needed
+  (with read-ahead) and stays in the browser, so what you played once loads locally next time.
 - Keys as in the table below (START = Enter, SELECT = Backspace); controllers work too.
   `?scale=1..4` sets the internal resolution (default 2), `?debug` shows renderer statistics.
 - Saves stay in the browser (OPFS). No online play in the browser yet.

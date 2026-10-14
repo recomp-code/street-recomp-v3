@@ -923,6 +923,32 @@ index 01a1217..aa65ff0 100644
  	auto texture = m_textureCache.Search(tex0);
  	if(!texture)
  	{
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index 57e58ba..e926385 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -1060,10 +1060,18 @@ bool CGSHandler::TransferWriteHandlerPSMT4(const void* pData, uint32 nLength)
+ 			uint32 nX = (m_trxCtx.nRRX + trxPos.nDSAX) % 2048;
+ 			uint32 nY = (m_trxCtx.nRRY + trxPos.nDSAY) % 2048;
+ 
+-			uint8 currentPixel = Indexor.GetPixel(nX, nY);
+-			if(currentPixel != nPixel[j])
++			//Same address as CPixelIndexor<PSMT4>::GetPixel/SetPixel, computed once for both
++			typedef CGsPixelFormats::STORAGEPSMT4 Storage;
++			const unsigned int columnNum = (nY / Storage::COLUMNHEIGHT) & 0x01;
++			unsigned int shift = (nX & 0x18) + ((nY & 0x02) << 1);
++			const unsigned int subTable = ((nY & 0x02) >> 1) ^ columnNum;
++			uint32 columnX = nX, columnY = nY;
++			const uint32 address = Indexor.GetColumnAddress(columnX, columnY);
++			uint32* word = &reinterpret_cast<uint32*>(m_pRAM + address)[Storage::m_nColumnWordTable[subTable][nY & 0x01][nX & 0x07]];
++			const uint32 updated = (*word & ~(0xFu << shift)) | (static_cast<uint32>(nPixel[j]) << shift);
++			if(updated != *word)
+ 			{
+-				Indexor.SetPixel(nX, nY, nPixel[j]);
++				*word = updated;
+ 				dirty = true;
+ 			}
+ 
 diff --git a/Source/gs/GSHandler.h b/Source/gs/GSHandler.h
 index 66bfe59..125dd17 100644
 --- a/Source/gs/GSHandler.h
