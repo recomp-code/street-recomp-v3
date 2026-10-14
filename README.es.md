@@ -79,8 +79,10 @@ nbastreet-v3-recomp/tools/web/serve.sh      # después abre http://localhost:808
 - Teclas como en la tabla de abajo (START = Enter, SELECT = Retroceso); los mandos también funcionan.
   `?scale=1..4` fija la resolución interna (2 por defecto, 1 en teléfonos), `?debug` muestra
   estadísticas del render.
-- **Texturas HD:** el pack de fans se lee imagen por imagen según el juego las muestra (activas por
-  defecto, apagadas en teléfonos; `?hd=0` / `?hd=1`).
+- **Ajustes en la pantalla de inicio** (se guardan en el navegador): resolución interna, texturas HD
+  (el pack de fans, leído imagen por imagen según el juego las muestra; activas por defecto),
+  búfer de sonido y online. También como parámetros: `?scale=1..4`, `?hd=0/1`,
+  `?audio=stable|normal|low`, `?online=0/1`.
 - **El online funciona:** la red del juego va por un WebSocket (`/net`) a `tools/web/net_relay.py`
   en el servidor, que solo llega al servidor del juego. La configuración de red se pone en la
   memory card del navegador la primera vez.

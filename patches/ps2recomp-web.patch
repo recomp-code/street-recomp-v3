@@ -92,7 +92,7 @@ index c8b9ef1..18f08c7 100644
      }
  
 diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
-index 1bbdb22..64bd581 100644
+index 1bbdb22..297541b 100644
 --- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
 +++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
 @@ -3,10 +3,12 @@
@@ -108,7 +108,7 @@ index 1bbdb22..64bd581 100644
  
  namespace ps2x::iop
  {
-@@ -102,6 +104,94 @@ namespace ps2x::iop::detail
+@@ -102,6 +104,108 @@ namespace ps2x::iop::detail
          {
              return static_cast<int16_t>(std::clamp(value, -32768, 32767));
          }
@@ -193,6 +193,20 @@ index 1bbdb22..64bd581 100644
 +            value = std::clamp(value + levelStep, low, high);
 +        }
 +
++        // The final mix often goes past 16 bits in loud moments (the game's music stream is
++        // already at full scale): round the peaks off above 3/4 of full scale instead of
++        // cutting them flat, which sounds harsh.
++        int16_t softLimit(int32_t value)
++        {
++            constexpr int32_t knee = 24576;
++            constexpr double room = 32767.0 - knee;
++            const int32_t magnitude = std::abs(value);
++            if (magnitude <= knee)
++                return static_cast<int16_t>(value);
++            const double limited = knee + room * std::tanh((magnitude - knee) / room);
++            return static_cast<int16_t>(value < 0 ? -limited : limited);
++        }
++
 +        void pushHistory(std::array<int16_t, 4> &history, int16_t sample)
 +        {
 +            history[0] = history[1];
@@ -203,7 +217,7 @@ index 1bbdb22..64bd581 100644
      }
  
      Spu2::Spu2() : m_ram(kRamWords)
-@@ -116,6 +206,7 @@ namespace ps2x::iop::detail
+@@ -116,6 +220,7 @@ namespace ps2x::iop::detail
          for (Core &core : m_cores)
              core = Core{};
          m_irqInfo = 0u;
@@ -211,7 +225,7 @@ index 1bbdb22..64bd581 100644
          m_irqPending = false;
          m_lastCycle = 0u;
          m_cycleInitialized = false;
-@@ -135,6 +226,45 @@ namespace ps2x::iop::detail
+@@ -135,6 +240,45 @@ namespace ps2x::iop::detail
          return m_cores[static_cast<size_t>(core) & 1u].admas != 0u;
      }
  
@@ -257,7 +271,7 @@ index 1bbdb22..64bd581 100644
      void Spu2::checkIrq(uint32_t address)
      {
          address &= kRamMask;
-@@ -230,14 +360,24 @@ namespace ps2x::iop::detail
+@@ -230,14 +374,24 @@ namespace ps2x::iop::detail
          const int coreIndex = offset >= 0x400u ? 1 : 0;
          Core &core = m_cores[static_cast<size_t>(coreIndex)];
          const uint32_t reg = offset & 0x3FFu;
@@ -284,7 +298,7 @@ index 1bbdb22..64bd581 100644
              case 0x4: voice.pitch = value; break;
              case 0x6: voice.adsr1 = value; break;
              case 0x8: voice.adsr2 = value; break;
-@@ -306,6 +446,7 @@ namespace ps2x::iop::detail
+@@ -306,6 +460,7 @@ namespace ps2x::iop::detail
              {
                  core.admaL.clear();
                  core.admaR.clear();
@@ -292,7 +306,7 @@ index 1bbdb22..64bd581 100644
              }
              break;
          case kRegEndxLo: core.endx &= 0xFF0000u; break;
-@@ -322,24 +463,13 @@ namespace ps2x::iop::detail
+@@ -322,24 +477,13 @@ namespace ps2x::iop::detail
          m_statDmaBytes += bytes;
          if (core.admas != 0u)
          {
@@ -324,7 +338,7 @@ index 1bbdb22..64bd581 100644
              // Bound the backlog (about a quarter second) so a stalled consumer cannot grow it.
              while (core.admaL.size() > 12000u)
                  core.admaL.pop_front();
-@@ -388,6 +518,7 @@ namespace ps2x::iop::detail
+@@ -388,6 +532,7 @@ namespace ps2x::iop::detail
          voice.lsaWritten = false;
          core.endx &= ~(1u << voiceIndex);
          decodeBlock(voice);
@@ -332,7 +346,7 @@ index 1bbdb22..64bd581 100644
      }
  
      void Spu2::keyOff(Voice &voice)
-@@ -519,7 +650,9 @@ namespace ps2x::iop::detail
+@@ -519,7 +664,9 @@ namespace ps2x::iop::detail
          if (voice.phase == Phase::Off)
              return 0;
  
@@ -343,7 +357,7 @@ index 1bbdb22..64bd581 100644
          tickEnvelope(voice);
          const int32_t out = (sample * voice.env) >> 15;
  
-@@ -528,7 +661,10 @@ namespace ps2x::iop::detail
+@@ -528,7 +675,10 @@ namespace ps2x::iop::detail
          {
              voice.counter -= 0x1000u;
              if (++voice.sampleIndex < 28)
@@ -354,7 +368,7 @@ index 1bbdb22..64bd581 100644
              voice.sampleIndex = 0;
              const uint8_t flags = voice.blockFlags;
              if ((flags & 0x1u) != 0u)
-@@ -554,6 +690,7 @@ namespace ps2x::iop::detail
+@@ -554,6 +704,7 @@ namespace ps2x::iop::detail
              voice.nax = voice.blockAddr;
              if (voice.phase == Phase::Off)
                  break;
@@ -362,7 +376,11 @@ index 1bbdb22..64bd581 100644
          }
          return out;
      }
-@@ -565,6 +702,10 @@ namespace ps2x::iop::detail
+@@ -562,9 +713,14 @@ namespace ps2x::iop::detail
+     {
+         int32_t coreOutL[2] = {0, 0};
+         int32_t coreOutR[2] = {0, 0};
++        int32_t dryOutL = 0, dryOutR = 0; // the final mix before 16-bit saturation
          for (int c = 0; c < 2; ++c)
          {
              Core &core = m_cores[static_cast<size_t>(c)];
@@ -373,7 +391,7 @@ index 1bbdb22..64bd581 100644
              int32_t dryL = 0;
              int32_t dryR = 0;
              for (int v = 0; v < 24; ++v)
-@@ -577,8 +718,10 @@ namespace ps2x::iop::detail
+@@ -577,8 +733,10 @@ namespace ps2x::iop::detail
                      continue;
                  }
                  const int32_t out = renderVoice(core, c, v);
@@ -386,7 +404,7 @@ index 1bbdb22..64bd581 100644
                  voice.outVolL = static_cast<int16_t>(volL);
                  voice.outVolR = static_cast<int16_t>(volR);
                  if ((core.vmixl & (1u << v)) != 0u)
-@@ -586,9 +729,16 @@ namespace ps2x::iop::detail
+@@ -586,9 +744,16 @@ namespace ps2x::iop::detail
                  if ((core.vmixr & (1u << v)) != 0u)
                      dryR += (out * volR) >> 15;
              }
@@ -403,7 +421,7 @@ index 1bbdb22..64bd581 100644
              if (!core.admaL.empty() || !core.admaR.empty())
              {
                  const int32_t inL = core.admaL.empty() ? 0 : core.admaL.front();
-@@ -598,14 +748,18 @@ namespace ps2x::iop::detail
+@@ -598,22 +763,33 @@ namespace ps2x::iop::detail
                  if (!core.admaR.empty())
                      core.admaR.pop_front();
                  // BVOL/AVOL are plain signed 16-bit volumes (no sweep mode).
@@ -425,8 +443,27 @@ index 1bbdb22..64bd581 100644
 +                    dryR += (coreOutR[0] * static_cast<int16_t>(raw(shared + 0xA))) >> 15;
              }
              // Master volume, MVOL.
-             coreOutL[c] = clamp16((dryL * volumeOf(raw(shared + 0x0))) >> 15);
-@@ -648,10 +802,10 @@ namespace ps2x::iop::detail
+-            coreOutL[c] = clamp16((dryL * volumeOf(raw(shared + 0x0))) >> 15);
+-            coreOutR[c] = clamp16((dryR * volumeOf(raw(shared + 0x2))) >> 15);
++            const int32_t outL = (dryL * volumeOf(raw(shared + 0x0))) >> 15;
++            const int32_t outR = (dryR * volumeOf(raw(shared + 0x2))) >> 15;
++            coreOutL[c] = clamp16(outL);
++            coreOutR[c] = clamp16(outR);
++            if (c == 1)
++            {
++                dryOutL = outL;
++                dryOutR = outR;
++            }
+         }
+ 
+-        m_outBlock.push_back(static_cast<int16_t>(coreOutL[1]));
+-        m_outBlock.push_back(static_cast<int16_t>(coreOutR[1]));
++        m_outBlock.push_back(softLimit(dryOutL));
++        m_outBlock.push_back(softLimit(dryOutR));
+     }
+ 
+     void Spu2::advanceTo(uint64_t iopCycle)
+@@ -648,10 +824,10 @@ namespace ps2x::iop::detail
              for (const Core &core : m_cores)
                  for (const Voice &voice : core.voices)
                      active += voice.phase != Phase::Off ? 1 : 0;
@@ -1593,7 +1630,7 @@ index 31a296b..f3532df 100644
      std::vector<ScheduledEvent> m_deadlines;
      std::deque<GuestInvocation> m_pendingInvocations;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index f09ec48..625da9b 100644
+index f09ec48..eab69c4 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -10,6 +10,7 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
@@ -1710,7 +1747,27 @@ index f09ec48..625da9b 100644
      renewTimeSlice();
      return false;
  }
-@@ -2293,6 +2379,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -2206,11 +2292,17 @@ void EeScheduler::processDueDeadlines()
+         {
+             if (scheduled.event.type == EeEventType::VBlankStart)
+             {
++                // After a stall (the host was busy, data came late) carry on from now: catching
++                // up the lost frames back to back made picture and sound run slow, then fast.
++                auto base = scheduled.hostDeadline;
++                const auto now = std::chrono::steady_clock::now();
++                if (now - base > 2 * kVBlankPeriod)
++                    base = now - kVBlankPeriod;
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankDurationCycles,
+-                              scheduled.hostDeadline + kVBlankDuration,
++                              base + kVBlankDuration,
+                               EeEvent{EeEventType::VBlankEnd, 0, m_vsyncTick + 1u});
+                 scheduleEvent(scheduled.deadlineCycle + kVBlankPeriodCycles,
+-                              scheduled.hostDeadline + kVBlankPeriod,
++                              base + kVBlankPeriod,
+                               EeEvent{EeEventType::VBlankStart, 0, 0});
+             }
+             processEvent(scheduled.event);
+@@ -2293,6 +2385,22 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }
@@ -2344,10 +2401,10 @@ index 0000000..96f355f
 +"DEV9.IRX",
 diff --git a/ps2xRuntime/web/library_fetch_stream.js b/ps2xRuntime/web/library_fetch_stream.js
 new file mode 100644
-index 0000000..ca0810a
+index 0000000..e7c7019
 --- /dev/null
 +++ b/ps2xRuntime/web/library_fetch_stream.js
-@@ -0,0 +1,228 @@
+@@ -0,0 +1,229 @@
 +/**
 + * WasmFS fetch backend for the game disc, replacing Emscripten's (src/lib/libwasmfs_fetch.js):
 + * the same on-demand HTTP Range reads, plus
@@ -2504,7 +2561,8 @@ index 0000000..ca0810a
 +      var stream = info.streams.find((st) => first === st.chunk || first === st.chunk + 1);
 +      if (stream) {
 +        info.streams.splice(info.streams.indexOf(stream), 1);
-+        stream.streak++;
++        // Only moving on to a new chunk counts: many small reads inside one chunk are not a stream
++        if (last > stream.chunk) stream.streak++;
 +      } else {
 +        stream = {chunk: last, streak: 0};
 +        if (info.streams.length >= STREAMS) info.streams.shift();
@@ -2512,11 +2570,11 @@ index 0000000..ca0810a
 +      stream.chunk = last;
 +      info.streams.push(stream);
 +      requestChunks(info, first, last);
-+      if (stream.streak >= 1) {
-+        // Ahead of the reader, in two requests so the next chunk arrives first.
-+        requestChunks(info, last + 1, last + 2);
-+        requestChunks(info, last + 3, last + READ_AHEAD_CHUNKS);
-+      }
++      // Ahead of the reader, as far as it has proven to go: 1 chunk, then 2, then the full
++      // read-ahead for long streams (videos). The next chunk goes in its own request, first.
++      var ahead = stream.streak >= 4 ? READ_AHEAD_CHUNKS : Math.min(stream.streak, 2);
++      if (ahead >= 1) requestChunks(info, last + 1, last + 1);
++      if (ahead >= 2) requestChunks(info, last + 2, last + ahead);
 +      var waitStart = 0;
 +      for (var i = first; i <= last; i++) {
 +        if (!info.chunks.has(i)) {
@@ -2616,10 +2674,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..b0df5d6
+index 0000000..dc55db6
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,974 @@
+@@ -0,0 +1,970 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -2843,7 +2901,7 @@ index 0000000..b0df5d6
 +
 +	bool g_debug = false; // <page>?debug: GS statistics every 2 s, F8/F9 dumps
 +	int g_scale = 2;      // internal resolution (decided on the page thread, from the URL)
-+	bool g_hd = false;    // HD texture pack (data/hd/): on, except on phones; <page>?hd=0 / ?hd=1
++	bool g_hd = true;     // HD texture pack (data/hd/): on unless <page>?hd=0 (start screen setting)
 +	ps2live::RingHeader* g_ring = nullptr;
 +	// Canvas size in device pixels, measured on the page thread (the GL thread can't read CSS)
 +	std::atomic<uint32_t> g_wantedWidth{0};
@@ -3560,11 +3618,7 @@ index 0000000..b0df5d6
 +			return value >= 1 && value <= 4 ? value : fallback;
 +		});
 +		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
-+		g_hd = EM_ASM_INT({
-+			const hd = new URLSearchParams(location.search).get('hd');
-+			if (hd !== null) return hd !== '0' ? 1 : 0;
-+			return /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent) ? 0 : 1;
-+		}) != 0;
++		g_hd = EM_ASM_INT({ return new URLSearchParams(location.search).get('hd') === '0' ? 0 : 1; }) != 0;
 +		OnPageFrame(0.0, nullptr); // first size, before the GL thread starts
 +
 +		emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
@@ -3724,10 +3778,10 @@ index 0000000..ac06b4b
 +void SetSoundPitch(Sound, float) {}
 diff --git a/ps2xRuntime/web/site/index.html b/ps2xRuntime/web/site/index.html
 new file mode 100644
-index 0000000..b0e36de
+index 0000000..5aadcad
 --- /dev/null
 +++ b/ps2xRuntime/web/site/index.html
-@@ -0,0 +1,197 @@
+@@ -0,0 +1,258 @@
 +<!doctype html>
 +<html lang="es">
 +<head>
@@ -3749,6 +3803,9 @@ index 0000000..b0e36de
 +  #status b { display: block; font-size: 18px; margin-bottom: 6px; }
 +  #play { pointer-events: auto; margin-top: 18px; font: 600 16px system-ui, sans-serif; color: #111; background: var(--accent);
 +          border: 0; border-radius: 6px; padding: 10px 28px; cursor: pointer; }
++  #settings { pointer-events: auto; margin: 16px auto 0; display: grid; grid-template-columns: auto auto; gap: 8px 12px;
++              align-items: center; text-align: left; font-size: 13px; color: var(--dim); width: max-content; max-width: calc(100vw - 32px); }
++  #settings select { font: 13px system-ui, sans-serif; color: var(--fg); background: #1a1a1d; border: 1px solid #333; border-radius: 4px; padding: 4px 6px; }
 +  #bar { width: 260px; height: 4px; background: #222; border-radius: 2px; overflow: hidden; margin: 10px auto 0; }
 +  #bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
 +  footer { display: flex; gap: 16px; align-items: center; padding: 8px 16px; color: var(--dim); font-size: 12px; }
@@ -3763,7 +3820,28 @@ index 0000000..b0e36de
 +  <div id="stage">
 +    <canvas id="canvas" tabindex="0" oncontextmenu="event.preventDefault()"></canvas>
 +    <div id="status"><div><b id="statusTitle">Cargando…</b><span id="statusText">Descargando el juego (solo la primera vez)</span><div id="bar"><i></i></div>
-+      <button id="play">▶ Jugar</button></div></div>
++      <button id="play">▶ Jugar</button>
++      <div id="settings">
++        <label for="optScale">Resolución</label>
++        <select id="optScale">
++          <option value="auto">Automática</option>
++          <option value="1">1x · nativa PS2 (más rápida)</option>
++          <option value="2">2x · 1280×896</option>
++          <option value="3">3x · 1920×1344</option>
++          <option value="4">4x · 2560×1792</option>
++        </select>
++        <label for="optHd">Texturas HD</label>
++        <select id="optHd"><option value="1">Sí</option><option value="0">No (menos memoria y datos)</option></select>
++        <label for="optAudio">Sonido</label>
++        <select id="optAudio">
++          <option value="auto">Automático</option>
++          <option value="stable">Estable (más búfer, para teléfonos)</option>
++          <option value="normal">Normal</option>
++          <option value="low">Baja latencia (PC rápido)</option>
++        </select>
++        <label for="optOnline">Online</label>
++        <select id="optOnline"><option value="1">Sí</option><option value="0">No</option></select>
++      </div></div></div>
 +  </div>
 +  <footer>
 +    <span>Flechas/WASD · Z X C V · Q E 1 3 · Enter = START · mando compatible</span>
@@ -3816,11 +3894,33 @@ index 0000000..b0e36de
 +    // sound is there from the first video. The download goes on meanwhile.
 +    preRun: [() => Module.addRunDependency('play-click')],
 +  };
++  // Settings on the start screen: kept in this browser, handed to the game as page parameters
++  // (?scale, ?hd, ?audio, ?online), which a link can also set.
++  const settingNames = { scale: 'optScale', hd: 'optHd', audio: 'optAudio', online: 'optOnline' };
++  const saved = (() => { try { return JSON.parse(localStorage.getItem('ps2x-settings') || '{}'); } catch (e) { return {}; } })();
++  const params = new URLSearchParams(location.search);
++  for (const [name, id] of Object.entries(settingNames)) {
++    const value = params.get(name) ?? saved[name];
++    const select = document.getElementById(id);
++    if (value !== undefined && [...select.options].some((o) => o.value === value)) select.value = value;
++  }
++  function applySettings() {
++    const chosen = {};
++    for (const [name, id] of Object.entries(settingNames)) {
++      chosen[name] = document.getElementById(id).value;
++      if (chosen[name] === 'auto') params.delete(name); else params.set(name, chosen[name]);
++    }
++    try { localStorage.setItem('ps2x-settings', JSON.stringify(chosen)); } catch (e) {}
++    history.replaceState(null, '', location.pathname + (params.toString() ? '?' + params : ''));
++  }
++  const audioMode = () => { const m = new URLSearchParams(location.search).get('audio'); return m && m !== 'auto' ? m : (isMobile ? 'stable' : 'normal'); };
 +  const playButton = document.getElementById('play');
 +  playButton.onclick = () => {
++    applySettings();
++    document.getElementById('settings').remove();
 +    playButton.remove();
-+    // Phones: larger output buffers ('playback'), fewer glitches when the CPU is busy
-+    audioContext = new AudioContext({ sampleRate: 48000, latencyHint: isMobile ? 'playback' : 'interactive' });
++    // Stable sound (phones): larger output buffers ('playback'), fewer glitches when the CPU is busy
++    audioContext = new AudioContext({ sampleRate: 48000, latencyHint: audioMode() === 'stable' ? 'playback' : 'interactive' });
 +    audioContext.resume();
 +    document.getElementById('canvas').focus();
 +    Module.removeRunDependency('play-click');
@@ -3839,12 +3939,14 @@ index 0000000..b0e36de
 +        this.frames = o.frames;
 +        this.waiting = true;
 +        this.lastL = this.lastR = 0;
++        this.fadeLeft = 0; this.fadeFrom = 0; this.fadeIn = 128;
 +        this.underruns = this.skips = this.blocks = 0;
 +        this.frac = 0;
 +        // Frames kept queued: ~50 ms (phones ~100 ms), growing after each underrun up to 150 ms
 +        // (phones 200 ms), whose threads get descheduled more often
-+        this.target = o.mobile ? 4800 : 2400;
-+        this.maxTarget = o.mobile ? 9600 : 7200;
++        const sizes = { low: [1600, 4800], normal: [2400, 7200], stable: [4800, 9600] }[o.mode] || [2400, 7200];
++        this.target = sizes[0];
++        this.maxTarget = sizes[1];
 +        this.level = this.target;
 +        this.capture = null;
 +        this.port.onmessage = (e) => { if (e.data === 'capture') this.capture = []; };
@@ -3858,25 +3960,38 @@ index 0000000..b0e36de
 +        const written = Atomics.load(this.index, 0);
 +        let read = Atomics.load(this.index, 1);
 +        let queued = (written - read) >>> 0;
-+        // Far too much queued (the game caught up after a stall): drop the excess, the last resort
-+        if (queued > Math.min(this.frames - 2048, this.target * 3)) { read = (written - this.target) >>> 0; queued = this.target; this.level = queued; this.frac = 0; this.skips++; }
-+        if (this.waiting && queued >= this.target * 0.7) this.waiting = false;
++        // Far too much queued (the game caught up after a stall): jump ahead, cross-fading from the
++        // old position over 128 samples (a speed-up would be heard as faster, higher sound)
++        if (queued > Math.min(this.frames - 2048, this.target * 2.5)) {
++          this.fadeFrom = read; this.fadeLeft = 128;
++          read = (written - this.target) >>> 0; queued = this.target; this.level = queued; this.skips++;
++        }
++        if (this.waiting && queued >= this.target * 0.7) { this.waiting = false; this.fadeIn = 0; }
 +        if (!this.waiting && queued < left.length + 2) {
 +          // Ran dry: keep a bit more sound queued from now on
 +          this.waiting = true; this.underruns++;
 +          this.target = Math.min(this.target + 600, this.maxTarget);
 +        }
-+        // The game's clock and the sound card's differ (the game makes ~49 kHz): play slightly
-+        // faster or slower (up to 4%) to keep the target queued, instead of dropping samples
-+        // (clicks); up to 8% faster to work off a backlog after a stall
++        // The game's clock and the sound card's differ (the game makes ~48-49 kHz): play slightly
++        // faster or slower, at most 3% (not heard), to keep the target queued
 +        this.level += (queued - this.level) * 0.01;
-+        const fast = this.level > this.target * 1.8 ? 0.08 : 0.04;
-+        const step = 1 + Math.max(-0.04, Math.min(fast, (this.level - this.target) / this.target * 0.06));
++        const step = 1 + Math.max(-0.03, Math.min(0.03, (this.level - this.target) / this.target * 0.04));
 +        for (let i = 0; i < left.length; i++) {
 +          if (!this.waiting && ((written - read) >>> 0) > 1) {
 +            const [l0, r0] = this.sample(read), [l1, r1] = this.sample((read + 1) >>> 0);
-+            this.lastL = l0 + (l1 - l0) * this.frac;
-+            this.lastR = r0 + (r1 - r0) * this.frac;
++            let outL = l0 + (l1 - l0) * this.frac;
++            let outR = r0 + (r1 - r0) * this.frac;
++            if (this.fadeLeft > 0) { // cross-fade from where it was before a jump
++              const [ol, or] = this.sample(this.fadeFrom), k = this.fadeLeft / 128;
++              outL = outL * (1 - k) + ol * k; outR = outR * (1 - k) + or * k;
++              this.fadeFrom = (this.fadeFrom + 1) >>> 0; this.fadeLeft--;
++            }
++            if (this.fadeIn < 128) { // back from a gap: fade in instead of a click
++              const g = ++this.fadeIn / 128;
++              outL = this.lastL + (outL - this.lastL) * g; outR = this.lastR + (outR - this.lastR) * g;
++            }
++            this.lastL = outL;
++            this.lastR = outR;
 +            this.frac += step;
 +            const whole = Math.floor(this.frac);
 +            this.frac -= whole;
@@ -3899,12 +4014,12 @@ index 0000000..b0e36de
 +    }
 +    registerProcessor('ps2x-output', Ps2xOutput);`;
 +  async function ps2xStartAudio(buffer, ring, frames, index) {
-+    audioContext ??= new AudioContext({ sampleRate: 48000, latencyHint: isMobile ? 'playback' : 'interactive' });
++    audioContext ??= new AudioContext({ sampleRate: 48000, latencyHint: audioMode() === 'stable' ? 'playback' : 'interactive' });
 +    const url = URL.createObjectURL(new Blob([audioWorklet], { type: 'text/javascript' }));
 +    await audioContext.audioWorklet.addModule(url);
 +    const node = new AudioWorkletNode(audioContext, 'ps2x-output', {
 +      numberOfInputs: 0, outputChannelCount: [2],
-+      processorOptions: { buffer, ring, frames, index, mobile: isMobile },
++      processorOptions: { buffer, ring, frames, index, mode: audioMode() },
 +    });
 +    node.connect(audioContext.destination);
 +    node.port.onmessage = (e) => {
@@ -3927,10 +4042,10 @@ index 0000000..b0e36de
 +</html>
 diff --git a/ps2xRuntime/web/web_platform.cpp b/ps2xRuntime/web/web_platform.cpp
 new file mode 100644
-index 0000000..ffc0b3e
+index 0000000..b6d3e2b
 --- /dev/null
 +++ b/ps2xRuntime/web/web_platform.cpp
-@@ -0,0 +1,191 @@
+@@ -0,0 +1,195 @@
 +// Browser platform for the WebAssembly build, run at the start of main() (on a worker: the build
 +// uses PROXY_TO_PTHREAD, so the page's main thread stays free for the GS host).
 +//
@@ -4059,7 +4174,11 @@ index 0000000..ffc0b3e
 +	// Online: the network adapter's traffic goes over a WebSocket to the page's server (/net),
 +	// whose relay reaches the game server. Each browser keeps its own id (a different MAC for
 +	// the server, which tells players apart by it).
-+	setenv("PS2X_NET", "1", 1);
++	// <page>?online=0 (start screen setting): no network adapter
++	if(MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).get('online') === '0' ? 1 : 0; }))
++		setenv("PS2X_NET", "0", 1);
++	else
++		setenv("PS2X_NET", "1", 1);
 +	setenv("PS2X_NET_SERVER", "nbas3.xellrecomp.party", 1);
 +	char* netId = reinterpret_cast<char*>(MAIN_THREAD_EM_ASM_PTR({
 +		let id = null;
