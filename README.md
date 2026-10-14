@@ -30,8 +30,8 @@ native code with [PS2Recomp](https://github.com/ran-j/PS2Recomp) and drawn on yo
 - **Controller** and keyboard (Windows: Xbox-style/XInput; Mac: Xbox, PlayStation or MFi).
 - **In-game graphics menu:** F1, Back+Start or hold START for 1.5 s.
 - Normal **saves** on an emulated memory card.
-- **Browser version (experimental):** the same recompiled game as WebAssembly, 60 fps in Chrome on
-  an Apple Silicon Mac, sound, keyboard and controller. The disc is read on demand over HTTP: only
+- **Browser version (experimental):** the same recompiled game as WebAssembly, 60 fps in Chrome or
+  Firefox on an Apple Silicon Mac, sound, keyboard and controller. The disc is read on demand over HTTP: only
   the parts the game uses are downloaded, never the whole ISO.
 
 ## Play on Windows
@@ -70,7 +70,7 @@ For yourself only: serve it on your computer or a private server, never in publi
 
 ```sh
 nbastreet-v3-recomp/tools/web/build.sh      # once: Emscripten, FFmpeg, Play! renderer, the game (1-3 hours)
-nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in Chrome
+nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in Chrome or Firefox
 ```
 
 - Click **Jugar** (browsers only allow sound after a click). The first load downloads the game code
