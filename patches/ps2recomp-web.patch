@@ -102,7 +102,7 @@ index 9478c33..5612800 100644
  	Console.Error("DEV9: Unsupported OS, can't find Gateway");
  	return {};
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index f29c1d1..f1b7a19 100644
+index f29c1d1..0100db3 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -81,7 +81,18 @@ else()
@@ -134,7 +134,7 @@ index f29c1d1..f1b7a19 100644
      set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
  else()
      set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
-@@ -517,12 +528,89 @@ target_include_directories(ps2_runtime PUBLIC
+@@ -517,12 +528,90 @@ target_include_directories(ps2_runtime PUBLIC
      ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
  )
  
@@ -207,6 +207,7 @@ index f29c1d1..f1b7a19 100644
 +            -sALLOW_TABLE_GROWTH
 +            -sPTHREAD_POOL_SIZE=16
 +            -sEXIT_RUNTIME=0
++            "--profiling-funcs"
 +            "-sEXPORTED_RUNTIME_METHODS=['addRunDependency','removeRunDependency']"
 +            "-sEXPORTED_FUNCTIONS=['_main','_EmptyBlockHandler','_MemoryUtils_GetByteProxy','_MemoryUtils_GetHalfProxy','_MemoryUtils_GetWordProxy','_MemoryUtils_GetDoubleProxy','_MemoryUtils_SetByteProxy','_MemoryUtils_SetHalfProxy','_MemoryUtils_SetWordProxy','_MemoryUtils_SetDoubleProxy','_LWL_Proxy','_LWR_Proxy','_LDL_Proxy','_LDR_Proxy','_SWL_Proxy','_SWR_Proxy','_SDL_Proxy','_SDR_Proxy']"
 +        )
@@ -566,7 +567,7 @@ index 7532552..b8c6172 100644
          const timespec timeout{static_cast<time_t>(timeoutMs / 1000u), static_cast<long>(timeoutMs % 1000u) * 1000000l};
          syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, nullptr, 0);
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 5c92038..734938c 100644
+index 5c92038..6f265a4 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -91,6 +91,20 @@ namespace
@@ -590,6 +591,17 @@ index 5c92038..734938c 100644
              while (IsAudioStreamProcessed(stream))
              {
                  const size_t got = ps2x::iop::readAudioFrames(buffer.data(), kFrames);
+@@ -3322,6 +3336,10 @@ void PS2Runtime::run()
+         spu2Output.pump();
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
++#if defined(__EMSCRIPTEN__)
++        // Browser: the page's GS host draws the picture; this headless window shows nothing.
++        if (!ps2_gsdump::liveActive())
++#endif
+         UploadFrame(frameTex, this, presentWidth, presentHeight);
+ 
+         BeginDrawing();
 diff --git a/ps2xRuntime/src/lib/ps2_vfs.cpp b/ps2xRuntime/src/lib/ps2_vfs.cpp
 index aff25e6..1de2f76 100644
 --- a/ps2xRuntime/src/lib/ps2_vfs.cpp
@@ -677,10 +689,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..e76ffdd
+index 0000000..e36055c
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,939 @@
+@@ -0,0 +1,929 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -717,6 +729,9 @@ index 0000000..e76ffdd
 +#include "gs/GSH_OpenGL/GSH_OpenGL.h"
 +#include "gs/GsPixelFormats.h"
 +#include "DefaultAppConfig.h" // CAppConfig::GetBasePath, defined once per Play! app
++
++#include <pthread.h>
++#include <unistd.h>
 +
 +#include <array>
 +#include <map>
@@ -852,6 +867,7 @@ index 0000000..e76ffdd
 +		uint64_t vuSlices = 0;
 +		uint64_t drawCalls = 0;
 +		uint64_t totalVsyncs = 0;
++		double vblankWaitMs = 0.0, idleMs = 0.0;
 +		uint32 presentWidth = 0, presentHeight = 0;
 +		uint64_t flips = 0;
 +		Framework::CSignal<void()>::Connection flipConnection;
@@ -897,7 +913,6 @@ index 0000000..e76ffdd
 +		return 0;
 +	}
 +
-+	bool g_dumpRequested = false;
 +	bool g_debug = false; // <page>?debug: GS statistics every 2 s, F8/F9 dumps
 +	int g_traceState = 0; // F9: 1 = start at the next vsync, 2 = tracing this frame
 +
@@ -905,10 +920,10 @@ index 0000000..e76ffdd
 +	{
 +		if(eventType == EMSCRIPTEN_EVENT_KEYDOWN && std::strcmp(e->code, "F9") == 0 && g_traceState == 0)
 +			g_traceState = 1;
-+		if(eventType == EMSCRIPTEN_EVENT_KEYDOWN && std::strcmp(e->code, "F8") == 0)
-+			g_dumpRequested = true;
 +		uint32_t stick = 0;
 +		const uint32_t bit = KeyBit(e->code, &stick);
++		if(g_debug)
++			std::printf("[pad] %s %s -> bit %08x stick %x\n", eventType == EMSCRIPTEN_EVENT_KEYDOWN ? "down" : "up", e->code, bit, stick);
 +		if(!bit && !stick)
 +			return EM_FALSE;
 +		if(eventType == EMSCRIPTEN_EVENT_KEYDOWN)
@@ -953,7 +968,9 @@ index 0000000..e76ffdd
 +			{
 +				if(emscripten_get_gamepad_status(i, &pad) != EMSCRIPTEN_RESULT_SUCCESS || !pad.connected)
 +					continue;
-+				if(std::strcmp(pad.mapping, "standard") == 0)
++				// "standard" mapping, and also controllers the browser couldn't map (Firefox on macOS,
++				// some third-party pads): they nearly always follow the same order.
++				if(pad.numButtons >= 4)
 +				{
 +					// Standard mapping: 0 A 1 B 2 X 3 Y 4 LB 5 RB 6 LT 7 RT 8 Back 9 Start
 +					// 10 L3 11 R3 12 Up 13 Down 14 Left 15 Right.
@@ -1160,6 +1177,8 @@ index 0000000..e76ffdd
 +		            (unsigned long long)h.nVif, h.vuMs, (unsigned long long)h.vuSlices, (unsigned long long)h.nVifReg,
 +		            (unsigned long long)h.nXfer, (unsigned long long)h.nVsync, (unsigned long long)h.nRegs,
 +		            (unsigned long long)h.nFifo, h.gsMs, (long long)(Available(h) / 1024), h.vpu1->IsVuRunning() ? 1 : 0);
++		std::printf("[webgs] 2s: worker waited %.0f ms at vblanks, %.0f ms for data\n", h.vblankWaitMs, h.idleMs);
++		h.vblankWaitMs = h.idleMs = 0.0;
 +		h.nVif = h.nVifReg = h.nXfer = h.nVsync = h.nRegs = h.nFifo = h.vuSlices = 0;
 +		h.vuMs = h.gsMs = 0.0;
 +		h.debugStart = now;
@@ -1276,8 +1295,6 @@ index 0000000..e76ffdd
 +
 +		for(;;)
 +		{
-+			if(g_debug)
-+				DebugStats(h);
 +			const uint64_t avail = Available(h);
 +			if(avail < 1)
 +				return false;
@@ -1333,53 +1350,6 @@ index 0000000..e76ffdd
 +				Consume(h, 2);
 +				h.nVsync++;
 +				h.totalVsyncs++;
-+				if(g_dumpRequested)
-+				{
-+					// F8: GS RAM of the main menu's V3 logo, as T8 128x128 (TBP 0x2b40, TBW 2)
-+					g_dumpRequested = false;
-+					uint8* gsRam = h.gs->GetRam();
-+					CGsPixelFormats::CPixelIndexorPSMT8 t8(gsRam, 0x2b40 * 256, 2);
-+					for(uint32_t y = 0; y < 128; y++)
-+					{
-+						std::printf("[dump] t8 %3u ", y);
-+						for(uint32_t x = 0; x < 128; x++)
-+							std::printf("%02x", t8.GetPixel(x, y));
-+						std::printf("\n");
-+					}
-+					CGsPixelFormats::CPixelIndexorPSMCT32 res(gsRam, 0x2b40 * 256, 1);
-+					for(uint32_t y = 0; y < 64; y++)
-+					{
-+						std::printf("[dump] r %3u ", y);
-+						for(uint32_t x = 0; x < 64; x++)
-+							std::printf("%08x", res.GetPixel(x, y));
-+						std::printf("\n");
-+					}
-+					CGsPixelFormats::CPixelIndexorPSMCT32 srcA(gsRam, 0x2b80 * 256, 1);
-+					for(uint32_t y = 0; y < 32; y++)
-+					{
-+						std::printf("[dump] a %3u ", y);
-+						for(uint32_t x = 0; x < 16; x++)
-+							std::printf("%08x", srcA.GetPixel(x, y));
-+						std::printf("\n");
-+					}
-+					CGsPixelFormats::CPixelIndexorPSMT8 srcB(gsRam, 0x2bc0 * 256, 2);
-+					for(uint32_t y = 0; y < 64; y++)
-+					{
-+						std::printf("[dump] b %3u ", y);
-+						for(uint32_t x = 0; x < 64; x++)
-+							std::printf("%02x", srcB.GetPixel(x, y));
-+						std::printf("\n");
-+					}
-+					CGsPixelFormats::CPixelIndexorPSMCT32 clut(gsRam, 0x3ffc * 256, 1);
-+					std::printf("[dump] clut ");
-+					for(uint32_t i = 0; i < 256; i++)
-+						std::printf("%08x", clut.GetPixel(i % 16, i / 16));
-+					std::printf("\n");
-+					const uint64* r = h.gs->GetRegisters();
-+					std::printf("[dump] regs alpha2 %llx clamp2 %llx tex1_2 %llx texa %llx colclamp %llx test2 %llx pabe %llx fba2 %llx dthe %llx\n",
-+					            (unsigned long long)r[0x43], (unsigned long long)r[0x09], (unsigned long long)r[0x15], (unsigned long long)r[0x3b],
-+					            (unsigned long long)r[0x46], (unsigned long long)r[0x48], (unsigned long long)r[0x49], (unsigned long long)r[0x4b], (unsigned long long)r[0x45]);
-+				}
 +				if(g_traceState == 2)
 +				{
 +					h.gsWeb->traceOn = false;
@@ -1393,12 +1363,12 @@ index 0000000..e76ffdd
 +					h.gsWeb->traceLines = 0;
 +					std::printf("[trace] begin\n");
 +				}
-+				const double gsStart = emscripten_get_now();
++				// Queues the frame's end and the flip for the page thread. With two frames already
++				// queued (Play!'s MAX_INFLIGHT_FRAMES) this waits: the picture never lags far behind.
++				const double waitStart = emscripten_get_now();
 +				h.gs->SetVBlank();
-+				h.gsWeb->Pump();
 +				h.gs->ResetVBlank();
-+				h.gsMs += emscripten_get_now() - gsStart;
-+				h.frames++;
++				h.vblankWaitMs += emscripten_get_now() - waitStart;
 +				return true;
 +			}
 +			case kTypeReadFifo2:
@@ -1408,10 +1378,9 @@ index 0000000..e76ffdd
 +				const uint32_t qwc = PeekValue<uint32_t>(h, 1);
 +				Consume(h, 5);
 +				h.nFifo++;
-+				h.gsWeb->Pump();
 +				std::vector<uint8_t> discard((static_cast<size_t>(qwc) + 1) * 16);
 +				h.gs->ReadImageData(discard.data(), qwc * 16);
-+				h.gsWeb->Pump();
++				h.gs->SendGSCall([]() {}, true, true); // the page thread has read it: the buffer can go
 +				break;
 +			}
 +			case kTypeRegisters:
@@ -1458,17 +1427,13 @@ index 0000000..e76ffdd
 +		Host& h = *g_host;
 +		UpdatePresentation(h);
 +		PublishPad(h.ring);
-+		// The game paces itself at 60. Frames queued behind (a load, a hitch) are drawn now, within
-+		// ~10 ms of this browser frame, so the picture never lags the game for long; only the
-+		// last one is shown.
-+		const double start = emscripten_get_now();
-+		for(int i = 0; i < 8; i++)
-+		{
-+			if(!ProcessPackets(h))
-+				break;
-+			if(i >= 1 && emscripten_get_now() - start > 10.0)
-+				break;
-+		}
++		// The GS calls the worker thread queued (draws, transfers, flips) run here, where the WebGL
++		// context lives; the last flip is what the page shows.
++		const double gsStart = emscripten_get_now();
++		h.gsWeb->Pump();
++		h.gsMs += emscripten_get_now() - gsStart;
++		if(g_debug)
++			DebugStats(h);
 +		if(h.statsStart == 0.0)
 +			h.statsStart = time; // rAF time is page-relative; emscripten_get_now() is absolute with pthreads
 +		if(time - h.statsStart >= 5000.0)
@@ -1478,6 +1443,71 @@ index 0000000..e76ffdd
 +			h.statsStart = time;
 +		}
 +		return h.ring->producerAlive ? EM_TRUE : EM_FALSE;
++	}
++
++	void RegisterJitFunctions();
++
++	// DMAC/GIF/VIF1/VU1 for the worker thread: built there, because the VU1 JIT adds its code to
++	// the function table of the thread that compiles it (each WebAssembly thread has its own).
++	void SetupEmulation(Host* h)
++	{
++		h->dmac = std::make_unique<CDMAC>(h->ram, h->spr, h->vuMem0, h->vuMem1, h->ee);
++		h->gif = std::make_unique<CGIF>(h->gs, *h->dmac, h->ram, h->spr);
++		h->vpu1 = std::make_shared<CVpu>(1, CVpu::VPUINIT(h->microMem1, h->vuMem1, &h->vu1), *h->gif, h->intc, h->ram, h->spr);
++
++		// VU1 context, as Play!'s EE subsystem sets it up.
++		CMIPS& vu1 = h->vu1;
++		vu1.m_executor = std::make_unique<CVuExecutor>(vu1, PS2::MICROMEM1SIZE);
++		vu1.m_pMemoryMap->InsertReadMap(0x00000000, 0x00003FFF, h->vuMem1, 0x00);
++		vu1.m_pMemoryMap->InsertReadMap(0x00008000, 0x00008FFF, [h](uint32 address, uint32) -> uint32 {
++			if(address == CVpu::VU_ADDR_ITOP)
++				return h->vpu1->GetVif().GetITOP();
++			if(address == CVpu::VU_ADDR_TOP)
++				return h->vpu1->GetVif().GetTOP();
++			return 0xCCCCCCCC;
++		}, 0x01);
++		vu1.m_pMemoryMap->InsertWriteMap(0x00000000, 0x00003FFF, h->vuMem1, 0x00);
++		vu1.m_pMemoryMap->InsertWriteMap(0x00008000, 0x00008FFF, [h](uint32 address, uint32 value) -> uint32 {
++			if(address == CVpu::VU_ADDR_XGKICK)
++			{
++				h->xgkicks++;
++				h->vpu1->ProcessXgKick(value);
++			}
++			return 0;
++		}, 0x01);
++		vu1.m_pMemoryMap->InsertInstructionMap(0x00000000, 0x00003FFF, h->microMem1, 0x01);
++		vu1.m_pArch = &h->maVu1;
++		vu1.m_pAddrTranslator = CMIPS::TranslateAddress64;
++		vu1.m_vuMem = h->vuMem1;
++		h->vuStateConnection = h->vpu1->VuStateChanged.Connect([h](CVpu::VU_STATE state) {
++			if(state == CVpu::VU_STATE_RUNNING)
++				h->vuStarts++;
++		});
++		h->vpu1->Reset();
++	}
++
++	// Worker thread: the live stream, VIF1, VU1 (its JIT code lives in this thread's function
++	// table) and the GIF; everything for the GS goes to the page thread through Play!'s mailbox.
++	void* HostThread(void* arg)
++	{
++		Host& h = *static_cast<Host*>(arg);
++		RegisterJitFunctions();
++		SetupEmulation(&h);
++		for(;;)
++		{
++			bool drew = false;
++			for(int i = 0; i < 4 && ProcessPackets(h); i++)
++				drew = true;
++			if(!drew)
++			{
++				if(!h.ring->producerAlive && h.headerDone)
++					break;
++				const double sleepStart = emscripten_get_now();
++				usleep(300); // the game writes a frame every ~16 ms
++				h.idleMs += emscripten_get_now() - sleepStart;
++			}
++		}
++		return nullptr;
 +	}
 +
 +	void RegisterJitFunctions()
@@ -1506,7 +1536,6 @@ index 0000000..e76ffdd
 +	void StartOnMainThread(void* arg)
 +	{
 +		auto* ring = static_cast<ps2live::RingHeader*>(arg);
-+		RegisterJitFunctions();
 +
 +		EmscriptenWebGLContextAttributes attr;
 +		emscripten_webgl_init_context_attributes(&attr);
@@ -1547,45 +1576,16 @@ index 0000000..e76ffdd
 +		CAppConfig::GetInstance().SetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR, scale);
 +		std::printf("[webgs] internal resolution x%d\n", scale);
 +
-+		h->dmac = std::make_unique<CDMAC>(h->ram, h->spr, h->vuMem0, h->vuMem1, h->ee);
 +		h->gsWeb = new CGSH_Web(g_context);
 +		h->gsWeb->debug = g_debug;
 +		h->gs = h->gsWeb;
 +		h->gs->SetIntc(&h->intc);
-+		h->gif = std::make_unique<CGIF>(h->gs, *h->dmac, h->ram, h->spr);
-+		h->vpu1 = std::make_shared<CVpu>(1, CVpu::VPUINIT(h->microMem1, h->vuMem1, &h->vu1), *h->gif, h->intc, h->ram, h->spr);
 +
-+		// VU1 context, as Play!'s EE subsystem sets it up.
-+		CMIPS& vu1 = h->vu1;
-+		vu1.m_executor = std::make_unique<CVuExecutor>(vu1, PS2::MICROMEM1SIZE);
-+		vu1.m_pMemoryMap->InsertReadMap(0x00000000, 0x00003FFF, h->vuMem1, 0x00);
-+		vu1.m_pMemoryMap->InsertReadMap(0x00008000, 0x00008FFF, [h](uint32 address, uint32) -> uint32 {
-+			if(address == CVpu::VU_ADDR_ITOP)
-+				return h->vpu1->GetVif().GetITOP();
-+			if(address == CVpu::VU_ADDR_TOP)
-+				return h->vpu1->GetVif().GetTOP();
-+			return 0xCCCCCCCC;
-+		}, 0x01);
-+		vu1.m_pMemoryMap->InsertWriteMap(0x00000000, 0x00003FFF, h->vuMem1, 0x00);
-+		vu1.m_pMemoryMap->InsertWriteMap(0x00008000, 0x00008FFF, [h](uint32 address, uint32 value) -> uint32 {
-+			if(address == CVpu::VU_ADDR_XGKICK)
-+			{
-+				h->xgkicks++;
-+				h->vpu1->ProcessXgKick(value);
-+			}
-+			return 0;
-+		}, 0x01);
-+		vu1.m_pMemoryMap->InsertInstructionMap(0x00000000, 0x00003FFF, h->microMem1, 0x01);
-+		vu1.m_pArch = &h->maVu1;
-+		vu1.m_pAddrTranslator = CMIPS::TranslateAddress64;
-+		vu1.m_vuMem = h->vuMem1;
-+
-+		h->newFrameConnection = h->gs->OnNewFrame.Connect([h](uint32 drawCalls) { h->drawCalls += drawCalls; });
-+		h->flipConnection = h->gs->OnFlipComplete.Connect([h]() { h->flips++; });
-+		h->vuStateConnection = h->vpu1->VuStateChanged.Connect([h](CVpu::VU_STATE state) {
-+			if(state == CVpu::VU_STATE_RUNNING)
-+				h->vuStarts++;
++		h->newFrameConnection = h->gs->OnNewFrame.Connect([h](uint32 drawCalls) {
++			h->drawCalls += drawCalls;
++			h->frames++; // a game frame finished on screen (runs on the page thread)
 +		});
++		h->flipConnection = h->gs->OnFlipComplete.Connect([h]() { h->flips++; });
 +		h->gs->Initialize();
 +		h->gsWeb->Pump();
 +		CGSHandler::PRESENTATION_PARAMS presentation;
@@ -1598,7 +1598,6 @@ index 0000000..e76ffdd
 +		emscripten_set_canvas_element_size("#canvas", static_cast<int>(presentation.windowWidth), static_cast<int>(presentation.windowHeight));
 +		h->gs->SetPresentationParams(presentation);
 +		h->gs->Reset();
-+		h->vpu1->Reset();
 +		h->gsWeb->Pump();
 +
 +		emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
@@ -1609,7 +1608,10 @@ index 0000000..e76ffdd
 +		ring->consumerFlags = 1; // never waits on the data event: no wake-ups needed
 +		g_host = h;
 +		h->statsStart = 0.0;
-+		std::printf("[webgs] GS host started (Play! GS on WebGL2, VU1 JIT to WebAssembly)\n");
++		pthread_t thread;
++		pthread_create(&thread, nullptr, &HostThread, h);
++		pthread_detach(thread);
++		std::printf("[webgs] GS host started (Play! GS on WebGL2 in the page, VIF1/VU1/GIF in a worker)\n");
 +		emscripten_request_animation_frame_loop(&OnAnimationFrame, nullptr);
 +	}
 +} // namespace
@@ -1940,10 +1942,10 @@ index 0000000..54446f7
 +</html>
 diff --git a/ps2xRuntime/web/web_platform.cpp b/ps2xRuntime/web/web_platform.cpp
 new file mode 100644
-index 0000000..393f9ac
+index 0000000..ec5e29c
 --- /dev/null
 +++ b/ps2xRuntime/web/web_platform.cpp
-@@ -0,0 +1,130 @@
+@@ -0,0 +1,133 @@
 +// Browser platform for the WebAssembly build, run at the start of main() (on a worker: the build
 +// uses PROXY_TO_PTHREAD, so the page's main thread stays free for the GS host).
 +//
@@ -2023,6 +2025,9 @@ index 0000000..393f9ac
 +	// The page reads keyboard and gamepads and publishes them in the live ring; the raylib pad
 +	// backend is headless here and would answer "no buttons" ahead of it.
 +	setenv("PS2X_NO_GAMEPAD", "1", 1);
++	// <page>?debug: also what the game reads from the pad
++	if(MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }))
++		setenv("PS2X_PAD_LOG", "1", 1);
 +	setenv("PS2X_MC_ROOT", "/saves/mc0", 1);
 +	setenv("PS2X_CD_IMAGE", "/game/NBAStreetV3.iso", 1);
 +	chdir("/game/iso");

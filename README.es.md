@@ -30,7 +30,7 @@ en el **navegador** (experimental): alta resolución, texturas HD, mando y **onl
 - **Menú gráfico en el juego:** F1, Back+Start o mantener START 1,5 s.
 - **Partidas guardadas** normales en una memory card emulada.
 - **Versión para navegador (experimental):** el mismo juego recompilado, en WebAssembly, a 60 fps en
-  Chrome en un Mac con Apple Silicon, con sonido, teclado y mando. El disco se lee bajo demanda por
+  Chrome o Firefox en un Mac con Apple Silicon, con sonido, teclado y mando. El disco se lee bajo demanda por
   HTTP: solo se descargan las partes que el juego usa, nunca la ISO completa.
 
 ## Jugar en Windows
@@ -70,7 +70,7 @@ ISO). Solo para ti: sírvelo en tu ordenador o en un servidor privado, nunca en 
 
 ```sh
 nbastreet-v3-recomp/tools/web/build.sh      # una vez: Emscripten, FFmpeg, render de Play!, el juego (1-3 horas)
-nbastreet-v3-recomp/tools/web/serve.sh      # después abre http://localhost:8088 en Chrome
+nbastreet-v3-recomp/tools/web/serve.sh      # después abre http://localhost:8088 en Chrome o Firefox
 ```
 
 - Pulsa **Jugar** (los navegadores solo permiten sonido tras un clic). La primera carga descarga el
