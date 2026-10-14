@@ -30,8 +30,8 @@ en el **navegador** (experimental): alta resolución, texturas HD, mando y **onl
 - **Menú gráfico en el juego:** F1, Back+Start o mantener START 1,5 s.
 - **Partidas guardadas** normales en una memory card emulada.
 - **Versión para navegador (experimental):** el mismo juego recompilado, en WebAssembly, a 60 fps en
-  Chrome o Firefox en un Mac con Apple Silicon, con sonido, teclado y mando. El disco se lee bajo demanda por
-  HTTP: solo se descargan las partes que el juego usa, nunca la ISO completa.
+  Chrome o Firefox, con sonido, mando, texturas HD y **online**. El disco llega bajo demanda: solo se
+  descargan las partes que el juego usa, nunca la ISO completa. Mira [qué hace](#qué-hace-la-versión-de-navegador).
 
 ## Jugar en Windows
 
@@ -72,6 +72,40 @@ ISO). Solo para ti: sírvelo en tu ordenador o en un servidor privado, nunca en 
 nbastreet-v3-recomp/tools/web/build.sh      # una vez: Emscripten, FFmpeg, render de Play!, el juego (1-3 horas)
 nbastreet-v3-recomp/tools/web/serve.sh      # después abre http://localhost:8088 en Chrome o Firefox
 ```
+
+### Qué hace la versión de navegador
+
+- **Streaming rápido, sin instalar:** el disco de 4,7 GB nunca se descarga entero. Se lee en trozos
+  de 1 MB (HTTP Range) según el juego los pide. La lectura anticipada sigue cada stream (videos,
+  música) y solo crece cuando el lector de verdad avanza por el disco. Un arranque en frío descarga
+  unos 64 MB en los primeros 30 s, de los que 27 MB son el código del juego (Brotli, 380 MB sin comprimir).
+- **Segunda visita al instante:** el navegador guarda el código del juego, y los trozos del disco ya
+  leídos quedan en su Cache Storage entre visitas. Las lecturas del disco van en segundo plano: el
+  juego nunca se congela esperando a la red.
+- **60 fps con varios hilos:**
+  - WebGL2 corre en su propio hilo (OffscreenCanvas);
+  - un hilo trabajador ejecuta la unidad vectorial del PS2 (VU1, con un JIT a WebAssembly) y el GIF;
+  - el hilo del juego duerme en los bucles de espera de cuadro del propio juego en vez de girar en
+    vacío, lo que ahorra batería.
+- **Gráficos nítidos:**
+  - resolución interna de 1x a 4x;
+  - mezclas, efectos de framebuffer y paletas exactos portados a WebGL2;
+  - pantalla completa.
+- **Texturas HD:** el pack de fans en formato PCSX2, reconocido con el mismo hash de texturas de PCSX2
+  y cargado imagen por imagen cuando el juego la muestra (el navegador la decodifica en otro hilo).
+- **Sonido limpio:**
+  - SPU2 con la interpolación gaussiana del hardware, barridos de volumen y limitación suave de picos;
+  - sale por un AudioWorklet con búfer adaptativo;
+  - el tiempo emulado avanza de forma continua, así que la música y los comentarios en streaming
+    nunca se repiten ni chasquean.
+- **Online:** el mismo servidor de la comunidad que la versión de PC. El adaptador de red del juego
+  habla por un solo WebSocket con un pequeño relay (`tools/web/net_relay.py`) que solo puede llegar al
+  servidor del juego.
+- **Mandos y teclado:** cualquier mando del navegador (estándar o no) y teclado.
+- **Partidas guardadas:** quedan en el navegador (OPFS) entre visitas.
+- **Ajustes en la pantalla de inicio:** resolución, texturas HD, búfer de sonido, online.
+- **Funciona en** Chrome y Firefox de escritorio y en Chrome de Android. Los teléfonos empiezan en
+  resolución 1x y con más búfer de sonido.
 
 - Pulsa **Jugar** (los navegadores solo permiten sonido tras un clic). La primera carga descarga el
   código del juego (~27 MB comprimido) y luego el navegador lo guarda; el disco llega en trozos de
