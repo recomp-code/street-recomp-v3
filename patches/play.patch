@@ -1,0 +1,944 @@
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+index 7eb9460..521ee29 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
+@@ -111,8 +111,10 @@ void CGSH_OpenGL::ReleaseImpl()
+ void CGSH_OpenGL::ResetImpl()
+ {
+ 	LoadPreferences();
++	m_emulatedFetchDirty = true;
+ 	m_textureCache.Flush();
+ 	PalCache_Flush();
++	m_currentFramebuffer.reset();
+ 	m_framebuffers.clear();
+ 	m_depthbuffers.clear();
+ 	m_vertexBuffer.clear();
+@@ -160,6 +162,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ 
+ 		if(!framebuffer && (dispLayer.bufWidth != 0))
+ 		{
++			printf("[gsh] display buffer %x w %u psm %x not drawn by the GPU: taken from GS RAM\n", dispLayer.bufPtr, dispLayer.bufWidth, dispLayer.psm);
+ 			framebuffer = FramebufferPtr(new CFramebuffer(dispLayer.bufPtr, dispLayer.bufWidth, FRAMEBUFFER_HEIGHT, dispLayer.psm, m_fbScale, m_multisampleEnabled));
+ 			m_framebuffers.push_back(framebuffer);
+ 			PopulateFramebuffer(framebuffer);
+@@ -265,6 +268,7 @@ void CGSH_OpenGL::NotifyPreferencesChangedImpl()
+ 	LoadPreferences();
+ 	m_textureCache.Flush();
+ 	PalCache_Flush();
++	m_currentFramebuffer.reset();
+ 	m_framebuffers.clear();
+ 	m_depthbuffers.clear();
+ 	CGSHandler::NotifyPreferencesChangedImpl();
+@@ -517,6 +521,12 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GetShaderFromCaps(const SHADERCAPS& s
+ 			glUniform1i(paletteUniform, 1);
+ 		}
+ 
++		auto dstUniform = glGetUniformLocation(*shader, "g_dstTexture");
++		if(dstUniform != -1)
++		{
++			glUniform1i(dstUniform, 2);
++		}
++
+ 		auto vertexParamsUniformBlock = glGetUniformBlockIndex(*shader, "VertexParams");
+ 		if(vertexParamsUniformBlock != GL_INVALID_INDEX)
+ 		{
+@@ -558,7 +568,13 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	//Get shader caps
+ 	//--------------------------------------------------------
+ 
++	bool emulatedFetch = NeedsEmulatedFetch(frameReg);
++	bool emulatedChanged = !m_renderState.isValid || (m_emulatedFetchActive != emulatedFetch);
++	m_emulatedFetchActive = emulatedFetch;
++
+ 	auto shaderCaps = make_convertible<SHADERCAPS>(0);
++	shaderCaps.hasEmulatedFetch = emulatedFetch;
++	shaderCaps.colorWrap = emulatedFetch && prim.nAlpha && ((m_nReg[GS_REG_COLCLAMP] & 1) == 0);
+ 	FillShaderCapsFromTexture(shaderCaps, tex0Reg, tex1Reg, texAReg, clampReg);
+ 	FillShaderCapsFromTest(shaderCaps, testReg);
+ 	FillShaderCapsFromAlpha(shaderCaps, prim.nAlpha != 0, alphaReg);
+@@ -607,11 +623,11 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	auto prevPrim = make_convertible<PRMODE>(prevPrimValue);
+ 	bool shaderChanged = !m_renderState.isValid || (static_cast<uint32>(m_renderState.shaderCaps) != static_cast<uint32>(shaderCaps));
+ 	bool primChanged = !m_renderState.isValid || (m_renderState.primReg != primReg);
+-	bool blendEnableChanged = primChanged && !m_hasFramebufferFetchExtension && ((!m_renderState.isValid) || (prevPrim.nAlpha != prim.nAlpha));
+-	bool alphaChanged = !m_renderState.isValid || (m_renderState.alphaReg != alphaReg);
++	bool blendEnableChanged = !m_hasFramebufferFetchExtension && (emulatedChanged || (primChanged && ((!m_renderState.isValid) || (prevPrim.nAlpha != prim.nAlpha))));
++	bool alphaChanged = !m_renderState.isValid || (m_renderState.alphaReg != alphaReg) || emulatedChanged;
+ 	bool testChanged = !m_renderState.isValid || (m_renderState.testReg != testReg);
+ 	bool zbufChanged = !m_renderState.isValid || (m_renderState.zbufReg != zbufReg);
+-	bool framebufferRelatedChanged = !m_renderState.isValid || !m_renderState.isFramebufferStateValid ||
++	bool framebufferRelatedChanged = !m_renderState.isValid || !m_renderState.isFramebufferStateValid || emulatedChanged ||
+ 	                                 (m_renderState.frameReg != frameReg) || zbufChanged || (m_renderState.scissorReg != scissorReg) || testChanged;
+ 	bool textureEnableChanged = !m_renderState.isValid || (prevPrim.nTexture != prim.nTexture);
+ 	bool textureChanged = !m_renderState.isValid || !m_renderState.isTextureStateValid ||
+@@ -637,7 +653,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	{
+ 		if(!m_hasFramebufferFetchExtension)
+ 		{
+-			m_renderState.blendEnabled = ((prim.nAlpha != 0) && m_alphaBlendingEnabled) ? GL_TRUE : GL_FALSE;
++			m_renderState.blendEnabled = ((prim.nAlpha != 0) && m_alphaBlendingEnabled && !m_emulatedFetchActive) ? GL_TRUE : GL_FALSE;
+ 			m_validGlState &= ~GLSTATE_BLEND;
+ 		}
+ 	}
+@@ -704,7 +720,7 @@ void CGSH_OpenGL::SetupBlendingFunction(uint64 alphaReg)
+ {
+ 	auto alpha = make_convertible<ALPHA>(alphaReg);
+ 
+-	if(m_hasFramebufferFetchExtension)
++	if(UsesShaderBlending())
+ 	{
+ 		m_fragmentParams.alphaFix = (static_cast<float>(alpha.nFix) / 255.f);
+ 		m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
+@@ -976,10 +992,14 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+ 	auto scissor = make_convertible<SCISSOR>(scissorReg);
+ 	auto test = make_convertible<TEST>(testReg);
+ 
+-	bool r = (frame.nMask & 0x000000FF) == 0;
+-	bool g = (frame.nMask & 0x0000FF00) == 0;
+-	bool b = (frame.nMask & 0x00FF0000) == 0;
+-	bool a = (frame.nMask & 0xFF000000) == 0;
++	//With an emulated framebuffer fetch, the shader applies FBMSK bit by bit
++	uint32 colorMask = m_emulatedFetchActive ? 0 : frame.nMask;
++	bool r = (colorMask & 0x000000FF) == 0;
++	bool g = (colorMask & 0x0000FF00) == 0;
++	bool b = (colorMask & 0x00FF0000) == 0;
++	bool a = (colorMask & 0xFF000000) == 0;
++	m_fragmentParams.fbMask = m_emulatedFetchActive ? frame.nMask : 0;
++	m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
+ 
+ 	//Don't write to alpha in PSMCT24
+ 	if(frame.nPsm == PSMCT24)
+@@ -1041,6 +1061,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+ 
+ 	m_renderState.framebufferHandle = framebuffer->m_framebuffer;
+ 	m_validGlState |= GLSTATE_FRAMEBUFFER; //glBindFramebuffer used to set just above
++	m_currentFramebuffer = (r || g || b || a) ? framebuffer : FramebufferPtr();
+ 
+ 	//We assume that we will be drawing to this framebuffer and that we'll need
+ 	//to resolve samples at some point if multisampling is enabled
+@@ -1217,7 +1238,7 @@ void CGSH_OpenGL::FillShaderCapsFromAlpha(SHADERCAPS& shaderCaps, bool alphaEnab
+ 
+ 	auto alpha = make_convertible<ALPHA>(alphaReg);
+ 
+-	if(m_hasFramebufferFetchExtension)
++	if(UsesShaderBlending())
+ 	{
+ 		shaderCaps.hasAlphaBlend = alphaEnabled;
+ 		shaderCaps.alphaBlendA = alpha.nA;
+@@ -1371,6 +1392,34 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
+ 	m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
+ }
+ 
++bool CGSH_OpenGL::NeedsEmulatedFetch(uint64 frameReg)
++{
++	if(m_hasFramebufferFetchExtension || (frameReg == 0)) return false;
++	if(!m_emulatedFetchDirty && (frameReg == m_emulatedFetchFrameReg)) return m_emulatedFetchActive;
++
++	auto frame = make_convertible<FRAME>(frameReg);
++	bool result = false;
++	if((frame.nPsm == PSMCT32) || (frame.nPsm == PSMCT24))
++	{
++		//FBMSK that keeps some bits of a channel: only the shader can do that
++		for(uint32 shift = 0; shift < 32; shift += 8)
++		{
++			uint32 byteMask = (frame.nMask >> shift) & 0xFF;
++			result |= (byteMask != 0) && (byteMask != 0xFF);
++		}
++		if(!result)
++		{
++			//Small offscreen buffers are where games compose textures (often read back later in
++			//another format, sometimes only once): draw them exactly from the start
++			auto framebuffer = FindFramebuffer(frame);
++			result = (framebuffer && framebuffer->m_exactColor) || (frame.GetWidth() <= 256);
++		}
++	}
++	m_emulatedFetchDirty = false;
++	m_emulatedFetchFrameReg = frameReg;
++	return result;
++}
++
+ CGSH_OpenGL::FramebufferPtr CGSH_OpenGL::FindFramebuffer(const FRAME& frame) const
+ {
+ 	auto framebufferIterator = std::find_if(std::begin(m_framebuffers), std::end(m_framebuffers),
+@@ -1724,6 +1773,26 @@ void CGSH_OpenGL::FlushVertexBuffer()
+ 
+ void CGSH_OpenGL::DoRenderPass()
+ {
++	if(m_currentFramebuffer)
++	{
++		//Remember what the GPU drew, so that a texture reading this memory in another format
++		//can get it back in GS RAM (WriteBackFramebuffer)
++		auto& framebuffer = *m_currentFramebuffer;
++		uint32 minY = m_renderState.scissorY;
++		uint32 maxY = std::min<uint32>(m_renderState.scissorY + m_renderState.scissorHeight, framebuffer.m_height) - 1;
++		if(!framebuffer.m_gpuDirty)
++		{
++			framebuffer.m_gpuDirty = true;
++			framebuffer.m_gpuDirtyMinY = minY;
++			framebuffer.m_gpuDirtyMaxY = maxY;
++		}
++		else
++		{
++			framebuffer.m_gpuDirtyMinY = std::min(framebuffer.m_gpuDirtyMinY, minY);
++			framebuffer.m_gpuDirtyMaxY = std::max(framebuffer.m_gpuDirtyMaxY, maxY);
++		}
++	}
++
+ 	if((m_validGlState & GLSTATE_VERTEX_PARAMS) == 0)
+ 	{
+ 		glBindBuffer(GL_UNIFORM_BUFFER, m_vertexParamsBuffer);
+@@ -1841,6 +1910,38 @@ void CGSH_OpenGL::DoRenderPass()
+ 		break;
+ 	}
+ 
++	if(static_cast<SHADERCAPS>(m_renderState.shaderCaps).hasEmulatedFetch && m_currentFramebuffer)
++	{
++		//The shader reads the destination from a copy of the drawn area
++		auto& framebuffer = *m_currentFramebuffer;
++		uint32 width = framebuffer.m_width * m_fbScale;
++		uint32 height = framebuffer.m_height * m_fbScale;
++		glActiveTexture(GL_TEXTURE2);
++		if(m_dstCopyTexture == 0)
++		{
++			glGenTextures(1, &m_dstCopyTexture);
++		}
++		glBindTexture(GL_TEXTURE_2D, m_dstCopyTexture);
++		if((m_dstCopyWidth != width) || (m_dstCopyHeight != height))
++		{
++			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++			glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++			m_dstCopyWidth = width;
++			m_dstCopyHeight = height;
++		}
++		uint32 x0 = std::min(m_renderState.scissorX * m_fbScale, width);
++		uint32 y0 = std::min(m_renderState.scissorY * m_fbScale, height);
++		uint32 x1 = std::min((m_renderState.scissorX + m_renderState.scissorWidth) * m_fbScale, width);
++		uint32 y1 = std::min((m_renderState.scissorY + m_renderState.scissorHeight) * m_fbScale, height);
++		if((x1 > x0) && (y1 > y0))
++		{
++			glCopyTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x0, y0, x1 - x0, y1 - y0);
++		}
++		glActiveTexture(GL_TEXTURE0);
++		CHECKGLERROR();
++	}
++
+ 	glDrawArrays(primitiveMode, 0, m_vertexBuffer.size());
+ 
+ 	m_drawCallCount++;
+@@ -2023,6 +2124,14 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
+ 			m_PrimitiveMode <<= m_nReg[GS_REG_PRMODE];
+ 		}
+ 
++		//Small offscreen buffers (texture compositions) are drawn exactly in GS RAM by the CPU:
++		//no GPU round trip when the game reads them back in another format
++		if(nDrawingKick && (m_primitiveType == PRIM_SPRITE) && DrawSpriteInSoftware())
++		{
++			m_nVtxCount = 2;
++			return;
++		}
++
+ 		if(nDrawingKick)
+ 		{
+ 			// Fast skip if nothing relevant changed since last draw
+@@ -2643,3 +2752,280 @@ CGSH_OpenGL::CDepthbuffer::CDepthbuffer(uint32 basePtr, uint32 width, uint32 hei
+ 	}
+ 	CHECKGLERROR();
+ }
++
++/////////////////////////////////////////////////////////////
++// Software sprites
++/////////////////////////////////////////////////////////////
++
++bool CGSH_OpenGL::DrawSpriteInSoftware()
++{
++	uint64 prim = m_PrimitiveMode;
++	const bool textured = (prim >> 4) & 1;
++	const bool fog = (prim >> 5) & 1;
++	const bool blend = (prim >> 6) & 1;
++	const bool antialias = (prim >> 7) & 1;
++	const bool useUV = (prim >> 8) & 1;
++	const unsigned ctx = (prim >> 9) & 1;
++	if(fog || antialias) return false;
++
++	uint64 frameReg = m_nReg[GS_REG_FRAME_1 + ctx];
++	uint32 fbp = static_cast<uint32>(frameReg & 0x1FF);
++	uint32 fbw = static_cast<uint32>((frameReg >> 16) & 0x3F);
++	uint32 fpsm = static_cast<uint32>((frameReg >> 24) & 0x3F);
++	uint32 fbmsk = static_cast<uint32>(frameReg >> 32);
++	if((fpsm != PSMCT32) && (fpsm != PSMCT24)) return false;
++	if((fbw == 0) || (fbw * 64 > 256)) return false;
++
++	uint64 testReg = m_nReg[GS_REG_TEST_1 + ctx];
++	uint64 zbufReg = m_nReg[GS_REG_ZBUF_1 + ctx];
++	const bool zte = (testReg >> 16) & 1;
++	const uint32 ztst = (testReg >> 17) & 3;
++	const bool zmsk = (zbufReg >> 32) & 1;
++	if(zte && !(ztst == 1 && zmsk)) return false; //needs the depth buffer
++
++	uint64 tex0Reg = m_nReg[GS_REG_TEX0_1 + ctx];
++	uint64 tex1Reg = m_nReg[GS_REG_TEX1_1 + ctx];
++	auto tex0 = make_convertible<TEX0>(tex0Reg);
++	if(textured)
++	{
++		if((tex1Reg >> 5) & 1) return false; //bilinear magnification
++		switch(tex0.nPsm)
++		{
++		case PSMCT32: case PSMCT24: case PSMCT16: case PSMCT16S:
++		case PSMT8: case PSMT4: case PSMT8H: case PSMT4HL: case PSMT4HH:
++			break;
++		default:
++			return false;
++		}
++	}
++
++	//Pending GPU work must land first, in order
++	FlushVertexBuffer();
++	if(textured)
++	{
++		WriteBackOverlappingFramebuffers(tex0);
++	}
++	for(const auto& framebuffer : m_framebuffers)
++	{
++		if(framebuffer->m_gpuDirty && (framebuffer->m_basePtr == fbp * 8192))
++		{
++			WriteBackFramebuffer(framebuffer);
++		}
++	}
++
++	//Vertices (12.4 fixed point), the second one carries the colour
++	auto offset = m_nReg[GS_REG_XYOFFSET_1 + ctx];
++	int32 ofx = static_cast<int32>(offset & 0xFFFF);
++	int32 ofy = static_cast<int32>((offset >> 32) & 0xFFFF);
++	int32 x[2], y[2];
++	int64 u[2] = {0, 0}, v[2] = {0, 0};
++	const uint32 texW = std::min<uint32>(tex0.GetWidth(), 1024);
++	const uint32 texH = std::min<uint32>(tex0.GetHeight(), 1024);
++	for(int i = 0; i < 2; i++)
++	{
++		const auto& vtx = m_VtxBuffer[1 - i];
++		x[i] = static_cast<int32>(vtx.position & 0xFFFF) - ofx;
++		y[i] = static_cast<int32>((vtx.position >> 16) & 0xFFFF) - ofy;
++		if(useUV)
++		{
++			u[i] = vtx.uv & 0x3FFF;
++			v[i] = (vtx.uv >> 16) & 0x3FFF;
++		}
++		else
++		{
++			float s, t, q;
++			uint32 sBits = static_cast<uint32>(vtx.st), tBits = static_cast<uint32>(vtx.st >> 32), qBits = static_cast<uint32>(vtx.rgbaq >> 32);
++			memcpy(&s, &sBits, 4);
++			memcpy(&t, &tBits, 4);
++			memcpy(&q, &qBits, 4);
++			if(q == 0) q = 1;
++			u[i] = static_cast<int64>(s / q * texW * 16.0f);
++			v[i] = static_cast<int64>(t / q * texH * 16.0f);
++		}
++	}
++	if(x[0] > x[1]) { std::swap(x[0], x[1]); std::swap(u[0], u[1]); }
++	if(y[0] > y[1]) { std::swap(y[0], y[1]); std::swap(v[0], v[1]); }
++
++	auto scissor = m_nReg[GS_REG_SCISSOR_1 + ctx];
++	int32 sx0 = static_cast<int32>(scissor & 0x7FF), sx1 = static_cast<int32>((scissor >> 16) & 0x7FF);
++	int32 sy0 = static_cast<int32>((scissor >> 32) & 0x7FF), sy1 = static_cast<int32>((scissor >> 48) & 0x7FF);
++	int32 px0 = std::max((x[0] + 15) >> 4, sx0), px1 = std::min(((x[1] + 15) >> 4) - 1, sx1);
++	int32 py0 = std::max((y[0] + 15) >> 4, sy0), py1 = std::min(((y[1] + 15) >> 4) - 1, sy1);
++	px1 = std::min<int32>(px1, fbw * 64 - 1);
++	py1 = std::min<int32>(py1, 2047);
++	m_softwareSprites++;
++	if((px0 > px1) || (py0 > py1)) return true;
++
++	//Colour of the primitive (flat: last vertex)
++	uint64 rgbaq = m_VtxBuffer[0].rgbaq;
++	const int32 vr = rgbaq & 0xFF, vg = (rgbaq >> 8) & 0xFF, vb = (rgbaq >> 16) & 0xFF, va = (rgbaq >> 24) & 0xFF;
++
++	//Texture sampling
++	uint64 clampReg = m_nReg[GS_REG_CLAMP_1 + ctx];
++	uint64 texaReg = m_nReg[GS_REG_TEXA];
++	const uint32 wms = clampReg & 3, wmt = (clampReg >> 2) & 3;
++	const uint32 minu = (clampReg >> 4) & 0x3FF, maxu = (clampReg >> 14) & 0x3FF;
++	const uint32 minv = (clampReg >> 24) & 0x3FF, maxv = (clampReg >> 34) & 0x3FF;
++	const uint32 ta0 = texaReg & 0xFF, ta1 = (texaReg >> 32) & 0xFF;
++	const bool aem = (texaReg >> 15) & 1;
++	const bool tcc = tex0.nColorComp != 0;
++	const uint32 tfx = tex0.nFunction;
++	std::array<uint32, 256> clut;
++	if(textured && CGsPixelFormats::IsPsmIDTEX(tex0.nPsm))
++	{
++		MakeLinearCLUT(tex0, clut);
++		if(tex0.nCPSM != PSMCT32)
++		{
++			for(auto& color : clut)
++			{
++				//16-bit CLUT: alpha from TEXA
++				uint32 rgb = color & 0xFFFFFF;
++				color = rgb | ((color >> 31) ? (ta1 << 24) : ((aem && rgb == 0) ? 0 : (ta0 << 24)));
++			}
++		}
++	}
++	auto wrap = [](int32 c, uint32 size, uint32 mode, uint32 minc, uint32 maxc) -> uint32 {
++		switch(mode)
++		{
++		case 0: return static_cast<uint32>(c) & (size - 1);
++		case 1: return static_cast<uint32>(std::clamp<int32>(c, 0, static_cast<int32>(size) - 1));
++		case 2: return static_cast<uint32>(std::clamp<int32>(c, static_cast<int32>(minc), static_cast<int32>(maxc)));
++		default: return (static_cast<uint32>(c) & minc) | maxc;
++		}
++	};
++	uint32 texBase = tex0.GetBufPtr();
++	uint32 texBufWidth = tex0.nBufWidth;
++	CGsPixelFormats::CPixelIndexorPSMCT32 tex32(m_pRAM, texBase, texBufWidth);
++	CGsPixelFormats::CPixelIndexorPSMCT16 tex16(m_pRAM, texBase, texBufWidth);
++	CGsPixelFormats::CPixelIndexorPSMCT16S tex16s(m_pRAM, texBase, texBufWidth);
++	CGsPixelFormats::CPixelIndexorPSMT8 tex8(m_pRAM, texBase, texBufWidth);
++	CGsPixelFormats::CPixelIndexorPSMT4 tex4(m_pRAM, texBase, texBufWidth);
++	auto fetch = [&](uint32 tx, uint32 ty) -> uint32 {
++		switch(tex0.nPsm)
++		{
++		case PSMCT32: return tex32.GetPixel(tx, ty);
++		case PSMCT24:
++		{
++			uint32 rgb = tex32.GetPixel(tx, ty) & 0xFFFFFF;
++			return rgb | ((aem && rgb == 0) ? 0 : (ta0 << 24));
++		}
++		case PSMCT16:
++		case PSMCT16S:
++		{
++			uint16 c = (tex0.nPsm == PSMCT16) ? tex16.GetPixel(tx, ty) : tex16s.GetPixel(tx, ty);
++			uint32 rgb = ((c & 0x1F) << 3) | (((c >> 5) & 0x1F) << 11) | (((c >> 10) & 0x1F) << 19);
++			return rgb | ((c & 0x8000) ? (ta1 << 24) : ((aem && (c & 0x7FFF) == 0) ? 0 : (ta0 << 24)));
++		}
++		case PSMT8: return clut[tex8.GetPixel(tx, ty)];
++		case PSMT4: return clut[tex4.GetPixel(tx, ty)];
++		case PSMT8H: return clut[tex32.GetPixel(tx, ty) >> 24];
++		case PSMT4HL: return clut[(tex32.GetPixel(tx, ty) >> 24) & 0xF];
++		default: return clut[tex32.GetPixel(tx, ty) >> 28];
++		}
++	};
++
++	//Pixel pipeline
++	uint64 alphaReg = m_nReg[GS_REG_ALPHA_1 + ctx];
++	const uint32 blendA = alphaReg & 3, blendB = (alphaReg >> 2) & 3, blendC = (alphaReg >> 4) & 3, blendD = (alphaReg >> 6) & 3;
++	const int32 blendFix = static_cast<int32>((alphaReg >> 32) & 0xFF);
++	const bool colClamp = m_nReg[GS_REG_COLCLAMP] & 1;
++	const bool pabe = m_nReg[GS_REG_PABE] & 1;
++	const bool fba = m_nReg[GS_REG_FBA_1 + ctx] & 1;
++	const bool ate = testReg & 1;
++	const uint32 atst = (testReg >> 1) & 7, aref = (testReg >> 4) & 0xFF, afail = (testReg >> 12) & 3;
++	const bool date = (testReg >> 14) & 1, datm = (testReg >> 15) & 1;
++	if(fpsm == PSMCT24) fbmsk |= 0xFF000000;
++	CGsPixelFormats::CPixelIndexorPSMCT32 target(m_pRAM, fbp * 8192, fbw);
++	const int64 du = (x[1] != x[0]) ? ((u[1] - u[0]) << 16) / (x[1] - x[0]) : 0;
++	const int64 dv = (y[1] != y[0]) ? ((v[1] - v[0]) << 16) / (y[1] - y[0]) : 0;
++
++	for(int32 py = py0; py <= py1; py++)
++	{
++		const int64 vv = v[0] + ((((static_cast<int64>(py) << 4) - y[0]) * dv) >> 16);
++		for(int32 px = px0; px <= px1; px++)
++		{
++			int32 r = vr, g = vg, b = vb, a = va;
++			if(textured)
++			{
++				const int64 uu = u[0] + ((((static_cast<int64>(px) << 4) - x[0]) * du) >> 16);
++				uint32 texel = fetch(wrap(static_cast<int32>(uu >> 4), texW, wms, minu, maxu), wrap(static_cast<int32>(vv >> 4), texH, wmt, minv, maxv));
++				int32 tr = texel & 0xFF, tg = (texel >> 8) & 0xFF, tb = (texel >> 16) & 0xFF, ta = texel >> 24;
++				switch(tfx)
++				{
++				case 0: //MODULATE
++					r = std::min((tr * vr) >> 7, 255);
++					g = std::min((tg * vg) >> 7, 255);
++					b = std::min((tb * vb) >> 7, 255);
++					if(tcc) a = std::min((ta * va) >> 7, 255);
++					break;
++				case 1: //DECAL
++					r = tr; g = tg; b = tb;
++					if(tcc) a = ta;
++					break;
++				default: //HIGHLIGHT, HIGHLIGHT2
++					r = std::min(((tr * vr) >> 7) + va, 255);
++					g = std::min(((tg * vg) >> 7) + va, 255);
++					b = std::min(((tb * vb) >> 7) + va, 255);
++					if(tcc) a = (tfx == 2) ? std::min(ta + va, 255) : ta;
++					break;
++				}
++			}
++
++			uint32* pixel = target.GetPixelAddress(px, py);
++			const uint32 dst = *pixel;
++			uint32 mask = fbmsk;
++			if(date && (((dst >> 31) & 1) != static_cast<uint32>(datm))) continue;
++			if(ate)
++			{
++				bool pass = true;
++				switch(atst)
++				{
++				case 0: pass = false; break;
++				case 1: pass = true; break;
++				case 2: pass = static_cast<uint32>(a) < aref; break;
++				case 3: pass = static_cast<uint32>(a) <= aref; break;
++				case 4: pass = static_cast<uint32>(a) == aref; break;
++				case 5: pass = static_cast<uint32>(a) >= aref; break;
++				case 6: pass = static_cast<uint32>(a) > aref; break;
++				case 7: pass = static_cast<uint32>(a) != aref; break;
++				}
++				if(!pass)
++				{
++					if(afail == 0 || afail == 2) continue; //KEEP, ZB_ONLY (no depth here)
++					if(afail == 3) mask |= 0xFF000000;      //RGB_ONLY
++				}
++			}
++			if(blend && !(pabe && (a & 0x80) == 0))
++			{
++				const int32 dr = dst & 0xFF, dg = (dst >> 8) & 0xFF, db = (dst >> 16) & 0xFF, da = dst >> 24;
++				auto pick = [](uint32 sel, int32 s, int32 d) { return sel == 0 ? s : (sel == 1 ? d : 0); };
++				const int32 c = blendC == 0 ? a : (blendC == 1 ? da : blendFix);
++				r = (((pick(blendA, r, dr) - pick(blendB, r, dr)) * c) >> 7) + pick(blendD, r, dr);
++				g = (((pick(blendA, g, dg) - pick(blendB, g, dg)) * c) >> 7) + pick(blendD, g, dg);
++				b = (((pick(blendA, b, db) - pick(blendB, b, db)) * c) >> 7) + pick(blendD, b, db);
++				if(colClamp)
++				{
++					r = std::clamp(r, 0, 255); g = std::clamp(g, 0, 255); b = std::clamp(b, 0, 255);
++				}
++				else
++				{
++					r &= 0xFF; g &= 0xFF; b &= 0xFF;
++				}
++			}
++			if(fba) a |= 0x80;
++			const uint32 src = static_cast<uint32>(r) | (static_cast<uint32>(g) << 8) | (static_cast<uint32>(b) << 16) | (static_cast<uint32>(a & 0xFF) << 24);
++			*pixel = (dst & mask) | (src & ~mask);
++		}
++	}
++
++	//GS RAM changed under the GPU copies and the cached textures
++	auto pageSize = CGsPixelFormats::GetPsmPageSize(PSMCT32);
++	uint32 start = fbp * 8192 + (py0 / pageSize.second) * fbw * CGsPixelFormats::PAGESIZE;
++	uint32 size = ((py1 / pageSize.second) - (py0 / pageSize.second) + 1) * fbw * CGsPixelFormats::PAGESIZE;
++	m_textureCache.InvalidateRange(start, size);
++	for(const auto& framebuffer : m_framebuffers)
++	{
++		framebuffer->m_cachedArea.Invalidate(start, size);
++	}
++	return true;
++}
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+index 290deb7..5f1c354 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
+@@ -99,6 +99,11 @@ private:
+ 		unsigned int alphaTestDepthTest_DepthFetch : 1;
+ 		unsigned int alphaTestDepthTestEqual_DepthFetch : 1;
+ 
++		//Destination read from a copy of the framebuffer (no GL_EXT_shader_framebuffer_fetch):
++		//exact alpha, blending and FBMSK bit masks in the shader
++		unsigned int hasEmulatedFetch : 1;
++		unsigned int colorWrap : 1; //COLCLAMP = 0: blending results wrap around (emulated fetch only)
++
+ 		bool isIndexedTextureSource() const
+ 		{
+ 			return texSourceMode == TEXTURE_SOURCE_MODE_IDX4 || texSourceMode == TEXTURE_SOURCE_MODE_IDX8;
+@@ -172,7 +177,7 @@ private:
+ 		uint32 alphaRef;
+ 		float alphaFix;
+ 		float fogColor[3];
+-		float padding2;
++		uint32 fbMask;
+ 	};
+ 	static_assert(sizeof(FRAGMENTPARAMS) == 0x40, "Size of FRAGMENTPARAMS must be 64 bytes.");
+ 
+@@ -247,6 +252,14 @@ private:
+ 		Framework::OpenGl::CRenderbuffer m_colorBufferMs;
+ 
+ 		CGsCachedArea m_cachedArea;
++
++		//Read back by the game in another format: drawn with exact values (emulated framebuffer fetch)
++		bool m_exactColor = false;
++
++		//Rows drawn on the GPU since the last write back to GS RAM (see WriteBackFramebuffer)
++		bool m_gpuDirty = false;
++		uint32 m_gpuDirtyMinY = 0;
++		uint32 m_gpuDirtyMaxY = 0;
+ 	};
+ 	typedef std::shared_ptr<CFramebuffer> FramebufferPtr;
+ 	typedef std::vector<FramebufferPtr> FramebufferList;
+@@ -307,8 +320,11 @@ private:
+ 
+ 	typedef std::vector<PRIM_VERTEX> VertexBuffer;
+ 
++protected:
+ 	void WriteRegisterImpl(uint8, uint64) override;
+ 
++private:
++
+ 	void InitializeRC();
+ 	void CheckExtensions();
+ 	void SetupTextureUpdaters();
+@@ -316,6 +332,9 @@ private:
+ 	void MakeLinearZOrtho(float*, float, float, float, float);
+ 	TEXTURE_INFO PrepareTexture(const TEX0&);
+ 	TEXTURE_INFO SearchTextureFramebuffer(const TEX0&);
++	void WriteBackOverlappingFramebuffers(const TEX0&);
++	void WriteBackFramebuffer(const FramebufferPtr&);
++	bool DrawSpriteInSoftware();
+ 	GLuint PreparePalette(const TEX0&);
+ 
+ 	void ProcessPrim(uint64);
+@@ -429,6 +448,24 @@ private:
+ 	GLint m_copyToFbSrcSizeUniform = -1;
+ 
+ 	TextureCache m_textureCache;
++	FramebufferPtr m_currentFramebuffer;
++	bool m_emulatedFetchActive = false;
++	bool m_emulatedFetchDirty = true;
++	uint64 m_emulatedFetchFrameReg = 0;
++	GLuint m_dstCopyTexture = 0;
++	uint32 m_dstCopyWidth = 0;
++	uint32 m_dstCopyHeight = 0;
++	bool UsesShaderBlending() const
++	{
++		return m_hasFramebufferFetchExtension || m_emulatedFetchActive;
++	}
++	bool NeedsEmulatedFetch(uint64 frameReg);
++
++public:
++	uint32 m_framebufferWriteBacks = 0;
++	uint32 m_softwareSprites = 0;
++
++private:
+ 	PaletteList m_paletteCache;
+ 	FramebufferList m_framebuffers;
+ 	DepthbufferList m_depthbuffers;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
+index 3f37572..e5f7d08 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
+@@ -136,13 +136,14 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateVertexShader(const SHADERCAPS& c
+ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS& caps)
+ {
+ 	bool alphaTestCanDiscardDepth = (caps.hasAlphaTest) && ((caps.alphaFailMethod == ALPHA_TEST_FAIL_FBONLY) || (caps.alphaFailMethod == ALPHA_TEST_FAIL_RGBONLY));
+-	bool useFramebufferFetch = (caps.hasAlphaBlend || caps.hasAlphaTest || caps.hasDestAlphaTest) && m_hasFramebufferFetchExtension;
++	bool emulatedFetch = caps.hasEmulatedFetch;
++	bool useFramebufferFetch = emulatedFetch || ((caps.hasAlphaBlend || caps.hasAlphaTest || caps.hasDestAlphaTest) && m_hasFramebufferFetchExtension);
+ 	bool useFramebufferFetchDepth = alphaTestCanDiscardDepth && m_hasFramebufferFetchDepthExtension;
+ 
+ 	std::stringstream shaderBuilder;
+ 	shaderBuilder << GLSL_VERSION << std::endl;
+ 
+-	if(useFramebufferFetch)
++	if(useFramebufferFetch && !emulatedFetch)
+ 	{
+ 		shaderBuilder << "#extension GL_EXT_shader_framebuffer_fetch : require" << std::endl;
+ 	}
+@@ -151,7 +152,7 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 		shaderBuilder << "#extension GL_ARM_shader_framebuffer_fetch_depth_stencil : require" << std::endl;
+ 	}
+ 
+-	shaderBuilder << "precision mediump float;" << std::endl;
++	shaderBuilder << (emulatedFetch ? "precision highp float;\nprecision highp int;" : "precision mediump float;") << std::endl;
+ 
+ 	shaderBuilder << "in highp float v_depth;" << std::endl;
+ 	shaderBuilder << "in vec4 v_color;" << std::endl;
+@@ -161,7 +162,7 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 		shaderBuilder << "in float v_fog;" << std::endl;
+ 	}
+ 
+-	if(useFramebufferFetch)
++	if(useFramebufferFetch && !emulatedFetch)
+ 	{
+ 		shaderBuilder << "inout vec4 fragColor;" << std::endl;
+ 	}
+@@ -176,6 +177,10 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 
+ 	shaderBuilder << "uniform sampler2D g_texture;" << std::endl;
+ 	shaderBuilder << "uniform sampler2D g_palette;" << std::endl;
++	if(emulatedFetch)
++	{
++		shaderBuilder << "uniform sampler2D g_dstTexture;" << std::endl;
++	}
+ 
+ 	shaderBuilder << "layout(std140) uniform FragmentParams" << std::endl;
+ 	shaderBuilder << "{" << std::endl;
+@@ -188,6 +193,7 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 	shaderBuilder << "	uint g_alphaRef;" << std::endl;
+ 	shaderBuilder << "	float g_alphaFix;" << std::endl;
+ 	shaderBuilder << "	vec3 g_fogColor;" << std::endl;
++	shaderBuilder << "	highp uint g_fbMask;" << std::endl;
+ 	shaderBuilder << "};" << std::endl;
+ 
+ 	if(caps.texClampS == TEXTURE_CLAMP_MODE_REGION_REPEAT || caps.texClampT == TEXTURE_CLAMP_MODE_REGION_REPEAT)
+@@ -224,6 +230,11 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 
+ 	shaderBuilder << "void main()" << std::endl;
+ 	shaderBuilder << "{" << std::endl;
++	if(emulatedFetch)
++	{
++		shaderBuilder << "	fragColor = texelFetch(g_dstTexture, ivec2(gl_FragCoord.xy), 0);" << std::endl;
++		shaderBuilder << "	vec4 dstColor = fragColor;" << std::endl;
++	}
+ 
+ 	if(useFramebufferFetch && caps.hasDestAlphaTest)
+ 	{
+@@ -249,6 +260,16 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 		shaderBuilder << "	texCoord.st /= g_textureSize.st;" << std::endl;
+ 	}
+ 
++	if(emulatedFetch && !caps.texBilinearFilter && (caps.texSourceMode != TEXTURE_SOURCE_MODE_NONE))
++	{
++		//The GS samples where the pixel starts, GL at its centre: pick the texel the GS would
++		shaderBuilder << "	{" << std::endl;
++		shaderBuilder << "		highp vec2 texelPos = texCoord.st * g_textureSize;" << std::endl;
++		shaderBuilder << "		highp vec2 texelStep = vec2(dFdx(texelPos.x), dFdy(texelPos.y));" << std::endl;
++		shaderBuilder << "		texCoord.st = (floor(texelPos - 0.5 * texelStep) + 0.5) / g_textureSize;" << std::endl;
++		shaderBuilder << "	}" << std::endl;
++	}
++
+ 	shaderBuilder << "	vec4 textureColor = vec4(1, 1, 1, 1);" << std::endl;
+ 	if(caps.isIndexedTextureSource())
+ 	{
+@@ -311,6 +332,18 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 		switch(caps.texFunction)
+ 		{
+ 		case TEX0_FUNCTION_MODULATE:
++			if(emulatedFetch)
++			{
++				//Exact GS math, (T * V) >> 7: these values may be read back as indices
++				shaderBuilder << "	{" << std::endl;
++				shaderBuilder << "		uvec4 t = uvec4(textureColor * 255.0 + 0.5);" << std::endl;
++				shaderBuilder << "		uvec4 v = uvec4(v_color * 255.0 + 0.5);" << std::endl;
++				shaderBuilder << "		uvec4 m = min((t * v) >> 7u, uvec4(255u));" << std::endl;
++				shaderBuilder << "		textureColor.rgb = vec3(m.rgb) / 255.0;" << std::endl;
++				shaderBuilder << "		textureColor.a = " << (caps.texHasAlpha ? "float(m.a) / 255.0;" : "v_color.a;") << std::endl;
++				shaderBuilder << "	}" << std::endl;
++				break;
++			}
+ 			shaderBuilder << "	textureColor.rgb = clamp(textureColor.rgb * v_color.rgb * 2.0, 0.0, 1.0);" << std::endl;
+ 			if(!caps.texHasAlpha)
+ 			{
+@@ -400,7 +433,31 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 
+ 	if(useFramebufferFetch)
+ 	{
+-		if(caps.hasAlphaBlend)
++		if(caps.hasAlphaBlend && emulatedFetch)
++		{
++			//Exact GS blending: ((A - B) * C >> 7) + D on 8-bit values, clamped or wrapped (COLCLAMP)
++			static const char* abd[] = {"cs", "cd", "ivec3(0)", "ivec3(0)"};
++			static const char* cParam[] = {"as", "ad", "fix", "fix"};
++			shaderBuilder << "	{" << std::endl;
++			shaderBuilder << "		ivec3 cs = ivec3(clamp(finalColor, 0.0, 1.0) * 255.0 + 0.5);" << std::endl;
++			shaderBuilder << "		ivec3 cd = ivec3(dstColor.rgb * 255.0 + 0.5);" << std::endl;
++			shaderBuilder << "		int as = int(clamp(finalAlpha, 0.0, 1.0) * 255.0 + 0.5);" << std::endl;
++			shaderBuilder << "		int ad = int(dstColor.a * 255.0 + 0.5);" << std::endl;
++			shaderBuilder << "		int fix = int(g_alphaFix * 255.0 + 0.5);" << std::endl;
++			shaderBuilder << "		ivec3 blended = (((" << abd[caps.alphaBlendA] << " - " << abd[caps.alphaBlendB] << ") * " << cParam[caps.alphaBlendC]
++			              << ") >> 7) + " << abd[caps.alphaBlendD] << ";" << std::endl;
++			if(caps.colorWrap)
++			{
++				shaderBuilder << "		blended &= ivec3(255);" << std::endl;
++			}
++			else
++			{
++				shaderBuilder << "		blended = clamp(blended, ivec3(0), ivec3(255));" << std::endl;
++			}
++			shaderBuilder << "		finalColor = vec3(blended) / 255.0;" << std::endl;
++			shaderBuilder << "	}" << std::endl;
++		}
++		else if(caps.hasAlphaBlend)
+ 		{
+ 			shaderBuilder << GenerateAlphaBlendSection(
+ 			    static_cast<ALPHABLEND_ABD>(caps.alphaBlendA), static_cast<ALPHABLEND_ABD>(caps.alphaBlendB),
+@@ -416,6 +473,17 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateFragmentShader(const SHADERCAPS&
+ 		shaderBuilder << "	{" << std::endl;
+ 		shaderBuilder << "		fragColor.a = finalAlpha;" << std::endl;
+ 		shaderBuilder << "	}" << std::endl;
++
++		if(emulatedFetch)
++		{
++			//FBMSK: the bits set keep the destination's value
++			shaderBuilder << "	{" << std::endl;
++			shaderBuilder << "		uvec4 dstBits = uvec4(dstColor * 255.0 + 0.5);" << std::endl;
++			shaderBuilder << "		uvec4 srcBits = uvec4(clamp(fragColor, 0.0, 1.0) * 255.0 + 0.5);" << std::endl;
++			shaderBuilder << "		uvec4 maskBits = uvec4(g_fbMask & 0xFFu, (g_fbMask >> 8u) & 0xFFu, (g_fbMask >> 16u) & 0xFFu, g_fbMask >> 24u);" << std::endl;
++			shaderBuilder << "		fragColor = vec4((dstBits & maskBits) | (srcBits & (~maskBits & 0xFFu))) / 255.0;" << std::endl;
++			shaderBuilder << "	}" << std::endl;
++		}
+ 	}
+ 	else
+ 	{
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+index 01a1217..aa65ff0 100644
+--- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
+@@ -1,5 +1,6 @@
+ #include <assert.h>
+ #include <cstring>
++#include <cstdio>
+ #include <sys/stat.h>
+ #include <limits.h>
+ #include <algorithm>
+@@ -110,6 +111,10 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
+ 	//First pass, look for an exact match
+ 	for(const auto& candidateFramebuffer : m_framebuffers)
+ 	{
++		//Exact framebuffers are written back to GS RAM before any texture reads them (see
++		//WriteBackOverlappingFramebuffers), and RAM may be newer (transfers): read RAM
++		if(candidateFramebuffer->m_exactColor) continue;
++
+ 		//Case: TEX0 points at the start of a frame buffer with the same width
+ 		if(candidateFramebuffer->m_basePtr == tex0.GetBufPtr() &&
+ 		   candidateFramebuffer->m_width == tex0.GetBufWidth() &&
+@@ -137,6 +142,7 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
+ 		//Second pass, be a bit more flexible
+ 		for(const auto& candidateFramebuffer : m_framebuffers)
+ 		{
++			if(candidateFramebuffer->m_exactColor) continue;
+ 			//Another case: TEX0 is pointing to the start of a page within our framebuffer (BGDA does this)
+ 			if(candidateFramebuffer->m_basePtr <= tex0.GetBufPtr() &&
+ 			   candidateFramebuffer->m_width == tex0.GetBufWidth() &&
+@@ -183,6 +189,115 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
+ 	}
+ }
+ 
++void CGSH_OpenGL::WriteBackOverlappingFramebuffers(const TEX0& tex0)
++{
++	auto texPageSize = CGsPixelFormats::GetPsmPageSize(tex0.nPsm);
++	uint32 texPagesX = std::max<uint32>(1, (std::max(tex0.GetBufWidth(), tex0.GetWidth()) + texPageSize.first - 1) / texPageSize.first);
++	uint32 texPagesY = std::max<uint32>(1, (tex0.GetHeight() + texPageSize.second - 1) / texPageSize.second);
++	uint32 texStart = tex0.GetBufPtr();
++	uint32 texEnd = texStart + (texPagesX * texPagesY * CGsPixelFormats::PAGESIZE);
++
++	for(const auto& framebuffer : m_framebuffers)
++	{
++		if(!framebuffer->m_gpuDirty) continue;
++		auto fbPageSize = CGsPixelFormats::GetPsmPageSize(framebuffer->m_psm);
++		uint32 fbPagesX = std::max<uint32>(1, framebuffer->m_width / fbPageSize.first);
++		uint32 fbStart = framebuffer->m_basePtr + (framebuffer->m_gpuDirtyMinY / fbPageSize.second) * fbPagesX * CGsPixelFormats::PAGESIZE;
++		uint32 fbEnd = framebuffer->m_basePtr + ((framebuffer->m_gpuDirtyMaxY / fbPageSize.second) + 1) * fbPagesX * CGsPixelFormats::PAGESIZE;
++		if((fbStart >= texEnd) || (texStart >= fbEnd)) continue;
++#ifdef _DEBUG
++		{
++			printf("[gsh] write-back fb %x w %u psm %x rows %u-%u [%x,%x) for tex %x tbw %u psm %x %ux%u [%x,%x)\n",
++			       framebuffer->m_basePtr, framebuffer->m_width, framebuffer->m_psm, framebuffer->m_gpuDirtyMinY, framebuffer->m_gpuDirtyMaxY,
++			       fbStart, fbEnd, tex0.GetBufPtr(), tex0.GetBufWidth(), static_cast<uint32>(tex0.nPsm), tex0.GetWidth(), tex0.GetHeight(), texStart, texEnd);
++		}
++#endif
++		WriteBackFramebuffer(framebuffer);
++		m_textureCache.InvalidateRange(fbStart, fbEnd - fbStart);
++	}
++}
++
++void CGSH_OpenGL::WriteBackFramebuffer(const FramebufferPtr& framebuffer)
++{
++	uint32 minY = framebuffer->m_gpuDirtyMinY;
++	uint32 maxY = framebuffer->m_gpuDirtyMaxY;
++	framebuffer->m_gpuDirty = false;
++	m_framebufferWriteBacks++;
++	if(!framebuffer->m_exactColor && ((framebuffer->m_psm == PSMCT32) || (framebuffer->m_psm == PSMCT24)))
++	{
++		//From now on, draw it with exact alpha (no "x2" alpha for GL blending)
++		framebuffer->m_exactColor = true;
++		m_emulatedFetchDirty = true;
++	}
++
++	//RAM written since the drawing (transfers) goes to the GPU first, then everything comes back
++	CommitFramebufferDirtyPages(framebuffer, minY, maxY);
++	if(m_multisampleEnabled)
++	{
++		ResolveFramebufferMultisample(framebuffer, m_fbScale);
++	}
++
++	uint32 width = framebuffer->m_width;
++	uint32 rows = maxY - minY + 1;
++	uint32 scale = m_fbScale;
++	std::vector<uint32> pixels(width * scale * rows * scale);
++	GLint prevReadFramebuffer = 0;
++	glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFramebuffer);
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, m_multisampleEnabled ? static_cast<GLuint>(framebuffer->m_resolveFramebuffer) : static_cast<GLuint>(framebuffer->m_framebuffer));
++	glPixelStorei(GL_PACK_ALIGNMENT, 4);
++	glReadPixels(0, minY * scale, width * scale, rows * scale, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
++	glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFramebuffer);
++	CHECKGLERROR();
++
++	auto pixelAt = [&](uint32 x, uint32 y) { return pixels[(x * scale) + ((y - minY) * scale * width * scale)]; };
++	switch(framebuffer->m_psm)
++	{
++	case PSMCT32:
++	{
++		CGsPixelFormats::CPixelIndexorPSMCT32 indexor(m_pRAM, framebuffer->m_basePtr, width / 64);
++		for(uint32 y = minY; y <= maxY; y++)
++			for(uint32 x = 0; x < width; x++)
++				indexor.SetPixel(x, y, pixelAt(x, y));
++	}
++	break;
++	case PSMCT24:
++	{
++		CGsPixelFormats::CPixelIndexorPSMCT32 indexor(m_pRAM, framebuffer->m_basePtr, width / 64);
++		for(uint32 y = minY; y <= maxY; y++)
++			for(uint32 x = 0; x < width; x++)
++			{
++				uint32* address = indexor.GetPixelAddress(x, y);
++				*address = (*address & 0xFF000000) | (pixelAt(x, y) & 0x00FFFFFF);
++			}
++	}
++	break;
++	case PSMCT16:
++	case PSMCT16S:
++	{
++		auto to16 = [](uint32 c) -> uint16 {
++			return static_cast<uint16>(((c >> 3) & 0x1F) | (((c >> 11) & 0x1F) << 5) | (((c >> 19) & 0x1F) << 10) | ((c >> 31) << 15));
++		};
++		if(framebuffer->m_psm == PSMCT16)
++		{
++			CGsPixelFormats::CPixelIndexorPSMCT16 indexor(m_pRAM, framebuffer->m_basePtr, width / 64);
++			for(uint32 y = minY; y <= maxY; y++)
++				for(uint32 x = 0; x < width; x++)
++					indexor.SetPixel(x, y, to16(pixelAt(x, y)));
++		}
++		else
++		{
++			CGsPixelFormats::CPixelIndexorPSMCT16S indexor(m_pRAM, framebuffer->m_basePtr, width / 64);
++			for(uint32 y = minY; y <= maxY; y++)
++				for(uint32 x = 0; x < width; x++)
++					indexor.SetPixel(x, y, to16(pixelAt(x, y)));
++		}
++	}
++	break;
++	default:
++		break;
++	}
++}
++
+ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
+ {
+ 	auto texInfo = SearchTextureFramebuffer(tex0);
+@@ -191,6 +306,10 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
+ 		return texInfo;
+ 	}
+ 
++	//The texture isn't one of our framebuffers, but it may read memory the GPU drew into
++	//(ex.: a PSMCT32 render read back as PSMT8). GS RAM has to hold that drawing first.
++	WriteBackOverlappingFramebuffers(tex0);
++
+ 	auto texture = m_textureCache.Search(tex0);
+ 	if(!texture)
+ 	{
+diff --git a/Source/gs/GSHandler.h b/Source/gs/GSHandler.h
+index 66bfe59..125dd17 100644
+--- a/Source/gs/GSHandler.h
++++ b/Source/gs/GSHandler.h
+@@ -901,6 +901,14 @@ public:
+ 	void SendGSCall(const CMailBox::FunctionType&, bool = false, bool = false);
+ 
+ 	void ProcessSingleFrame();
++	// Non-threaded GS: runs the calls queued so far without waiting for a flip (street-recomp-v3
++	// browser host, which must never block the page's main thread).
++	void ProcessPendingCalls()
++	{
++		assert(!m_gsThreaded);
++		while(m_mailBox.IsPending())
++			m_mailBox.ReceiveCall();
++	}
+ 
+ 	FlipCompleteEvent OnFlipComplete;
+ 	NewFrameEvent OnNewFrame;

@@ -1,0 +1,16 @@
+# Local server for tools/web/serve.sh (SITE = the web folder).
+{
+	admin off
+	auto_https off
+}
+:8088 {
+	root * {$SITE}
+	header {
+		Cross-Origin-Opener-Policy same-origin
+		Cross-Origin-Embedder-Policy require-corp
+		Cache-Control "private, no-cache"
+	}
+	file_server {
+		precompressed br
+	}
+}

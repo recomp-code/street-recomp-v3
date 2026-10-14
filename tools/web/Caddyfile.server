@@ -1,0 +1,23 @@
+# Private server for the web build (copy the web folder to /opt/nbarecomp/site).
+# Replace the domain; make the password hash with: caddy hash-password --plaintext 'your-password'
+# Behind Cloudflare (orange cloud) use SSL mode "Full": Caddy makes its own certificate here.
+{
+	auto_https disable_redirects
+	skip_install_trust
+}
+play.example.com:443 {
+	tls internal
+	basic_auth {
+		player $2a$14$REPLACE_WITH_YOUR_HASH
+	}
+	root * /opt/nbarecomp/site
+	header {
+		Cross-Origin-Opener-Policy same-origin
+		Cross-Origin-Embedder-Policy require-corp
+		Cache-Control "private, no-cache"
+		X-Robots-Tag noindex
+	}
+	file_server {
+		precompressed br
+	}
+}

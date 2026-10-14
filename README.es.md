@@ -2,8 +2,8 @@
 
 [English](README.md) | **Español**
 
-Juega a **NBA Street V3** (PS2) como un programa nativo en **Windows** y **macOS (Apple Silicon)**:
-alta resolución, texturas HD, mando y **online funcionando**. El juego se recompila a código nativo con
+Juega a **NBA Street V3** (PS2) como un programa nativo en **Windows** y **macOS (Apple Silicon)**, o
+en el **navegador** (experimental): alta resolución, texturas HD, mando y **online funcionando**. El juego se recompila a código nativo con
 [PS2Recomp](https://github.com/ran-j/PS2Recomp) y se dibuja en tu GPU con el render de
 [PCSX2](https://github.com/PCSX2/pcsx2).
 
@@ -29,6 +29,9 @@ alta resolución, texturas HD, mando y **online funcionando**. El juego se recom
 - **Mando** y teclado (Windows: tipo Xbox/XInput; Mac: Xbox, PlayStation o MFi).
 - **Menú gráfico en el juego:** F1, Back+Start o mantener START 1,5 s.
 - **Partidas guardadas** normales en una memory card emulada.
+- **Versión para navegador (experimental):** el mismo juego recompilado, en WebAssembly, a 60 fps en
+  Chrome en un Mac con Apple Silicon, con sonido, teclado y mando. El disco se lee bajo demanda por
+  HTTP: solo se descargan las partes que el juego usa, nunca la ISO completa.
 
 ## Jugar en Windows
 
@@ -60,6 +63,30 @@ nbastreet-v3-recomp/tools/macos/play.sh                                    # jug
 `install.sh` instala con Homebrew lo que falte (CMake, Ninja, FFmpeg), descarga las fuentes y compila el render y el juego a partir de tu ISO. Vuelve a
 ejecutarlo después de un `git pull` para actualizar.
 
+## Jugar en el navegador (experimental)
+
+Se compila en un Mac que ya hizo la instalación de arriba (reutiliza el código del juego hecho con tu
+ISO). Solo para ti: sírvelo en tu ordenador o en un servidor privado, nunca en público.
+
+```sh
+nbastreet-v3-recomp/tools/web/build.sh      # una vez: Emscripten, FFmpeg, render de Play!, el juego (1-3 horas)
+nbastreet-v3-recomp/tools/web/serve.sh      # después abre http://localhost:8088 en Chrome
+```
+
+- Pulsa **Jugar** (los navegadores solo permiten sonido tras un clic). La primera carga descarga el
+  código del juego (~27 MB comprimido) y luego el navegador lo guarda; el disco llega en trozos de
+  1 MB según se necesita.
+- Teclas como en la tabla de abajo (START = Enter, SELECT = Retroceso); los mandos también funcionan.
+  `?scale=1..4` fija la resolución interna (2 por defecto), `?debug` muestra estadísticas del render.
+- Las partidas se guardan en el navegador (OPFS). Todavía no hay online en el navegador.
+- En un servidor hacen falta HTTPS y las cabeceras COOP/COEP: mira `tools/web/Caddyfile.server`
+  (protegido con contraseña).
+
+Cómo funciona: el runtime y el juego corren en hilos de WebAssembly; los gráficos del PS2 (GS, VIF1,
+VU1) se dibujan con el render del emulador [Play!](https://github.com/jpd002/Play-) sobre WebGL2, con
+arreglos para los efectos que WebGL no tiene (`patches/play.patch`); el sonido del SPU2 va a un
+AudioWorklet.
+
 ## Controles
 
 | | Windows | Mac |
@@ -88,6 +115,9 @@ cuenta (cualquier e-mail; **no reutilices una contraseña real**) y una **person
 | `game/` | Configuración del recompilador para SLUS-21126, arreglos del juego, configuración de red |
 | `tools/` | Scripts de Windows (`install.ps1`, compilación, depuración, texturas) |
 | `tools/macos/` | Scripts de Mac (`install.sh`, `play.sh`, `build.sh`, `build_pcsx2.sh`, `run_scripted.sh`) |
+| `patches/ps2recomp-web.patch` | Versión de navegador, encima de `ps2recomp.patch` (Emscripten, plataforma web, host GS de Play!) |
+| `patches/play.patch`, `play-dependencies.patch` | Cambios sobre Play! `83700b2c` (arreglos del GS en WebGL2, excepciones wasm) |
+| `tools/web/` | Versión de navegador (`build.sh`, `serve.sh`, configuraciones de Caddy) |
 | `docs/BUILDING.es.md` | Compilación manual en Windows, texturas HD, cómo funciona el online |
 | `docs/PORTING_NOTES.md` | Notas técnicas: arquitectura y cada bug corregido |
 
