@@ -31,8 +31,8 @@ native code with [PS2Recomp](https://github.com/ran-j/PS2Recomp) and drawn on yo
 - **In-game graphics menu:** F1, Back+Start or hold START for 1.5 s.
 - Normal **saves** on an emulated memory card.
 - **Browser version (experimental):** the same recompiled game as WebAssembly, 60 fps in Chrome or
-  Firefox on an Apple Silicon Mac, sound, keyboard and controller. The disc is read on demand over HTTP: only
-  the parts the game uses are downloaded, never the whole ISO.
+  Firefox, with sound, controller, HD textures and **online play**. The disc streams on demand: only
+  the parts the game uses are downloaded, never the whole ISO. See [what it does](#what-the-browser-version-does).
 
 ## Play on Windows
 
@@ -72,6 +72,37 @@ For yourself only: serve it on your computer or a private server, never in publi
 nbastreet-v3-recomp/tools/web/build.sh      # once: Emscripten, FFmpeg, Play! renderer, the game (1-3 hours)
 nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in Chrome or Firefox
 ```
+
+### What the browser version does
+
+- **Fast streaming, no install:** the 4.7 GB disc is never downloaded. It is read in 1 MB HTTP Range
+  pieces as the game asks for them. Read-ahead follows each stream (videos, music) and only grows
+  once a reader really moves through the disc. A cold start downloads about 64 MB in its first 30 s,
+  27 MB of which is the game code (Brotli, 380 MB uncompressed).
+- **Instant second visit:** the browser keeps the game code, and the disc pieces already read go into
+  its Cache Storage, kept across visits. Disc reads run in the background, so the game never freezes
+  waiting for the network.
+- **60 fps, multi-threaded:**
+  - WebGL2 runs in its own thread (OffscreenCanvas);
+  - a worker thread runs the PS2 vector unit (VU1, through a JIT to WebAssembly) and the GIF;
+  - the game thread sleeps in the game's own frame-wait loops instead of spinning, which saves battery.
+- **Sharp graphics:**
+  - internal resolution 1x to 4x;
+  - accurate blending, framebuffer effects and palettes ported to WebGL2;
+  - fullscreen.
+- **HD textures:** the fan pack in PCSX2 format, recognized with PCSX2's own texture hash and loaded
+  image by image while the game shows it (decoded off-thread by the browser).
+- **Clean sound:**
+  - SPU2 with the hardware's Gaussian interpolation, volume sweeps and soft peak limiting;
+  - played through an AudioWorklet with adaptive buffering;
+  - emulated time keeps flowing smoothly, so streamed music and commentary never repeat or click.
+- **Online:** the same community server as the PC version. The game's network adapter talks over one
+  WebSocket to a small relay (`tools/web/net_relay.py`) that can only reach the game server.
+- **Controllers and keyboard:** any browser gamepad (standard or not) and keyboard.
+- **Saves:** kept in the browser (OPFS) across visits.
+- **Settings on the start screen:** resolution, HD textures, sound buffer, online.
+- **Works on** desktop Chrome and Firefox and on Android Chrome. Phones start at 1x resolution and get
+  a larger sound buffer.
 
 - Click **Jugar** (browsers only allow sound after a click). The first load downloads the game code
   (~27 MB compressed), then the browser keeps it; the disc streams in 1 MB pieces as needed.
