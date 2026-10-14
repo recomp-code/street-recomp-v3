@@ -17,6 +17,21 @@ index c7c7af5..97c9613 100644
  set(PS2X_IS_AARCH64_TARGET OFF)
  if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
      set(PS2X_IS_ARM_TARGET ON)
+diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
+index a2d29cb..c36b1c7 100644
+--- a/ps2xIOP/CMakeLists.txt
++++ b/ps2xIOP/CMakeLists.txt
+@@ -69,6 +69,10 @@ set(PS2X_DEV9_SOURCES
+     src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Relay.cpp
+ )
+ target_sources(ps2_iop PRIVATE ${PS2X_DEV9_SOURCES})
++if(EMSCRIPTEN)
++    # Browser: DEV9's sockets go over a WebSocket to the page's relay (no sockets in a browser).
++    target_sources(ps2_iop PRIVATE src/emulator/dev9/web_sockets.cpp)
++endif()
+ if(MSVC)
+     set_source_files_properties(${PS2X_DEV9_SOURCES} src/emulator/core/iop_dev9.cpp
+         PROPERTIES COMPILE_OPTIONS "/W0;/wd4996;/utf-8")
 diff --git a/ps2xIOP/include/ps2x/host_intrin.h b/ps2xIOP/include/ps2x/host_intrin.h
 index 43bc85f..f92bccb 100644
 --- a/ps2xIOP/include/ps2x/host_intrin.h
@@ -34,6 +49,20 @@ index 43bc85f..f92bccb 100644
  #else
  #include <x86intrin.h>
  #endif
+diff --git a/ps2xIOP/src/emulator/core/iop_dev9.cpp b/ps2xIOP/src/emulator/core/iop_dev9.cpp
+index e383599..6ed7fb0 100644
+--- a/ps2xIOP/src/emulator/core/iop_dev9.cpp
++++ b/ps2xIOP/src/emulator/core/iop_dev9.cpp
+@@ -18,6 +18,9 @@
+ #include <arpa/inet.h>
+ #include <netdb.h>
+ #endif
++#if defined(__EMSCRIPTEN__)
++#include "../dev9/web_sockets.h" // sockets over the page's WebSocket relay
++#endif
+ 
+ // ---- Symbols the PCSX2 DEV9 code expects from the rest of PCSX2 -------------------------------
+ 
 diff --git a/ps2xIOP/src/emulator/core/iop_memory.cpp b/ps2xIOP/src/emulator/core/iop_memory.cpp
 index c8b9ef1..f1fcbca 100644
 --- a/ps2xIOP/src/emulator/core/iop_memory.cpp
@@ -89,10 +118,55 @@ index be7a058..7d6a785 100644
          void dmaWrite(int core, const uint8_t *data, uint32_t bytes);
          // SPU2 -> memory.
 diff --git a/ps2xIOP/src/emulator/dev9/DEV9/AdapterUtils.cpp b/ps2xIOP/src/emulator/dev9/DEV9/AdapterUtils.cpp
-index 9478c33..5612800 100644
+index 9478c33..27502dc 100644
 --- a/ps2xIOP/src/emulator/dev9/DEV9/AdapterUtils.cpp
 +++ b/ps2xIOP/src/emulator/dev9/DEV9/AdapterUtils.cpp
-@@ -518,7 +518,7 @@ std::vector<IP_Address> AdapterUtils::GetGateways(const Adapter* adapter)
+@@ -215,8 +215,32 @@ bool AdapterUtils::GetAdapter(const std::string& name, Adapter* adapter, Adapter
+ 
+ 	return false;
+ }
++#if defined(__EMSCRIPTEN__)
++namespace
++{
++	// Browser: no network interfaces. A fixed virtual adapter; the traffic leaves through the
++	// page's WebSocket relay (web_sockets.cpp) whatever its addresses say.
++	ifaddrs* BrowserAdapter()
++	{
++		static sockaddr_in address{AF_INET, 0, {htonl(0xC0A8C802u)}, {}}; // 192.168.200.2
++		static sockaddr_in netmask{AF_INET, 0, {htonl(0xFFFFFF00u)}, {}};
++		static char name[] = "web0";
++		static ifaddrs adapter{};
++		adapter.ifa_name = name;
++		adapter.ifa_flags = IFF_UP;
++		adapter.ifa_addr = reinterpret_cast<sockaddr*>(&address);
++		adapter.ifa_netmask = reinterpret_cast<sockaddr*>(&netmask);
++		return &adapter;
++	}
++}
++#endif
++
+ bool AdapterUtils::GetAdapterAuto(Adapter* adapter, AdapterBuffer* buffer)
+ {
++#if defined(__EMSCRIPTEN__)
++	*adapter = *BrowserAdapter();
++	return true;
++#endif
+ 	std::unique_ptr<ifaddrs, IfAdaptersDeleter> adapterInfo;
+ 	ifaddrs* pAdapter = GetAllAdapters(&adapterInfo);
+ 	if (pAdapter == nullptr)
+@@ -272,6 +296,11 @@ std::optional<MAC_Address> AdapterUtils::GetAdapterMAC(const Adapter* adapter)
+ std::optional<MAC_Address> AdapterUtils::GetAdapterMAC(const Adapter* adapter)
+ {
+ 	MAC_Address macAddr{};
++#if defined(__EMSCRIPTEN__)
++	// Locally administered; sockets.cpp makes it unique per browser (PS2X_NET_ID).
++	macAddr = MAC_Address{{{0x02, 0x50, 0x53, 0x32, 0x00, 0x01}}};
++	return macAddr;
++#endif
+ #if defined(AF_LINK)
+ 	ifaddrs* adapterInfo;
+ 	const int error = getifaddrs(&adapterInfo);
+@@ -518,7 +547,7 @@ std::vector<IP_Address> AdapterUtils::GetGateways(const Adapter* adapter)
  	return collection;
  }
  #else
@@ -101,8 +175,902 @@ index 9478c33..5612800 100644
  {
  	Console.Error("DEV9: Unsupported OS, can't find Gateway");
  	return {};
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/InternalServers/DNS_Server.cpp b/ps2xIOP/src/emulator/dev9/DEV9/InternalServers/DNS_Server.cpp
+index 9110d5e..3910380 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/InternalServers/DNS_Server.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/InternalServers/DNS_Server.cpp
+@@ -26,6 +26,9 @@
+ 
+ #include "DEV9/DEV9.h"
+ #include "DEV9/AdapterUtils.h"
++#if defined(__EMSCRIPTEN__)
++#include "../../web_sockets.h" // sockets over the page's WebSocket relay
++#endif
+ 
+ using namespace PacketReader;
+ using namespace PacketReader::IP;
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/ICMP_Session/ICMP_Session.cpp b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/ICMP_Session/ICMP_Session.cpp
+index 2732bfa..ed4b7a8 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/ICMP_Session/ICMP_Session.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/ICMP_Session/ICMP_Session.cpp
+@@ -31,6 +31,9 @@
+ 
+ #include "ICMP_Session.h"
+ #include "DEV9/PacketReader/NetLib.h"
++#if defined(__EMSCRIPTEN__)
++#include "../../../web_sockets.h" // sockets over the page's WebSocket relay
++#endif
+ 
+ using namespace PacketReader;
+ using namespace PacketReader::IP;
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session.cpp b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session.cpp
+index 2c984a8..a77fe8b 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session.cpp
+@@ -11,6 +11,9 @@
+ #else
+ #include <unistd.h>
+ #endif
++#if defined(__EMSCRIPTEN__)
++#include "../../../web_sockets.h" // sockets over the page's WebSocket relay
++#endif
+ 
+ using namespace PacketReader;
+ using namespace PacketReader::IP;
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session_In.cpp b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session_In.cpp
+index e7bf0f8..bd68e09 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session_In.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session_In.cpp
+@@ -13,6 +13,9 @@
+ #endif
+ 
+ #include "TCP_Session.h"
++#if defined(__EMSCRIPTEN__)
++#include "../../../web_sockets.h" // sockets over the page's WebSocket relay
++#endif
+ 
+ using namespace PacketReader;
+ using namespace PacketReader::IP;
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session_Out.cpp b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session_Out.cpp
+index 6b90193..1e7e96e 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session_Out.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/TCP_Session/TCP_Session_Out.cpp
+@@ -22,6 +22,9 @@
+ #ifdef _WIN32
+ #include <ws2tcpip.h>
+ #endif
++#if defined(__EMSCRIPTEN__)
++#include "../../../web_sockets.h" // sockets over the page's WebSocket relay
++#endif
+ 
+ using namespace PacketReader;
+ using namespace PacketReader::IP;
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Common.cpp b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Common.cpp
+index a5fd815..a5d76cc 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Common.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Common.cpp
+@@ -23,6 +23,9 @@
+ 
+ #include "UDP_Common.h"
+ #include "DEV9/PacketReader/IP/UDP/UDP_Packet.h"
++#if defined(__EMSCRIPTEN__)
++#include "../../../web_sockets.h" // sockets over the page's WebSocket relay
++#endif
+ 
+ using namespace PacketReader;
+ using namespace PacketReader::IP;
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_FixedPort.cpp b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_FixedPort.cpp
+index 55819b8..3573dbf 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_FixedPort.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_FixedPort.cpp
+@@ -24,6 +24,9 @@
+ #include "UDP_Common.h"
+ #include "UDP_FixedPort.h"
+ #include "DEV9/PacketReader/IP/UDP/UDP_Packet.h"
++#if defined(__EMSCRIPTEN__)
++#include "../../../web_sockets.h" // sockets over the page's WebSocket relay
++#endif
+ 
+ using namespace PacketReader;
+ using namespace PacketReader::IP;
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Relay.cpp b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Relay.cpp
+index ae6eaa6..b3fe074 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Relay.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Relay.cpp
+@@ -26,6 +26,9 @@
+ #include "UDP_Relay.h"
+ #include "DEV9/PacketReader/IP/UDP/UDP_Packet.h"
+ #include "DEV9/PacketReader/Payload.h"
++#if defined(__EMSCRIPTEN__)
++#include "../../../web_sockets.h" // sockets over the page's WebSocket relay
++#endif
+ 
+ using namespace PacketReader;
+ using namespace PacketReader::IP;
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Session.cpp b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Session.cpp
+index 276a2a4..741098a 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Session.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/Sessions/UDP_Session/UDP_Session.cpp
+@@ -22,6 +22,9 @@
+ #include "UDP_Session.h"
+ #include "UDP_Common.h"
+ #include "DEV9/PacketReader/IP/UDP/UDP_Packet.h"
++#if defined(__EMSCRIPTEN__)
++#include "../../../web_sockets.h" // sockets over the page's WebSocket relay
++#endif
+ 
+ using namespace PacketReader;
+ using namespace PacketReader::IP;
+diff --git a/ps2xIOP/src/emulator/dev9/DEV9/sockets.cpp b/ps2xIOP/src/emulator/dev9/DEV9/sockets.cpp
+index 1af725a..8dc05f9 100644
+--- a/ps2xIOP/src/emulator/dev9/DEV9/sockets.cpp
++++ b/ps2xIOP/src/emulator/dev9/DEV9/sockets.cpp
+@@ -166,11 +166,15 @@ SocketAdapter::SocketAdapter()
+ 
+ 		// ps2recomp: a different memory card folder (second instance on this PC) gets another MAC:
+ 		// the relay and the game server tell players apart by it.
++		// PS2X_NET_ID does the same for browsers (all of them have the same card folder).
+ 		if (const char* mcRoot = std::getenv("PS2X_MC_ROOT"); mcRoot && *mcRoot)
+ 		{
+ 			u32 hash = 2166136261u;
+ 			for (const char* p = mcRoot; *p; ++p)
+ 				hash = (hash ^ static_cast<u8>(*p)) * 16777619u;
++			if (const char* netId = std::getenv("PS2X_NET_ID"); netId && *netId)
++				for (const char* p = netId; *p; ++p)
++					hash = (hash ^ static_cast<u8>(*p)) * 16777619u;
+ 			newMAC.bytes[3] = static_cast<u8>(hash);
+ 			newMAC.bytes[4] ^= static_cast<u8>(hash >> 8);
+ 		}
+diff --git a/ps2xIOP/src/emulator/dev9/web_sockets.cpp b/ps2xIOP/src/emulator/dev9/web_sockets.cpp
+new file mode 100644
+index 0000000..f0d0073
+--- /dev/null
++++ b/ps2xIOP/src/emulator/dev9/web_sockets.cpp
+@@ -0,0 +1,681 @@
++// Browser sockets for DEV9 over one WebSocket (see web_sockets.h). Messages, little endian:
++//   page -> relay   1 TCP_OPEN id ip4 port16 | 2 TCP_SEND id data | 3 CLOSE id | 4 UDP_OPEN id
++//                   5 UDP_SEND id ip4 port16 data | 6 RESOLVE id name | 7 SHUTDOWN id
++//   relay -> page   10 CONNECTED id ok8 | 11 DATA id data | 12 CLOSED id
++//                   13 UDP_DATA id ip4 port16 data | 14 RESOLVED id ok8 ip4
++// ip4 is in network order (as in sin_addr), the rest little endian.
++#if defined(__EMSCRIPTEN__)
++#define PS2X_WEB_SOCKETS_IMPL
++#include "web_sockets.h"
++
++#include <emscripten.h>
++#include <emscripten/threading.h>
++
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/ioctl.h>
++
++#include <algorithm>
++#include <cerrno>
++#include <chrono>
++#include <condition_variable>
++#include <cstdarg>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <fcntl.h>
++#include <map>
++#include <mutex>
++#include <pthread.h>
++#include <unistd.h>
++#include <vector>
++
++namespace
++{
++	// Our descriptors sit below FD_SETSIZE (select) and above the few real files the runtime opens.
++	constexpr int kFirstFd = 600;
++	constexpr int kLastFd = 1000;
++
++	enum class Kind
++	{
++		Tcp,
++		Udp,
++	};
++	enum class TcpState
++	{
++		Idle,
++		Connecting,
++		Connected,
++		Failed,
++	};
++
++	struct Datagram
++	{
++		uint32_t ip;   // network order
++		uint16_t port; // host order
++		std::vector<uint8_t> data;
++	};
++
++	struct Sock
++	{
++		Kind kind = Kind::Tcp;
++		bool nonblock = false;
++		TcpState state = TcpState::Idle;
++		std::deque<uint8_t> stream;
++		std::deque<Datagram> datagrams;
++		bool peerClosed = false;
++		bool udpOpened = false;
++		uint16_t localPort = 0;
++		int error = 0;
++		uint32_t defaultIp = 0;
++		uint16_t defaultPort = 0;
++	};
++
++	struct Resolution
++	{
++		bool done = false;
++		bool ok = false;
++		uint32_t ip = 0;
++	};
++
++	std::mutex g_mutex;
++	std::condition_variable g_cv;
++	std::map<int, Sock> g_sockets;
++	std::map<uint32_t, Resolution> g_resolutions;
++	std::deque<std::vector<uint8_t>> g_outgoing;
++	uint32_t g_nextResolution = 1;
++	uint16_t g_nextPort = 40000;
++	std::vector<uint8_t> g_inbox; // the message the net thread is handing over
++	std::once_flag g_threadOnce;
++
++	void put8(std::vector<uint8_t>& out, uint8_t value) { out.push_back(value); }
++	void put16(std::vector<uint8_t>& out, uint16_t value)
++	{
++		out.push_back(static_cast<uint8_t>(value));
++		out.push_back(static_cast<uint8_t>(value >> 8));
++	}
++	void put32(std::vector<uint8_t>& out, uint32_t value)
++	{
++		for (int i = 0; i < 4; i++)
++			out.push_back(static_cast<uint8_t>(value >> (8 * i)));
++	}
++	void putIp(std::vector<uint8_t>& out, uint32_t ip)
++	{
++		const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&ip);
++		out.insert(out.end(), bytes, bytes + 4);
++	}
++	uint16_t get16(const uint8_t* p) { return static_cast<uint16_t>(p[0] | (p[1] << 8)); }
++	uint32_t get32(const uint8_t* p) { return p[0] | (p[1] << 8) | (p[2] << 16) | (static_cast<uint32_t>(p[3]) << 24); }
++	uint32_t getIp(const uint8_t* p)
++	{
++		uint32_t ip;
++		std::memcpy(&ip, p, 4);
++		return ip;
++	}
++
++	std::vector<uint8_t> message(uint8_t type, uint32_t id)
++	{
++		std::vector<uint8_t> out;
++		put8(out, type);
++		put32(out, id);
++		return out;
++	}
++
++	void* netThread(void*)
++	{
++		// The WebSocket lives in this worker; its events need the worker's event loop, so the
++		// thread hands back to it. Outgoing messages are picked up every 2 ms.
++		EM_ASM({
++			const url = (self.location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + self.location.host + '/net';
++			function open() {
++				const ws = new WebSocket(url);
++				ws.binaryType = 'arraybuffer';
++				ws.onopen = () => { self.ps2xNet = ws; _ps2x_ws_link(1); };
++				ws.onmessage = (event) => {
++					const data = new Uint8Array(event.data);
++					const ptr = _ps2x_ws_inbox(data.length);
++					new Uint8Array(wasmMemory.buffer).set(data, ptr);
++					_ps2x_ws_receive(data.length);
++				};
++				ws.onclose = () => {
++					if (self.ps2xNet === ws) self.ps2xNet = null;
++					_ps2x_ws_link(0);
++					setTimeout(open, 2000);
++				};
++			}
++			open();
++			setInterval(() => { if (self.ps2xNet && self.ps2xNet.readyState === 1) _ps2x_ws_pump(); }, 2);
++		});
++		emscripten_exit_with_live_runtime();
++		return nullptr;
++	}
++
++	void startNetThread()
++	{
++		std::call_once(g_threadOnce, [] {
++			pthread_t thread;
++			pthread_create(&thread, nullptr, &netThread, nullptr);
++			pthread_detach(thread);
++		});
++	}
++
++	Sock* find(int fd)
++	{
++		auto it = g_sockets.find(fd);
++		return it == g_sockets.end() ? nullptr : &it->second;
++	}
++
++	bool readable(const Sock& s)
++	{
++		if (s.kind == Kind::Udp)
++			return !s.datagrams.empty();
++		return !s.stream.empty() || s.peerClosed || s.state == TcpState::Failed;
++	}
++	bool writable(const Sock& s) { return s.kind == Kind::Udp || s.state == TcpState::Connected; }
++	bool failed(const Sock& s) { return s.kind == Kind::Tcp && s.state == TcpState::Failed; }
++
++	template <typename Pred>
++	bool waitFor(std::unique_lock<std::mutex>& lock, Pred pred, int timeoutMs)
++	{
++		if (timeoutMs < 0)
++		{
++			g_cv.wait(lock, pred);
++			return true;
++		}
++		return g_cv.wait_for(lock, std::chrono::milliseconds(timeoutMs), pred);
++	}
++} // namespace
++
++extern "C" {
++EMSCRIPTEN_KEEPALIVE uint8_t* ps2x_ws_inbox(int length)
++{
++	g_inbox.resize(static_cast<size_t>(length));
++	return g_inbox.data();
++}
++
++EMSCRIPTEN_KEEPALIVE void ps2x_ws_link(int up)
++{
++	if (up)
++		return;
++	// Relay connection lost: every TCP connection is gone with it.
++	std::lock_guard lock(g_mutex);
++	for (auto& [fd, s] : g_sockets)
++	{
++		if (s.kind != Kind::Tcp)
++			continue;
++		if (s.state == TcpState::Connecting)
++		{
++			s.state = TcpState::Failed;
++			s.error = ECONNREFUSED;
++		}
++		else if (s.state == TcpState::Connected)
++			s.peerClosed = true;
++	}
++	g_cv.notify_all();
++}
++
++EMSCRIPTEN_KEEPALIVE void ps2x_ws_receive(int length)
++{
++	const uint8_t* p = g_inbox.data();
++	if (length < 5)
++		return;
++	const uint8_t type = p[0];
++	const uint32_t id = get32(p + 1);
++	std::lock_guard lock(g_mutex);
++	Sock* s = find(static_cast<int>(id));
++	switch (type)
++	{
++		case 10: // CONNECTED
++			if (s && length >= 6)
++			{
++				s->state = p[5] ? TcpState::Connected : TcpState::Failed;
++				s->error = p[5] ? 0 : ECONNREFUSED;
++			}
++			break;
++		case 11: // DATA
++			if (s)
++				s->stream.insert(s->stream.end(), p + 5, p + length);
++			break;
++		case 12: // CLOSED
++			if (s)
++			{
++				if (s->state == TcpState::Connecting)
++				{
++					s->state = TcpState::Failed;
++					s->error = ECONNREFUSED;
++				}
++				s->peerClosed = true;
++			}
++			break;
++		case 13: // UDP_DATA
++			if (s && length >= 11 && s->datagrams.size() < 512)
++				s->datagrams.push_back(Datagram{getIp(p + 5), get16(p + 9), std::vector<uint8_t>(p + 11, p + length)});
++			break;
++		case 14: // RESOLVED
++			if (length >= 10)
++			{
++				auto it = g_resolutions.find(id);
++				if (it != g_resolutions.end())
++				{
++					it->second.done = true;
++					it->second.ok = p[5] != 0;
++					it->second.ip = getIp(p + 6);
++				}
++			}
++			break;
++	}
++	g_cv.notify_all();
++}
++
++EMSCRIPTEN_KEEPALIVE void ps2x_ws_pump()
++{
++	std::deque<std::vector<uint8_t>> outgoing;
++	{
++		std::lock_guard lock(g_mutex);
++		outgoing.swap(g_outgoing);
++	}
++	for (const auto& m : outgoing)
++	{
++		EM_ASM({ self.ps2xNet.send(new Uint8Array(wasmMemory.buffer).slice($0, $0 + $1)); }, m.data(), m.size());
++	}
++}
++}
++
++int ps2x_ws_socket(int domain, int type, int)
++{
++	const int base = type & ~(SOCK_NONBLOCK | SOCK_CLOEXEC);
++	if (domain != AF_INET || (base != SOCK_STREAM && base != SOCK_DGRAM))
++	{
++		errno = base == SOCK_RAW ? EACCES : EAFNOSUPPORT; // no ICMP in a browser
++		return -1;
++	}
++	startNetThread();
++	std::lock_guard lock(g_mutex);
++	for (int fd = kFirstFd; fd < kLastFd; fd++)
++	{
++		if (g_sockets.count(fd))
++			continue;
++		Sock& s = g_sockets[fd];
++		s.kind = base == SOCK_STREAM ? Kind::Tcp : Kind::Udp;
++		s.nonblock = (type & SOCK_NONBLOCK) != 0;
++		return fd;
++	}
++	errno = EMFILE;
++	return -1;
++}
++
++int ps2x_ws_close(int fd)
++{
++	{
++		std::lock_guard lock(g_mutex);
++		if (Sock* s = find(fd))
++		{
++			if ((s->kind == Kind::Tcp && s->state != TcpState::Idle) || (s->kind == Kind::Udp && s->udpOpened))
++				g_outgoing.push_back(message(3, static_cast<uint32_t>(fd)));
++			g_sockets.erase(fd);
++			return 0;
++		}
++	}
++	return ::close(fd);
++}
++
++int ps2x_ws_bind(int fd, const sockaddr* address, socklen_t)
++{
++	std::lock_guard lock(g_mutex);
++	Sock* s = find(fd);
++	if (!s)
++	{
++		errno = EBADF;
++		return -1;
++	}
++	const uint16_t port = ntohs(reinterpret_cast<const sockaddr_in*>(address)->sin_port);
++	s->localPort = port ? port : g_nextPort++;
++	return 0;
++}
++
++int ps2x_ws_connect(int fd, const sockaddr* address, socklen_t)
++{
++	const sockaddr_in* in = reinterpret_cast<const sockaddr_in*>(address);
++	std::unique_lock lock(g_mutex);
++	Sock* s = find(fd);
++	if (!s)
++	{
++		errno = EBADF;
++		return -1;
++	}
++	if (s->kind == Kind::Udp)
++	{
++		s->defaultIp = in->sin_addr.s_addr;
++		s->defaultPort = ntohs(in->sin_port);
++		return 0;
++	}
++	s->state = TcpState::Connecting;
++	auto m = message(1, static_cast<uint32_t>(fd));
++	putIp(m, in->sin_addr.s_addr);
++	put16(m, ntohs(in->sin_port));
++	g_outgoing.push_back(std::move(m));
++	if (s->nonblock)
++	{
++		errno = EINPROGRESS;
++		return -1;
++	}
++	waitFor(lock, [fd] { Sock* t = find(fd); return !t || t->state != TcpState::Connecting; }, 15000);
++	s = find(fd);
++	if (!s || s->state != TcpState::Connected)
++	{
++		errno = ECONNREFUSED;
++		return -1;
++	}
++	return 0;
++}
++
++ssize_t ps2x_ws_sendto(int fd, const void* data, size_t length, int, const sockaddr* address, socklen_t)
++{
++	std::lock_guard lock(g_mutex);
++	Sock* s = find(fd);
++	if (!s)
++	{
++		errno = EBADF;
++		return -1;
++	}
++	if (s->kind == Kind::Tcp)
++	{
++		if (s->state != TcpState::Connected)
++		{
++			errno = s->state == TcpState::Failed ? ECONNRESET : EWOULDBLOCK;
++			return -1;
++		}
++		auto m = message(2, static_cast<uint32_t>(fd));
++		m.insert(m.end(), static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + length);
++		g_outgoing.push_back(std::move(m));
++		return static_cast<ssize_t>(length);
++	}
++	uint32_t ip = s->defaultIp;
++	uint16_t port = s->defaultPort;
++	if (address)
++	{
++		const sockaddr_in* in = reinterpret_cast<const sockaddr_in*>(address);
++		ip = in->sin_addr.s_addr;
++		port = ntohs(in->sin_port);
++	}
++	if (!s->udpOpened)
++	{
++		g_outgoing.push_back(message(4, static_cast<uint32_t>(fd)));
++		s->udpOpened = true;
++		if (!s->localPort)
++			s->localPort = g_nextPort++;
++	}
++	auto m = message(5, static_cast<uint32_t>(fd));
++	putIp(m, ip);
++	put16(m, port);
++	m.insert(m.end(), static_cast<const uint8_t*>(data), static_cast<const uint8_t*>(data) + length);
++	g_outgoing.push_back(std::move(m));
++	return static_cast<ssize_t>(length);
++}
++
++ssize_t ps2x_ws_send(int fd, const void* data, size_t length, int flags)
++{
++	return ps2x_ws_sendto(fd, data, length, flags, nullptr, 0);
++}
++
++ssize_t ps2x_ws_recvfrom(int fd, void* data, size_t length, int flags, sockaddr* address, socklen_t* addressLength)
++{
++	std::unique_lock lock(g_mutex);
++	Sock* s = find(fd);
++	if (!s)
++	{
++		errno = EBADF;
++		return -1;
++	}
++	const bool dontWait = s->nonblock || (flags & MSG_DONTWAIT);
++	if (!readable(*s))
++	{
++		if (dontWait)
++		{
++			errno = EWOULDBLOCK;
++			return -1;
++		}
++		waitFor(lock, [fd] { Sock* t = find(fd); return !t || readable(*t); }, -1);
++		s = find(fd);
++		if (!s)
++		{
++			errno = EBADF;
++			return -1;
++		}
++	}
++	if (s->kind == Kind::Udp)
++	{
++		Datagram d = std::move(s->datagrams.front());
++		s->datagrams.pop_front();
++		const size_t n = std::min(length, d.data.size());
++		std::memcpy(data, d.data.data(), n);
++		if (address && addressLength)
++		{
++			sockaddr_in from{};
++			from.sin_family = AF_INET;
++			from.sin_addr.s_addr = d.ip;
++			from.sin_port = htons(d.port);
++			std::memcpy(address, &from, std::min<size_t>(*addressLength, sizeof(from)));
++			*addressLength = sizeof(from);
++		}
++		return static_cast<ssize_t>(n);
++	}
++	if (s->stream.empty())
++	{
++		if (s->state == TcpState::Failed)
++		{
++			errno = ECONNRESET;
++			return -1;
++		}
++		return 0; // the server closed its side
++	}
++	const size_t n = std::min(length, s->stream.size());
++	std::copy(s->stream.begin(), s->stream.begin() + static_cast<std::ptrdiff_t>(n), static_cast<uint8_t*>(data));
++	if (!(flags & MSG_PEEK))
++		s->stream.erase(s->stream.begin(), s->stream.begin() + static_cast<std::ptrdiff_t>(n));
++	return static_cast<ssize_t>(n);
++}
++
++ssize_t ps2x_ws_recv(int fd, void* data, size_t length, int flags)
++{
++	return ps2x_ws_recvfrom(fd, data, length, flags, nullptr, nullptr);
++}
++
++int ps2x_ws_select(int count, fd_set* read, fd_set* write, fd_set* except, timeval* timeout)
++{
++	const fd_set inRead = read ? *read : fd_set{};
++	const fd_set inWrite = write ? *write : fd_set{};
++	const fd_set inExcept = except ? *except : fd_set{};
++	auto evaluate = [&](bool apply) {
++		int ready = 0;
++		fd_set outRead, outWrite, outExcept;
++		FD_ZERO(&outRead);
++		FD_ZERO(&outWrite);
++		FD_ZERO(&outExcept);
++		for (int fd = 0; fd < count && fd < FD_SETSIZE; fd++)
++		{
++			const Sock* s = find(fd);
++			if (!s)
++				continue;
++			if (read && FD_ISSET(fd, &inRead) && readable(*s))
++				FD_SET(fd, &outRead), ready++;
++			if (write && FD_ISSET(fd, &inWrite) && writable(*s))
++				FD_SET(fd, &outWrite), ready++;
++			if (except && FD_ISSET(fd, &inExcept) && failed(*s))
++				FD_SET(fd, &outExcept), ready++;
++		}
++		if (apply)
++		{
++			if (read)
++				*read = outRead;
++			if (write)
++				*write = outWrite;
++			if (except)
++				*except = outExcept;
++		}
++		return ready;
++	};
++	std::unique_lock lock(g_mutex);
++	const int timeoutMs = timeout ? static_cast<int>(timeout->tv_sec * 1000 + timeout->tv_usec / 1000) : -1;
++	if (evaluate(false) == 0 && timeoutMs != 0)
++		waitFor(lock, [&] { return evaluate(false) > 0; }, timeoutMs);
++	return evaluate(true);
++}
++
++int ps2x_ws_ioctl(int fd, int request, ...)
++{
++	va_list args;
++	va_start(args, request);
++	void* argument = va_arg(args, void*);
++	va_end(args);
++	std::lock_guard lock(g_mutex);
++	Sock* s = find(fd);
++	if (!s)
++	{
++		errno = ENOTTY;
++		return -1;
++	}
++	if (request == FIONBIO)
++	{
++		s->nonblock = *static_cast<int*>(argument) != 0;
++		return 0;
++	}
++	if (request == FIONREAD)
++	{
++		const size_t available = s->kind == Kind::Tcp ? s->stream.size() : (s->datagrams.empty() ? 0 : s->datagrams.front().data.size());
++		*static_cast<int*>(argument) = static_cast<int>(available);
++		return 0;
++	}
++	errno = EINVAL;
++	return -1;
++}
++
++int ps2x_ws_fcntl(int fd, int command, ...)
++{
++	va_list args;
++	va_start(args, command);
++	const int argument = va_arg(args, int);
++	va_end(args);
++	{
++		std::lock_guard lock(g_mutex);
++		if (Sock* s = find(fd))
++		{
++			if (command == F_GETFL)
++				return O_RDWR | (s->nonblock ? O_NONBLOCK : 0);
++			if (command == F_SETFL)
++				s->nonblock = (argument & O_NONBLOCK) != 0;
++			return 0;
++		}
++	}
++	return ::fcntl(fd, command, argument);
++}
++
++int ps2x_ws_setsockopt(int fd, int, int, const void*, socklen_t)
++{
++	std::lock_guard lock(g_mutex);
++	if (!find(fd))
++	{
++		errno = EBADF;
++		return -1;
++	}
++	return 0; // TCP_NODELAY, SO_BROADCAST...: the relay has its own sockets
++}
++
++int ps2x_ws_getsockopt(int fd, int level, int option, void* value, socklen_t* length)
++{
++	std::lock_guard lock(g_mutex);
++	Sock* s = find(fd);
++	if (!s)
++	{
++		errno = EBADF;
++		return -1;
++	}
++	if (value && length && *length >= sizeof(int))
++	{
++		int result = 0;
++		if (level == SOL_SOCKET && option == SO_ERROR)
++		{
++			result = s->error;
++			s->error = 0;
++		}
++		std::memcpy(value, &result, sizeof(result));
++		*length = sizeof(int);
++	}
++	return 0;
++}
++
++int ps2x_ws_getsockname(int fd, sockaddr* address, socklen_t* length)
++{
++	std::lock_guard lock(g_mutex);
++	Sock* s = find(fd);
++	if (!s)
++	{
++		errno = EBADF;
++		return -1;
++	}
++	sockaddr_in local{};
++	local.sin_family = AF_INET;
++	local.sin_port = htons(s->localPort);
++	std::memcpy(address, &local, std::min<size_t>(*length, sizeof(local)));
++	*length = sizeof(local);
++	return 0;
++}
++
++int ps2x_ws_shutdown(int fd, int how)
++{
++	std::lock_guard lock(g_mutex);
++	Sock* s = find(fd);
++	if (!s)
++	{
++		errno = EBADF;
++		return -1;
++	}
++	if (s->kind == Kind::Tcp && s->state == TcpState::Connected && (how == SHUT_WR || how == SHUT_RDWR))
++		g_outgoing.push_back(message(7, static_cast<uint32_t>(fd)));
++	return 0;
++}
++
++int ps2x_ws_getaddrinfo(const char* node, const char* service, const addrinfo* hints, addrinfo** result)
++{
++	if (!node || !result)
++		return EAI_NONAME;
++	uint32_t ip = 0;
++	if (inet_pton(AF_INET, node, &ip) != 1)
++	{
++		// A name: the relay looks it up.
++		startNetThread();
++		std::unique_lock lock(g_mutex);
++		const uint32_t id = g_nextResolution++;
++		g_resolutions[id] = Resolution{};
++		auto m = message(6, id);
++		m.insert(m.end(), node, node + std::strlen(node));
++		g_outgoing.push_back(std::move(m));
++		waitFor(lock, [id] { return g_resolutions[id].done; }, 10000);
++		const Resolution r = g_resolutions[id];
++		g_resolutions.erase(id);
++		if (!r.done || !r.ok)
++			return EAI_NONAME;
++		ip = r.ip;
++	}
++	// One block: the addrinfo followed by its address (freed by ps2x_ws_freeaddrinfo).
++	auto* block = static_cast<uint8_t*>(std::calloc(1, sizeof(addrinfo) + sizeof(sockaddr_in)));
++	auto* info = reinterpret_cast<addrinfo*>(block);
++	auto* address = reinterpret_cast<sockaddr_in*>(block + sizeof(addrinfo));
++	address->sin_family = AF_INET;
++	address->sin_addr.s_addr = ip;
++	address->sin_port = htons(static_cast<uint16_t>(service ? std::atoi(service) : 0));
++	info->ai_family = AF_INET;
++	info->ai_socktype = hints ? hints->ai_socktype : SOCK_STREAM;
++	info->ai_protocol = hints ? hints->ai_protocol : 0;
++	info->ai_addrlen = sizeof(sockaddr_in);
++	info->ai_addr = reinterpret_cast<sockaddr*>(address);
++	*result = info;
++	return 0;
++}
++
++void ps2x_ws_freeaddrinfo(addrinfo* info)
++{
++	std::free(info);
++}
++
++#endif
+diff --git a/ps2xIOP/src/emulator/dev9/web_sockets.h b/ps2xIOP/src/emulator/dev9/web_sockets.h
+new file mode 100644
+index 0000000..2f99b0d
+--- /dev/null
++++ b/ps2xIOP/src/emulator/dev9/web_sockets.h
+@@ -0,0 +1,55 @@
++// Browser build: the sockets DEV9's network sessions use (TCP, UDP, name lookups), carried over a
++// single WebSocket to the relay on the page's server (/net), which makes the real connections.
++// They behave like non-blocking BSD sockets with no network round trip per call: received data
++// waits in local queues, so recv/select/ioctl(FIONREAD) answer at once and send/connect only
++// queue a message.
++//
++// DEV9 sources include this after their system headers; the macros send their socket calls
++// here. web_sockets.cpp defines PS2X_WEB_SOCKETS_IMPL to see the real names.
++#pragma once
++#if defined(__EMSCRIPTEN__)
++
++#include <netdb.h>
++#include <sys/select.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++
++int ps2x_ws_socket(int domain, int type, int protocol);
++int ps2x_ws_close(int fd);
++int ps2x_ws_bind(int fd, const struct sockaddr* address, socklen_t length);
++int ps2x_ws_connect(int fd, const struct sockaddr* address, socklen_t length);
++ssize_t ps2x_ws_send(int fd, const void* data, size_t length, int flags);
++ssize_t ps2x_ws_recv(int fd, void* data, size_t length, int flags);
++ssize_t ps2x_ws_sendto(int fd, const void* data, size_t length, int flags, const struct sockaddr* address, socklen_t addressLength);
++ssize_t ps2x_ws_recvfrom(int fd, void* data, size_t length, int flags, struct sockaddr* address, socklen_t* addressLength);
++int ps2x_ws_select(int count, fd_set* read, fd_set* write, fd_set* except, struct timeval* timeout);
++int ps2x_ws_ioctl(int fd, int request, ...);
++int ps2x_ws_fcntl(int fd, int command, ...);
++int ps2x_ws_setsockopt(int fd, int level, int option, const void* value, socklen_t length);
++int ps2x_ws_getsockopt(int fd, int level, int option, void* value, socklen_t* length);
++int ps2x_ws_getsockname(int fd, struct sockaddr* address, socklen_t* length);
++int ps2x_ws_shutdown(int fd, int how);
++int ps2x_ws_getaddrinfo(const char* node, const char* service, const struct addrinfo* hints, struct addrinfo** result);
++void ps2x_ws_freeaddrinfo(struct addrinfo* info);
++
++#if !defined(PS2X_WEB_SOCKETS_IMPL)
++#define socket ps2x_ws_socket
++#define close ps2x_ws_close
++#define bind ps2x_ws_bind
++#define connect ps2x_ws_connect
++#define send ps2x_ws_send
++#define recv ps2x_ws_recv
++#define sendto ps2x_ws_sendto
++#define recvfrom ps2x_ws_recvfrom
++#define select ps2x_ws_select
++#define ioctl ps2x_ws_ioctl
++#define fcntl ps2x_ws_fcntl
++#define setsockopt ps2x_ws_setsockopt
++#define getsockopt ps2x_ws_getsockopt
++#define getsockname ps2x_ws_getsockname
++#define shutdown ps2x_ws_shutdown
++#define getaddrinfo ps2x_ws_getaddrinfo
++#define freeaddrinfo ps2x_ws_freeaddrinfo
++#endif
++
++#endif
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index f29c1d1..0100db3 100644
+index f29c1d1..c485f3c 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -81,7 +81,18 @@ else()
@@ -134,7 +1102,7 @@ index f29c1d1..0100db3 100644
      set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
  else()
      set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
-@@ -517,12 +528,90 @@ target_include_directories(ps2_runtime PUBLIC
+@@ -517,12 +528,96 @@ target_include_directories(ps2_runtime PUBLIC
      ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
  )
  
@@ -208,9 +1176,15 @@ index f29c1d1..0100db3 100644
 +            -sPTHREAD_POOL_SIZE=16
 +            -sEXIT_RUNTIME=0
 +            "--profiling-funcs"
-+            "-sEXPORTED_RUNTIME_METHODS=['addRunDependency','removeRunDependency']"
++            # WebGL from a thread: the page's canvas is handed over as an OffscreenCanvas
++            "-sOFFSCREENCANVAS_SUPPORT=1"
++            "-sOFFSCREENCANVASES_TO_PTHREAD=''"
++            # The disc's on-demand reader with read-ahead (replaces Emscripten's fetch backend JS)
++            "--js-library=${CMAKE_CURRENT_SOURCE_DIR}/web/library_fetch_stream.js"
++            "-sEXPORTED_RUNTIME_METHODS=['addRunDependency','removeRunDependency','stringToNewUTF8']"
 +            "-sEXPORTED_FUNCTIONS=['_main','_EmptyBlockHandler','_MemoryUtils_GetByteProxy','_MemoryUtils_GetHalfProxy','_MemoryUtils_GetWordProxy','_MemoryUtils_GetDoubleProxy','_MemoryUtils_SetByteProxy','_MemoryUtils_SetHalfProxy','_MemoryUtils_SetWordProxy','_MemoryUtils_SetDoubleProxy','_LWL_Proxy','_LWR_Proxy','_LDL_Proxy','_LDR_Proxy','_SWL_Proxy','_SWR_Proxy','_SDL_Proxy','_SDR_Proxy']"
 +        )
++        set_property(TARGET ps2EntryRunner APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/web/library_fetch_stream.js")
 +    else()
 +        target_sources(ps2EntryRunner PRIVATE web/node_platform.cpp)
 +        set_source_files_properties(web/node_platform.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON SKIP_UNITY_BUILD_INCLUSION ON)
@@ -226,6 +1200,334 @@ index f29c1d1..0100db3 100644
  if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
      target_sources(ps2EntryRunner PRIVATE
          src/lib/ps2_debug_panel.cpp
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index 31a296b..f3532df 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -237,6 +237,7 @@ enum class EeEventType : uint8_t
+     ExternalWake,
+     Alarm,
+     DelayedInvocation,
++    HostTask,
+ };
+ 
+ struct EeEvent
+@@ -279,6 +280,9 @@ public:
+     void run();
+     void requestStop();
+     void postEvent(EeEvent event);
++    // From any thread: runs task on the EE thread at its next checkpoint (where it may queue
++    // guest invocations, e.g. a completion callback for work done by another host thread).
++    void postHostTask(std::function<void()> task);
+     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
+     void accountCycles(uint32_t cycles) noexcept;
+     [[nodiscard]] bool isExecutingGuest() const noexcept;
+@@ -442,6 +446,8 @@ private:
+ 
+     mutable std::mutex m_eventMutex;
+     std::condition_variable m_eventCv;
++    std::unordered_map<uint32_t, std::function<void()>> m_hostTasks; // under m_eventMutex
++    uint32_t m_nextHostTaskId = 0;
+     std::deque<EeEvent> m_events;
+     std::vector<ScheduledEvent> m_deadlines;
+     std::deque<GuestInvocation> m_pendingInvocations;
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index f09ec48..abf2923 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -10,6 +10,7 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
+ 
+ #include <algorithm>
+ #include <array>
++#include <vector>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdio>
+@@ -462,6 +463,18 @@ void EeScheduler::requestStop()
+     m_eventCv.notify_all();
+ }
+ 
++void EeScheduler::postHostTask(std::function<void()> task)
++{
++    {
++        std::lock_guard lock(m_eventMutex);
++        const uint32_t id = ++m_nextHostTaskId;
++        m_hostTasks.emplace(id, std::move(task));
++        m_events.push_back(EeEvent{EeEventType::HostTask, id, 0});
++        m_checkpointPending.store(true, std::memory_order_release);
++    }
++    m_eventCv.notify_one();
++}
++
+ void EeScheduler::postEvent(EeEvent event)
+ {
+     if (event.type == EeEventType::Stop)
+@@ -478,6 +491,37 @@ void EeScheduler::postEvent(EeEvent event)
+     m_eventCv.notify_one();
+ }
+ 
++namespace
++{
++    // Guest PC ranges where a game only spins waiting for an event (see ps2xAddEeIdleLoop).
++    struct EeIdleLoop
++    {
++        uint32_t begin;
++        uint32_t end;
++    };
++    std::vector<EeIdleLoop> g_eeIdleLoops;
++
++    bool eeIdleLoopAt(uint32_t pc) noexcept
++    {
++        static const bool s_disabled = std::getenv("PS2X_NO_IDLE_SLEEP") != nullptr;
++        if (s_disabled)
++            return false;
++        for (const EeIdleLoop &loop : g_eeIdleLoops)
++        {
++            if (pc >= loop.begin && pc < loop.end)
++                return true;
++        }
++        return false;
++    }
++}
++
++// Called by game overrides at startup: [begin, end) is a loop that only polls memory written by
++// interrupt handlers or other threads.
++void ps2xAddEeIdleLoop(uint32_t begin, uint32_t end)
++{
++    g_eeIdleLoops.push_back({begin, end});
++}
++
+ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+ {
+     accountCycles(cycles);
+@@ -541,6 +585,18 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+         return true;
+     }
+ 
++    // A game wait loop (registered by its override, e.g. "spin until the vsync counter moves"):
++    // nothing can change until the next timed event or a posted one, so sleep until then
++    // instead of spinning through the loop on a whole host core.
++    if (running != nullptr && hostDeadline != INT64_MAX && eeIdleLoopAt(running->activeContext().pc))
++    {
++        std::unique_lock lock(m_eventMutex);
++        const auto until = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(hostDeadline));
++        m_eventCv.wait_until(lock, until, [this]()
++                             { return !m_events.empty() || m_checkpointPending.load(std::memory_order_acquire) ||
++                                      m_stopRequested.load(std::memory_order_acquire); });
++    }
++
+     renewTimeSlice();
+     return false;
+ }
+@@ -2293,6 +2349,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+         queueInvocation(std::move(invocation));
+         break;
+     }
++    case EeEventType::HostTask:
++    {
++        std::function<void()> task;
++        {
++            std::lock_guard lock(m_eventMutex);
++            auto it = m_hostTasks.find(event.id);
++            if (it != m_hostTasks.end())
++            {
++                task = std::move(it->second);
++                m_hostTasks.erase(it);
++            }
++        }
++        if (task)
++            task();
++        break;
++    }
+     case EeEventType::DelayedInvocation:
+     {
+         auto it = m_delayedInvocations.find(event.id);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index 4928e86..d29ccdf 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -4,7 +4,11 @@
+ #include "runtime/ee_scheduler.h"
+ 
+ #include <chrono>
++#include <condition_variable>
+ #include <cstring>
++#include <deque>
++#include <mutex>
++#include <thread>
+ #include <iostream>
+ 
+ namespace ps2_stubs
+@@ -247,13 +251,109 @@ namespace ps2_stubs
+         }
+     }
+ 
++#if defined(__EMSCRIPTEN__)
++    namespace
++    {
++        // Browser: the disc comes over the network, and a read can take a few hundred
++        // milliseconds. Like a real drive, sceCdRead only starts the read: a host thread fetches
++        // the sectors into RAM while the game (and the IOP, and the sound) keep running, and the
++        // completion callback fires when the data is there. sceCdSync reports the drive busy.
++        struct CdReadJob
++        {
++            uint32_t lbn;
++            uint32_t sectors;
++            uint32_t offset;
++            size_t bytes;
++        };
++        std::mutex g_cdJobMutex;
++        std::condition_variable g_cdJobCv;
++        std::condition_variable g_cdIdleCv;
++        std::deque<CdReadJob> g_cdJobs;
++        uint32_t g_cdReadsInFlight = 0u; // under g_cdJobMutex
++        std::mutex g_cdIoMutex;          // readCdSectors (shared file handles) one at a time
++
++        void cdReaderThread(PS2Runtime *runtime, uint8_t *rdram)
++        {
++            for (;;)
++            {
++                CdReadJob job;
++                {
++                    std::unique_lock lock(g_cdJobMutex);
++                    g_cdJobCv.wait(lock, [] { return !g_cdJobs.empty(); });
++                    job = g_cdJobs.front();
++                    g_cdJobs.pop_front();
++                }
++                bool ok;
++                {
++                    std::lock_guard io(g_cdIoMutex);
++                    ok = readCdSectors(job.lbn, job.sectors, rdram + job.offset, job.bytes);
++                    if (!ok)
++                        std::memset(rdram + job.offset, 0, job.bytes);
++                }
++                {
++                    std::lock_guard lock(g_cdJobMutex);
++                    --g_cdReadsInFlight;
++                }
++                g_cdIdleCv.notify_all();
++                runtime->eeScheduler().postHostTask([runtime, job]()
++                                                    { queueCdUserCallback(runtime, kCdFuncRead, job.sectors); });
++            }
++        }
++
++        void startCdRead(PS2Runtime *runtime, uint8_t *rdram, const CdReadJob &job)
++        {
++            static const bool s_started = [runtime, rdram]()
++            {
++                std::thread(cdReaderThread, runtime, rdram).detach();
++                return true;
++            }();
++            (void)s_started;
++            {
++                std::lock_guard lock(g_cdJobMutex);
++                ++g_cdReadsInFlight;
++                g_cdJobs.push_back(job);
++            }
++            g_cdJobCv.notify_one();
++        }
++
++        bool cdReadsInFlight()
++        {
++            std::lock_guard lock(g_cdJobMutex);
++            return g_cdReadsInFlight != 0u;
++        }
++
++        // Synchronous readers (blocking sync, other read commands) go after the queued reads.
++        void waitCdReadsDone()
++        {
++            std::unique_lock lock(g_cdJobMutex);
++            g_cdIdleCv.wait(lock, [] { return g_cdReadsInFlight == 0u; });
++        }
++    }
++#endif
++
++    // Reads that complete before returning (read chains, streaming): in the browser they come
++    // after any queued sceCdRead, one at a time with the reader thread.
++    static bool readCdSectorsAfterQueued(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t bytes)
++    {
++#if defined(__EMSCRIPTEN__)
++        waitCdReadsDone();
++        std::lock_guard io(g_cdIoMutex);
++#endif
++        return readCdSectors(lbn, sectors, dst, bytes);
++    }
++
+     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         struct CompletionNotifier
+         {
+             PS2Runtime *runtime;
+             uint32_t sectors;
+-            ~CompletionNotifier() { queueCdUserCallback(runtime, kCdFuncRead, sectors); }
++            bool armed = true;
++            ~CompletionNotifier()
++            {
++                if (armed)
++                    queueCdUserCallback(runtime, kCdFuncRead, sectors);
++            }
+         } completionNotifier{runtime, getRegU32(ctx, 5)};
+ 
+         const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
+@@ -304,6 +404,23 @@ namespace ps2_stubs
+             return readCdSectors(args.lbn, args.sectors, rdram + offset, bytes);
+         };
+ 
++#if defined(__EMSCRIPTEN__)
++        if (runtime != nullptr && isResolvableCdLbn(a0))
++        {
++            const uint32_t offset = a2 & PS2_RAM_MASK;
++            const size_t bytes = clampReadBytes(a1, offset);
++            g_cdStreamingLbn = a0 + a1;
++            if (bytes != 0)
++            {
++                startCdRead(runtime, rdram, CdReadJob{a0, a1, offset, bytes});
++                completionNotifier.armed = false; // the reader thread delivers it
++            }
++            setReturnS32(ctx, 1); // command accepted
++            return;
++        }
++        waitCdReadsDone();
++        std::lock_guard cdIo(g_cdIoMutex);
++#endif
+         CdReadArgs selected{a0, a1, a2, "a0/a1/a2"};
+         bool ok = tryRead(selected);
+ 
+@@ -386,6 +503,16 @@ namespace ps2_stubs
+ 
+     void sceCdSync(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
++#if defined(__EMSCRIPTEN__)
++        // mode 0 waits for the drive, 1 only asks whether it is still busy
++        if (getRegU32(ctx, 4) == 0u)
++            waitCdReadsDone();
++        else if (cdReadsInFlight())
++        {
++            setReturnS32(ctx, 1);
++            return;
++        }
++#endif
+         setReturnS32(ctx, 0); // 0 = completed/not busy
+     }
+ 
+@@ -563,7 +690,7 @@ namespace ps2_stubs
+                 bytes = maxBytes;
+             }
+ 
+-            if (!readCdSectors(lbn, sectors, rdram + offset, bytes))
++            if (!readCdSectorsAfterQueued(lbn, sectors, rdram + offset, bytes))
+             {
+                 ok = false;
+                 break;
+@@ -899,7 +1026,7 @@ namespace ps2_stubs
+ 
+                 const uint32_t readLbn = g_cdStreamingLbn;
+                 const size_t readBytes = static_cast<size_t>(sectors) * kCdSectorSize;
+-                if (!readCdSectors(readLbn, sectors, rdram + offset, readBytes))
++                if (!readCdSectorsAfterQueued(readLbn, sectors, rdram + offset, readBytes))
+                 {
+                     finishCdStRead(rdram, ctx, state, g_lastCdError);
+                     return;
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
 index 0e1a2ad..721e03b 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
@@ -649,6 +1951,240 @@ index 0000000..96f355f
 +// Disc files the game opens through cdrom0: (PS2X_VFS_LOG=1 run to a match), besides the ELF.
 +"SLUS_211.26",
 +"DEV9.IRX",
+diff --git a/ps2xRuntime/web/library_fetch_stream.js b/ps2xRuntime/web/library_fetch_stream.js
+new file mode 100644
+index 0000000..ca0810a
+--- /dev/null
++++ b/ps2xRuntime/web/library_fetch_stream.js
+@@ -0,0 +1,228 @@
++/**
++ * WasmFS fetch backend for the game disc, replacing Emscripten's (src/lib/libwasmfs_fetch.js):
++ * the same on-demand HTTP Range reads, plus
++ *  - read-ahead: sequential reads (streamed music, videos, loading) fetch the next chunks in
++ *    the background, several requests at once, so the game rarely waits for the network;
++ *  - one request per chunk: a read waits for a chunk already on its way instead of asking again;
++ *  - a bounded cache (least recently used chunks go), instead of keeping every chunk ever read;
++ *  - a persistent copy in the browser's Cache Storage: what was played once is read locally the
++ *    next time (keyed by the server's ETag, so a changed file is fetched again).
++ */
++
++addToLibrary({
++  $wasmFS$JSMemoryRanges: {},
++
++  _wasmfs_create_fetch_backend_js__deps: [
++    '$wasmFS$backends',
++    '$wasmFS$JSMemoryRanges',
++    '_wasmfs_fetch_get_file_url',
++    '_wasmfs_fetch_get_chunk_size',
++  ],
++  _wasmfs_create_fetch_backend_js: async function(backend) {
++    const READ_AHEAD_CHUNKS = 8;     // chunks fetched ahead of a sequential read
++    const STREAMS = 4;               // interleaved sequential readers followed at once (video, audio...)
++    const MAX_CACHED_CHUNKS = 384;   // per file (x chunk size, 1 MB here)
++
++    // Persistent chunk store (absent in some private modes: then memory only).
++    var diskCache = (typeof caches !== 'undefined') ? caches.open('ps2x-disc-v1').catch(() => null) : Promise.resolve(null);
++
++    function chunkKey(info, i) {
++      return `${info.url}?ps2x-chunk=${i}&size=${info.chunkSize}&v=${encodeURIComponent(info.version)}`;
++    }
++
++    function fileUrl(file) {
++      var name = UTF8ToString(__wasmfs_fetch_get_file_url(file));
++      if (name.indexOf('://') !== -1) return name;
++      try {
++        return new URL(name, self.location.origin).toString();
++      } catch (_e) {
++        throw {status: 404};
++      }
++    }
++
++    // First access: size and range support (HEAD), or the whole file when it is small or the
++    // server can't do ranges.
++    async function openFile(file) {
++      var info = wasmFS$JSMemoryRanges[file];
++      if (info) return info.ready ? info : await info.opening;
++      var url = fileUrl(file);
++      var chunkSize = __wasmfs_fetch_get_chunk_size(file);
++      info = wasmFS$JSMemoryRanges[file] = {url, chunkSize, size: 0, chunks: new Map(), pending: new Map(),
++                                            ready: false, streams: []};
++      info.opening = (async () => {
++        var head = await fetch(url, {method: 'HEAD', headers: {'Range': 'bytes=0-'}});
++        var length = head.ok && head.headers.has('Content-Length') ? parseInt(head.headers.get('Content-Length'), 10) : 0;
++        if (head.ok && head.headers.get('Accept-Ranges') == 'bytes' && length > chunkSize * 2) {
++          info.size = length;
++          info.version = head.headers.get('ETag') || head.headers.get('Last-Modified') || String(length);
++        } else {
++          var whole = await fetch(url);
++          if (!whole.ok) throw whole;
++          var data = new Uint8Array(await whole.arrayBuffer());
++          info.size = data.byteLength;
++          info.chunkSize = Math.max(1, data.byteLength);
++          info.chunks.set(0, data);
++        }
++        info.ready = true;
++        return info;
++      })();
++      try {
++        return await info.opening;
++      } catch (e) {
++        wasmFS$JSMemoryRanges[file] = undefined;
++        throw e;
++      }
++    }
++
++    function chunkCount(info) {
++      return Math.ceil(info.size / info.chunkSize);
++    }
++
++    // Fetches chunks [first, last] that are neither cached nor on their way, as one request.
++    function requestChunks(info, first, last) {
++      last = Math.min(last, chunkCount(info) - 1);
++      while (first <= last && (info.chunks.has(first) || info.pending.has(first))) first++;
++      while (last >= first && (info.chunks.has(last) || info.pending.has(last))) last--;
++      if (first > last) return;
++      // One promise per chunk, settled as soon as that chunk is in: a read never waits for its
++      // neighbours in the same request.
++      var settle = new Map();
++      for (var i = first; i <= last; i++) {
++        let resolve, reject;
++        var promise = new Promise((ok, fail) => { resolve = ok; reject = fail; });
++        promise.catch(() => {});
++        settle.set(i, {resolve, reject});
++        info.pending.set(i, promise);
++      }
++      var arrived = (i, chunk) => {
++        if (!info.chunks.has(i)) info.chunks.set(i, chunk);
++        info.pending.delete(i);
++        settle.get(i).resolve();
++        settle.delete(i);
++      };
++      (async () => {
++        // Chunks already in the browser's store come from there; the rest from the network.
++        var cache = await diskCache;
++        var missing = [];
++        for (var i = first; i <= last; i++) {
++          var hit = cache ? await cache.match(chunkKey(info, i)).catch(() => null) : null;
++          if (hit) arrived(i, new Uint8Array(await hit.arrayBuffer()));
++          else missing.push(i);
++        }
++        while (missing.length) {
++          var a = missing[0], b = a;
++          while (missing.length > b - a + 1 && missing[b - a + 1] === b + 1) b++;
++          missing.splice(0, b - a + 1);
++          var start = a * info.chunkSize;
++          var end = Math.min((b + 1) * info.chunkSize, info.size);
++          var response = await fetch(info.url, {headers: {'Range': `bytes=${start}-${end - 1}`}});
++          if (!response.ok) throw response;
++          var bytes = new Uint8Array(await response.arrayBuffer());
++          for (var j = a; j <= b; j++) {
++            var chunk = bytes.slice(j * info.chunkSize - start, (j + 1) * info.chunkSize - start);
++            arrived(j, chunk);
++            if (cache) cache.put(chunkKey(info, j), new Response(chunk)).catch(() => {});
++          }
++        }
++      })().catch((error) => {
++        for (var [i, s] of settle) { info.pending.delete(i); s.reject(error); }
++      });
++    }
++
++    function evict(info, keepFrom, keepTo) {
++      // Maps keep insertion order and touch() re-inserts on use: the first ones are the oldest.
++      for (var key of info.chunks.keys()) {
++        if (info.chunks.size <= MAX_CACHED_CHUNKS) break;
++        if (key >= keepFrom && key <= keepTo) continue;
++        info.chunks.delete(key);
++      }
++    }
++
++    function touch(info, i) {
++      var chunk = info.chunks.get(i);
++      info.chunks.delete(i);
++      info.chunks.set(i, chunk);
++      return chunk;
++    }
++
++    async function getFileRange(info, offset, len) {
++      if (info.chunks.size === 1 && info.chunkSize >= info.size) return; // whole file
++      var first = (offset / info.chunkSize) | 0;
++      var last = ((offset + len - 1) / info.chunkSize) | 0;
++      // Sequential reading? The game may interleave several streams (a video, its sound, music):
++      // a read continues one of them when it starts where that one ended (or in the same chunk).
++      var stream = info.streams.find((st) => first === st.chunk || first === st.chunk + 1);
++      if (stream) {
++        info.streams.splice(info.streams.indexOf(stream), 1);
++        stream.streak++;
++      } else {
++        stream = {chunk: last, streak: 0};
++        if (info.streams.length >= STREAMS) info.streams.shift();
++      }
++      stream.chunk = last;
++      info.streams.push(stream);
++      requestChunks(info, first, last);
++      if (stream.streak >= 1) {
++        // Ahead of the reader, in two requests so the next chunk arrives first.
++        requestChunks(info, last + 1, last + 2);
++        requestChunks(info, last + 3, last + READ_AHEAD_CHUNKS);
++      }
++      var waitStart = 0;
++      for (var i = first; i <= last; i++) {
++        if (!info.chunks.has(i)) {
++          waitStart ||= performance.now();
++          await info.pending.get(i);
++          if (!info.chunks.has(i)) requestChunks(info, i, i), await info.pending.get(i);
++        }
++      }
++      if (waitStart) {
++        // The game had to wait for the network: count it (and show long waits with ?debug)
++        var waited = performance.now() - waitStart;
++        info.waits = (info.waits || 0) + 1;
++        info.waitedMs = (info.waitedMs || 0) + waited;
++        if (waited > 20) err(`[disc] waited ${waited.toFixed(0)} ms for chunk ${first}-${last} (stream streak ${stream.streak}, ${info.waits} waits, ${info.waitedMs.toFixed(0)} ms total)`);
++      }
++      evict(info, first, last + READ_AHEAD_CHUNKS);
++    }
++
++    wasmFS$backends[backend] = {
++      allocFile: async (file) => { /* nop */ },
++      freeFile: async (file) => {
++        wasmFS$JSMemoryRanges[file] = undefined;
++      },
++      write: async (file, buffer, length, offset) => {
++        console.error('fetch backend: files are read-only');
++      },
++      read: async (file, buffer, length, offset) => {
++        if (offset < 0 || length <= 0) return 0;
++        var info;
++        try {
++          info = await openFile(file);
++          length = Math.min(length, info.size - offset);
++          if (length <= 0) return 0;
++          await getFileRange(info, offset, length);
++        } catch (failedResponse) {
++          return failedResponse.status === 404 ? -{{{ cDefs.ENOENT }}} : -{{{ cDefs.EBADF }}};
++        }
++        var chunkSize = info.chunkSize;
++        var first = (offset / chunkSize) | 0;
++        var last = ((offset + length - 1) / chunkSize) | 0;
++        for (var i = first; i <= last; i++) {
++          var chunk = touch(info, i);
++          var chunkStart = i * chunkSize;
++          var start = Math.max(chunkStart, offset);
++          var end = Math.min(chunkStart + chunkSize, offset + length);
++          HEAPU8.set(chunk.subarray(start - chunkStart, end - chunkStart), buffer + (start - offset));
++        }
++        return length;
++      },
++      getSize: async (file) => {
++        try {
++          return (await openFile(file)).size;
++        } catch (failedResponse) {
++          return 0;
++        }
++      },
++    };
++  },
++});
 diff --git a/ps2xRuntime/web/node_platform.cpp b/ps2xRuntime/web/node_platform.cpp
 new file mode 100644
 index 0000000..b5ea934
@@ -689,10 +2225,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..e36055c
+index 0000000..b0df5d6
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,929 @@
+@@ -0,0 +1,974 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -712,6 +2248,7 @@ index 0000000..e36055c
 +
 +#include <emscripten.h>
 +#include <emscripten/html5.h>
++#include <emscripten/threading.h>
 +
 +#include "BasicBlock.h"
 +#include "FrameDump.h"
@@ -914,6 +2451,12 @@ index 0000000..e36055c
 +	}
 +
 +	bool g_debug = false; // <page>?debug: GS statistics every 2 s, F8/F9 dumps
++	int g_scale = 2;      // internal resolution (decided on the page thread, from the URL)
++	bool g_hd = false;    // HD texture pack (data/hd/): on, except on phones; <page>?hd=0 / ?hd=1
++	ps2live::RingHeader* g_ring = nullptr;
++	// Canvas size in device pixels, measured on the page thread (the GL thread can't read CSS)
++	std::atomic<uint32_t> g_wantedWidth{0};
++	std::atomic<uint32_t> g_wantedHeight{0};
 +	int g_traceState = 0; // F9: 1 = start at the next vsync, 2 = tracing this frame
 +
 +	EM_BOOL OnKey(int eventType, const EmscriptenKeyboardEvent* e, void*)
@@ -1144,7 +2687,9 @@ index 0000000..e36055c
 +		            (unsigned long long)h.pathBytes[3], (unsigned long long)gsRegs[0x00], (unsigned long long)gsRegs[0x4C],
 +		            (unsigned long long)gsRegs[0x05]);
 +		h.pathBytes[1] = h.pathBytes[2] = h.pathBytes[3] = h.xgkicks = 0;
-+		std::printf("[webgs] 2s: framebuffer write-backs %u, software sprites %u\n", h.gsWeb->m_framebufferWriteBacks, h.gsWeb->m_softwareSprites);
++		std::printf("[webgs] 2s: framebuffer write-backs %u, software sprites %u, hd textures shown %u, loaded %u\n", h.gsWeb->m_framebufferWriteBacks,
++		            h.gsWeb->m_softwareSprites, h.gsWeb->m_hdTexturesShown, h.gsWeb->m_hdTexturesLoaded);
++		h.gsWeb->m_hdTexturesShown = 0;
 +		h.gsWeb->m_framebufferWriteBacks = 0;
 +		h.gsWeb->m_softwareSprites = 0;
 +		std::printf("[webgs] 2s: gs reg writes:");
@@ -1405,11 +2950,8 @@ index 0000000..e36055c
 +	// presentation in device pixels.
 +	void UpdatePresentation(Host& h)
 +	{
-+		double cssWidth = 0.0, cssHeight = 0.0;
-+		emscripten_get_element_css_size("#canvas", &cssWidth, &cssHeight);
-+		const double ratio = emscripten_get_device_pixel_ratio();
-+		const uint32 width = static_cast<uint32>(cssWidth * ratio + 0.5);
-+		const uint32 height = static_cast<uint32>(cssHeight * ratio + 0.5);
++		const uint32 width = g_wantedWidth.load();
++		const uint32 height = g_wantedHeight.load();
 +		if(width == 0 || height == 0 || (width == h.presentWidth && height == h.presentHeight))
 +			return;
 +		h.presentWidth = width;
@@ -1426,9 +2968,8 @@ index 0000000..e36055c
 +	{
 +		Host& h = *g_host;
 +		UpdatePresentation(h);
-+		PublishPad(h.ring);
-+		// The GS calls the worker thread queued (draws, transfers, flips) run here, where the WebGL
-+		// context lives; the last flip is what the page shows.
++		// The GS calls the worker thread queued (draws, transfers, flips) run here, in the thread
++		// that owns the canvas (OffscreenCanvas); the last flip is what the page shows.
 +		const double gsStart = emscripten_get_now();
 +		h.gsWeb->Pump();
 +		h.gsMs += emscripten_get_now() - gsStart;
@@ -1533,7 +3074,9 @@ index 0000000..e36055c
 +	}
 +
 +	// Main thread: builds the GS/VIF1/VU1/GIF and starts the frame loop.
-+	void StartOnMainThread(void* arg)
++	// GL thread: owns the canvas (transferred as an OffscreenCanvas), the WebGL context and Play!'s
++	// GS; draws in its own requestAnimationFrame loop.
++	void* GlThread(void* arg)
 +	{
 +		auto* ring = static_cast<ps2live::RingHeader*>(arg);
 +
@@ -1545,12 +3088,13 @@ index 0000000..e36055c
 +		attr.antialias = EM_FALSE;
 +		attr.preserveDrawingBuffer = EM_TRUE; // a vsync without changes keeps the last picture
 +		attr.powerPreference = EM_WEBGL_POWER_PREFERENCE_HIGH_PERFORMANCE;
++		attr.proxyContextToMainThread = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_DISALLOW;
 +		g_context = emscripten_webgl_create_context("#canvas", &attr);
 +		if(g_context <= 0)
 +		{
 +			std::printf("[webgs] WebGL2 is not available (%d)\n", static_cast<int>(g_context));
 +			ring->consumerQuit = 1;
-+			return;
++			return nullptr;
 +		}
 +
 +		Host* h = new Host();
@@ -1566,15 +3110,9 @@ index 0000000..e36055c
 +		std::memset(h->vuMem1, 0, PS2::VUMEM1SIZE);
 +		std::memset(h->microMem1, 0, PS2::MICROMEM1SIZE);
 +
-+		// Internal resolution: <page>?scale=N (1 = native PS2, default 2)
-+		const int scale = EM_ASM_INT({
-+			const value = parseInt(new URLSearchParams(location.search).get('scale') || '2', 10);
-+			return value >= 1 && value <= 4 ? value : 2;
-+		});
-+		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
 +		CGSH_OpenGL::RegisterPreferences();
-+		CAppConfig::GetInstance().SetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR, scale);
-+		std::printf("[webgs] internal resolution x%d\n", scale);
++		CAppConfig::GetInstance().SetPreferenceInteger(PREF_CGSH_OPENGL_RESOLUTION_FACTOR, g_scale);
++		std::printf("[webgs] internal resolution x%d\n", g_scale);
 +
 +		h->gsWeb = new CGSH_Web(g_context);
 +		h->gsWeb->debug = g_debug;
@@ -1588,21 +3126,11 @@ index 0000000..e36055c
 +		h->flipConnection = h->gs->OnFlipComplete.Connect([h]() { h->flips++; });
 +		h->gs->Initialize();
 +		h->gsWeb->Pump();
-+		CGSHandler::PRESENTATION_PARAMS presentation;
-+		presentation.mode = CGSHandler::PRESENTATION_MODE_FIT;
-+		double cssWidth = 1280.0, cssHeight = 960.0;
-+		emscripten_get_element_css_size("#canvas", &cssWidth, &cssHeight);
-+		const double ratio = emscripten_get_device_pixel_ratio();
-+		presentation.windowWidth = static_cast<uint32>(cssWidth * ratio);
-+		presentation.windowHeight = static_cast<uint32>(cssHeight * ratio);
-+		emscripten_set_canvas_element_size("#canvas", static_cast<int>(presentation.windowWidth), static_cast<int>(presentation.windowHeight));
-+		h->gs->SetPresentationParams(presentation);
++		UpdatePresentation(*h);
 +		h->gs->Reset();
 +		h->gsWeb->Pump();
-+
-+		emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
-+		emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
-+		emscripten_set_blur_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnBlur);
++		if(g_hd)
++			h->gsWeb->EnableHdTextures("data/hd");
 +
 +		ring->consumerAlive = 1;
 +		ring->consumerFlags = 1; // never waits on the data event: no wake-ups needed
@@ -1611,8 +3139,61 @@ index 0000000..e36055c
 +		pthread_t thread;
 +		pthread_create(&thread, nullptr, &HostThread, h);
 +		pthread_detach(thread);
-+		std::printf("[webgs] GS host started (Play! GS on WebGL2 in the page, VIF1/VU1/GIF in a worker)\n");
++		std::printf("[webgs] GS host started (Play! GS on WebGL2 in its own thread, VIF1/VU1/GIF in another)\n");
 +		emscripten_request_animation_frame_loop(&OnAnimationFrame, nullptr);
++		emscripten_exit_with_live_runtime(); // back to this worker's event loop, which runs the frames
++		return nullptr;
++	}
++
++	// Page thread: only what needs the DOM: keyboard, gamepads and the canvas size.
++	EM_BOOL OnPageFrame(double, void*)
++	{
++		double cssWidth = 0.0, cssHeight = 0.0;
++		emscripten_get_element_css_size("#canvas", &cssWidth, &cssHeight);
++		const double ratio = emscripten_get_device_pixel_ratio();
++		g_wantedWidth.store(static_cast<uint32_t>(cssWidth * ratio + 0.5));
++		g_wantedHeight.store(static_cast<uint32_t>(cssHeight * ratio + 0.5));
++		PublishPad(g_ring);
++		return g_ring->producerAlive ? EM_TRUE : EM_FALSE;
++	}
++
++	void StartOnMainThread(void* arg)
++	{
++		g_ring = static_cast<ps2live::RingHeader*>(arg);
++		// Internal resolution: <page>?scale=N (1 = native PS2). Default 2, or 1 on phones, tablets
++		// and machines with few cores, where the GPU has less room.
++		g_scale = EM_ASM_INT({
++			const small = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent) || (navigator.hardwareConcurrency || 8) <= 4;
++			const fallback = small ? 1 : 2;
++			const value = parseInt(new URLSearchParams(location.search).get('scale') || String(fallback), 10);
++			return value >= 1 && value <= 4 ? value : fallback;
++		});
++		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
++		g_hd = EM_ASM_INT({
++			const hd = new URLSearchParams(location.search).get('hd');
++			if (hd !== null) return hd !== '0' ? 1 : 0;
++			return /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent) ? 0 : 1;
++		}) != 0;
++		OnPageFrame(0.0, nullptr); // first size, before the GL thread starts
++
++		emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
++		emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
++		emscripten_set_blur_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnBlur);
++		emscripten_request_animation_frame_loop(&OnPageFrame, nullptr);
++
++		pthread_attr_t attr;
++		pthread_attr_init(&attr);
++		emscripten_pthread_attr_settransferredcanvases(&attr, "#canvas");
++		pthread_t thread;
++		const int error = pthread_create(&thread, &attr, &GlThread, g_ring);
++		pthread_attr_destroy(&attr);
++		if(error != 0)
++		{
++			std::printf("[webgs] could not give the canvas to a thread (%d)\n", error);
++			g_ring->consumerQuit = 1;
++			return;
++		}
++		pthread_detach(thread);
 +	}
 +} // namespace
 +
@@ -1752,10 +3333,10 @@ index 0000000..ac06b4b
 +void SetSoundPitch(Sound, float) {}
 diff --git a/ps2xRuntime/web/site/index.html b/ps2xRuntime/web/site/index.html
 new file mode 100644
-index 0000000..54446f7
+index 0000000..b0e36de
 --- /dev/null
 +++ b/ps2xRuntime/web/site/index.html
-@@ -0,0 +1,184 @@
+@@ -0,0 +1,197 @@
 +<!doctype html>
 +<html lang="es">
 +<head>
@@ -1829,6 +3410,7 @@ index 0000000..54446f7
 +    statusText.textContent = 'La página necesita las cabeceras COOP/COEP del servidor.';
 +  }
 +  let audioContext = null;
++  const isMobile = /Android|iPhone|iPad|Mobile/i.test(navigator.userAgent);
 +  var Module = {
 +    canvas: document.getElementById('canvas'),
 +    print: append,
@@ -1846,7 +3428,8 @@ index 0000000..54446f7
 +  const playButton = document.getElementById('play');
 +  playButton.onclick = () => {
 +    playButton.remove();
-+    audioContext = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
++    // Phones: larger output buffers ('playback'), fewer glitches when the CPU is busy
++    audioContext = new AudioContext({ sampleRate: 48000, latencyHint: isMobile ? 'playback' : 'interactive' });
 +    audioContext.resume();
 +    document.getElementById('canvas').focus();
 +    Module.removeRunDependency('play-click');
@@ -1867,7 +3450,11 @@ index 0000000..54446f7
 +        this.lastL = this.lastR = 0;
 +        this.underruns = this.skips = this.blocks = 0;
 +        this.frac = 0;
-+        this.level = 2400;
++        // Frames kept queued: ~50 ms (phones ~100 ms), growing after each underrun up to 150 ms
++        // (phones 200 ms), whose threads get descheduled more often
++        this.target = o.mobile ? 4800 : 2400;
++        this.maxTarget = o.mobile ? 9600 : 7200;
++        this.level = this.target;
 +        this.capture = null;
 +        this.port.onmessage = (e) => { if (e.data === 'capture') this.capture = []; };
 +      }
@@ -1880,13 +3467,20 @@ index 0000000..54446f7
 +        const written = Atomics.load(this.index, 0);
 +        let read = Atomics.load(this.index, 1);
 +        let queued = (written - read) >>> 0;
-+        if (queued > 14000) { read = (written - 2400) >>> 0; queued = 2400; this.frac = 0; this.skips++; }
-+        if (this.waiting && queued >= 1600) this.waiting = false;
-+        if (!this.waiting && queued < left.length + 2) { this.waiting = true; this.underruns++; }
++        // Far too much queued (the game caught up after a stall): drop the excess, the last resort
++        if (queued > Math.min(this.frames - 2048, this.target * 3)) { read = (written - this.target) >>> 0; queued = this.target; this.level = queued; this.frac = 0; this.skips++; }
++        if (this.waiting && queued >= this.target * 0.7) this.waiting = false;
++        if (!this.waiting && queued < left.length + 2) {
++          // Ran dry: keep a bit more sound queued from now on
++          this.waiting = true; this.underruns++;
++          this.target = Math.min(this.target + 600, this.maxTarget);
++        }
 +        // The game's clock and the sound card's differ (the game makes ~49 kHz): play slightly
-+        // faster or slower (up to 4%) to keep ~60 ms queued, instead of dropping samples (clicks)
++        // faster or slower (up to 4%) to keep the target queued, instead of dropping samples
++        // (clicks); up to 8% faster to work off a backlog after a stall
 +        this.level += (queued - this.level) * 0.01;
-+        const step = 1 + Math.max(-0.04, Math.min(0.04, (this.level - 2400) / 2400 * 0.06));
++        const fast = this.level > this.target * 1.8 ? 0.08 : 0.04;
++        const step = 1 + Math.max(-0.04, Math.min(fast, (this.level - this.target) / this.target * 0.06));
 +        for (let i = 0; i < left.length; i++) {
 +          if (!this.waiting && ((written - read) >>> 0) > 1) {
 +            const [l0, r0] = this.sample(read), [l1, r1] = this.sample((read + 1) >>> 0);
@@ -1907,24 +3501,24 @@ index 0000000..54446f7
 +        if (++this.blocks % 1500 === 0) {
 +          const produced = ((written - (this.lastWritten ?? written)) >>> 0) / (currentTime - (this.lastTime ?? currentTime) || 1);
 +          this.lastWritten = written; this.lastTime = currentTime;
-+          this.port.postMessage({ underruns: this.underruns, skips: this.skips, queued, step, produced });
++          this.port.postMessage({ underruns: this.underruns, skips: this.skips, queued, step, produced, target: this.target });
 +        }
 +        return true;
 +      }
 +    }
 +    registerProcessor('ps2x-output', Ps2xOutput);`;
 +  async function ps2xStartAudio(buffer, ring, frames, index) {
-+    audioContext ??= new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
++    audioContext ??= new AudioContext({ sampleRate: 48000, latencyHint: isMobile ? 'playback' : 'interactive' });
 +    const url = URL.createObjectURL(new Blob([audioWorklet], { type: 'text/javascript' }));
 +    await audioContext.audioWorklet.addModule(url);
 +    const node = new AudioWorkletNode(audioContext, 'ps2x-output', {
 +      numberOfInputs: 0, outputChannelCount: [2],
-+      processorOptions: { buffer, ring, frames, index },
++      processorOptions: { buffer, ring, frames, index, mobile: isMobile },
 +    });
 +    node.connect(audioContext.destination);
 +    node.port.onmessage = (e) => {
 +      if (e.data.capture) { window.ps2xAudioCapture = e.data.capture; return; }
-+      append(`[audio] underruns ${e.data.underruns}, skips ${e.data.skips}, queued ${e.data.queued}, rate ${e.data.step.toFixed(4)}, game makes ${e.data.produced.toFixed(0)} Hz`);
++      append(`[audio] underruns ${e.data.underruns}, skips ${e.data.skips}, queued ${e.data.queued}, rate ${e.data.step.toFixed(4)}, target ${e.data.target}, game makes ${e.data.produced.toFixed(0)} Hz`);
 +    };
 +    window.ps2xAudioNode = node;
 +    if (audioContext.state !== 'running') sound.hidden = false;
@@ -1942,18 +3536,19 @@ index 0000000..54446f7
 +</html>
 diff --git a/ps2xRuntime/web/web_platform.cpp b/ps2xRuntime/web/web_platform.cpp
 new file mode 100644
-index 0000000..ec5e29c
+index 0000000..ffc0b3e
 --- /dev/null
 +++ b/ps2xRuntime/web/web_platform.cpp
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,191 @@
 +// Browser platform for the WebAssembly build, run at the start of main() (on a worker: the build
 +// uses PROXY_TO_PTHREAD, so the page's main thread stays free for the GS host).
 +//
 +// Files (WasmFS):
 +//   /game        fetch backend on <page>/data/: read on demand in 1 MB HTTP Range requests,
 +//                so the 4.7 GB ISO is never downloaded whole, only the sectors the game reads
-+//   /saves/mc0   OPFS (the browser's private file system): the memory card survives reloads
-+// Environment: the GS host is the page (PS2X_GS_LIVE=1), no network yet.
++//   /saves/mc0   OPFS (the browser's private file system): the memory card survives reloads;
++//                the network configuration (BWNETCNF) comes from data/mc0/ the first time
++// Environment: the GS host is the page (PS2X_GS_LIVE=1); online through the page's /net relay.
 +// Audio: the runtime's 48 kHz stereo stream goes into a ring buffer in the wasm memory, which an
 +// AudioWorklet on the page reads directly (the memory is a SharedArrayBuffer).
 +
@@ -1988,6 +3583,26 @@ index 0000000..ec5e29c
 +	close(fd);
 +}
 +
++// Copies a file from data/ onto the memory card unless it is there already.
++static void SeedSaveFile(const char* from, const char* to)
++{
++	struct stat st;
++	if(stat(to, &st) == 0)
++		return;
++	const int in = open(from, O_RDONLY);
++	if(in < 0)
++		return;
++	const int out = open(to, O_WRONLY | O_CREAT | O_TRUNC, 0666);
++	char buffer[4096];
++	ssize_t got;
++	while(out >= 0 && (got = read(in, buffer, sizeof(buffer))) > 0)
++		write(out, buffer, static_cast<size_t>(got));
++	std::printf("[web] memory card: %s %s\n", to, out >= 0 ? "added" : "failed");
++	if(out >= 0)
++		close(out);
++	close(in);
++}
++
 +// web/disc_files.inc: the disc files the game opens through cdrom0: besides the raw ISO sectors
 +// (found with PS2X_VFS_LOG=1), served under data/iso/.
 +static const char* const kDiscFiles[] = {
@@ -2020,15 +3635,52 @@ index 0000000..ec5e29c
 +	backend_t opfs = wasmfs_create_opfs_backend();
 +	wasmfs_create_directory("/saves", 0777, opfs);
 +	mkdir("/saves/mc0", 0777);
++	// The network configuration the online menu asks for ("Your Network Configuration file").
++	static const char* const kNetConfig[] = {"BWNETCNF", "dev000.dat", "ifc000.dat", "net000.cnf"};
++	mkdir("/game/mc0", 0777);
++	mkdir("/game/mc0/BWNETCNF", 0777);
++	mkdir("/saves/mc0/BWNETCNF", 0777);
++	for(const char* name : kNetConfig)
++	{
++		char from[96], to[96];
++		std::snprintf(from, sizeof(from), "/game/mc0/BWNETCNF/%s", name);
++		std::snprintf(to, sizeof(to), "/saves/mc0/BWNETCNF/%s", name);
++		const int fd = wasmfs_create_file(from, 0444, data);
++		if(fd >= 0)
++			close(fd);
++		SeedSaveFile(from, to);
++	}
 +
 +	setenv("PS2X_GS_LIVE", "1", 1);
 +	// The page reads keyboard and gamepads and publishes them in the live ring; the raylib pad
 +	// backend is headless here and would answer "no buttons" ahead of it.
 +	setenv("PS2X_NO_GAMEPAD", "1", 1);
++	// <page>?nosleep: the game's wait loops spin instead of sleeping (comparisons)
++	if(MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('nosleep') ? 1 : 0; }))
++		setenv("PS2X_NO_IDLE_SLEEP", "1", 1);
 +	// <page>?debug: also what the game reads from the pad
 +	if(MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }))
++	{
 +		setenv("PS2X_PAD_LOG", "1", 1);
++		setenv("PS2X_NET_LOG", "1", 1);
++	}
 +	setenv("PS2X_MC_ROOT", "/saves/mc0", 1);
++	// Online: the network adapter's traffic goes over a WebSocket to the page's server (/net),
++	// whose relay reaches the game server. Each browser keeps its own id (a different MAC for
++	// the server, which tells players apart by it).
++	setenv("PS2X_NET", "1", 1);
++	setenv("PS2X_NET_SERVER", "nbas3.xellrecomp.party", 1);
++	char* netId = reinterpret_cast<char*>(MAIN_THREAD_EM_ASM_PTR({
++		let id = null;
++		try { id = localStorage.getItem('ps2x-net-id'); } catch (e) {}
++		if (!id) {
++			id = Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, '0')).join('');
++			try { localStorage.setItem('ps2x-net-id', id); } catch (e) {}
++		}
++		return stringToNewUTF8(id);
++	}));
++	setenv("PS2X_NET_ID", netId, 1);
++	std::free(netId);
 +	setenv("PS2X_CD_IMAGE", "/game/NBAStreetV3.iso", 1);
 +	chdir("/game/iso");
 +

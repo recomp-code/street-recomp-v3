@@ -76,14 +76,20 @@ nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in
 - Click **Jugar** (browsers only allow sound after a click). The first load downloads the game code
   (~27 MB compressed), then the browser keeps it; the disc streams in 1 MB pieces as needed.
 - Keys as in the table below (START = Enter, SELECT = Backspace); controllers work too.
-  `?scale=1..4` sets the internal resolution (default 2), `?debug` shows renderer statistics.
-- Saves stay in the browser (OPFS). No online play in the browser yet.
-- On a server you need HTTPS and the COOP/COEP headers: see `tools/web/Caddyfile.server`
-  (password protected).
+  `?scale=1..4` sets the internal resolution (default 2, 1 on phones), `?debug` shows renderer
+  statistics.
+- **HD textures:** the fan pack is read image by image as the game shows them (on by default,
+  off on phones; `?hd=0` / `?hd=1`).
+- **Online works:** the game's network goes over a WebSocket (`/net`) to `tools/web/net_relay.py`
+  on the server, which only reaches the game server. The network configuration is put on the
+  browser's memory card the first time.
+- Saves stay in the browser (OPFS).
+- On a server you need HTTPS and the COOP/COEP headers: see `tools/web/Caddyfile.server`.
 
 How it works: the runtime and the game run in WebAssembly threads; the PS2 graphics (GS, VIF1,
 VU1) are drawn with the renderer of the [Play!](https://github.com/jpd002/Play-) emulator on WebGL2,
-with fixes for effects WebGL lacks (`patches/play.patch`); the SPU2 sound goes to an AudioWorklet.
+with fixes for effects WebGL lacks (`patches/play.patch`) and a faster VU1 JIT (registers in wasm
+locals, `patches/play-codegen.patch`); the SPU2 sound goes to an AudioWorklet.
 
 ## Controls
 
@@ -114,7 +120,7 @@ account (any e-mail; **don't reuse a real password**) and a **persona**, then an
 | `tools/` | Windows scripts (`install.ps1`, builds, debugging, textures) |
 | `tools/macos/` | Mac scripts (`install.sh`, `play.sh`, `build.sh`, `build_pcsx2.sh`, `run_scripted.sh`) |
 | `patches/ps2recomp-web.patch` | Browser build, on top of `ps2recomp.patch` (Emscripten, web platform, Play! GS host) |
-| `patches/play.patch`, `play-dependencies.patch` | Changes to Play! `83700b2c` (WebGL2 GS fixes, wasm exceptions) |
+| `patches/play.patch`, `play-dependencies.patch`, `play-codegen.patch` | Changes to Play! `83700b2c` (WebGL2 GS fixes, HD textures, wasm exceptions, VU JIT) |
 | `tools/web/` | Browser build (`build.sh`, `serve.sh`, Caddy configs) |
 | `docs/BUILDING.md` | Manual Windows build, HD textures, how online works |
 | `docs/PORTING_NOTES.md` | Technical notes: architecture and every bug fixed |

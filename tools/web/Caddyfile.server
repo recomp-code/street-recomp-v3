@@ -1,23 +1,41 @@
-# Private server for the web build (copy the web folder to /opt/nbarecomp/site).
-# Replace the domain; make the password hash with: caddy hash-password --plaintext 'your-password'
+# Server for the web build (copy the web folder to /opt/nbarecomp/site). Replace the domain.
 # Behind Cloudflare (orange cloud) use SSL mode "Full": Caddy makes its own certificate here.
+# Online: run tools/web/net_relay.py on 127.0.0.1:8765 (see nbarecomp-net.service below); /net
+# carries the game's network traffic to it over a WebSocket.
+# Optional password: add inside the site block
+#	basic_auth {
+#		player <hash from: caddy hash-password --plaintext 'your-password'>
+#	}
 {
 	auto_https disable_redirects
 	skip_install_trust
 }
 play.example.com:443 {
 	tls internal
-	basic_auth {
-		player $2a$14$REPLACE_WITH_YOUR_HASH
-	}
-	root * /opt/nbarecomp/site
 	header {
 		Cross-Origin-Opener-Policy same-origin
 		Cross-Origin-Embedder-Policy require-corp
 		Cache-Control "private, no-cache"
 		X-Robots-Tag noindex
 	}
-	file_server {
-		precompressed br
+	handle /net {
+		reverse_proxy 127.0.0.1:8765
+	}
+	handle {
+		root * /opt/nbarecomp/site
+		file_server {
+			precompressed br
+		}
 	}
 }
+
+# /etc/systemd/system/nbarecomp-net.service (needs python3-websockets):
+#   [Unit]
+#   Description=NBA Street V3 web: WebSocket relay to the game server
+#   After=network-online.target
+#   [Service]
+#   ExecStart=/usr/bin/python3 /opt/nbarecomp/net_relay.py --server your-game-server.example.com --listen 127.0.0.1:8765
+#   DynamicUser=yes
+#   Restart=always
+#   [Install]
+#   WantedBy=multi-user.target

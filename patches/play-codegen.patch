@@ -1,0 +1,284 @@
+diff --git a/include/Jitter_CodeGen_Wasm.h b/include/Jitter_CodeGen_Wasm.h
+index e2f1fbe..5ada6f3 100644
+--- a/include/Jitter_CodeGen_Wasm.h
++++ b/include/Jitter_CodeGen_Wasm.h
+@@ -75,6 +75,7 @@ namespace Jitter
+ 		void PrepareSignatures(CWasmModuleBuilder&, const StatementList&);
+ 		void RegisterSignature(CWasmModuleBuilder&, std::string);
+ 		void PrepareLocalVars(const StatementList&);
++		StatementList MapRegistersToLocals(const StatementList&);
+ 
+ 		uint32 GetTemporaryLocation(CSymbol*) const;
+ 
+@@ -119,6 +120,7 @@ namespace Jitter
+ 		void Emit_Break(const STATEMENT&);
+ 
+ 		void Emit_Mov_VarAny(const STATEMENT&);
++		void Emit_Mov_RefRef(const STATEMENT&);
+ 
+ 		void Emit_RelToRef_VarCst(const STATEMENT&);
+ 
+@@ -197,6 +199,7 @@ namespace Jitter
+ 		void Emit_Fp_Clamp_MemMem(const STATEMENT&);
+ 		void Emit_Fp_ToSingleI32_MemMem(const STATEMENT&);
+ 		void Emit_Fp_ToInt32TruncS_MemMem(const STATEMENT&);
++		void Emit_Fp_Mov_MemMem(const STATEMENT&);
+ 		void Emit_Fp_LdCst_TmpCst(const STATEMENT&);
+ 		void Emit_Fp_SetRoundingMode_Cst(const STATEMENT&);
+ 
+@@ -238,6 +241,8 @@ namespace Jitter
+ 		std::map<uint32, LABEL_FLOW> m_labelFlows;
+ 		std::map<std::string, uint32> m_signatures;
+ 		std::map<TemporaryInstance, uint32> m_temporaryLocations;
++		//Locals standing for the register allocator's registers (statements only hold weak refs)
++		std::vector<SymbolPtr> m_registerLocals;
+ 		uint32 m_localI32Count = 0;
+ 		uint32 m_localI64Count = 0;
+ 		uint32 m_localF32Count = 0;
+diff --git a/include/WasmDefs.h b/include/WasmDefs.h
+index 0036a51..345cc70 100644
+--- a/include/WasmDefs.h
++++ b/include/WasmDefs.h
+@@ -157,6 +157,8 @@ namespace Wasm
+ 		INST_F32_DEMOTE_F64 = 0xB6,
+ 		INST_F64_CONVERT_I64_S = 0xB9,
+ 		INST_F64_PROMOTE_F32 = 0xBB,
++		INST_I32_REINTERPRET_F32 = 0xBC,
++		INST_F32_REINTERPRET_I32 = 0xBE,
+ 		INST_I32x4_TRUNC_SAT_F32x4_S = 0xF8,
+ 		INST_F32x4_CONVERT_I32x4_S = 0xFA
+ 	};
+diff --git a/src/Jitter_CodeGen_Wasm.cpp b/src/Jitter_CodeGen_Wasm.cpp
+index 3f86e4a..16daa63 100644
+--- a/src/Jitter_CodeGen_Wasm.cpp
++++ b/src/Jitter_CodeGen_Wasm.cpp
+@@ -93,6 +93,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
+ 	{ OP_BREAK,          MATCH_NIL,            MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Break                                  },
+ 
+ 	{ OP_MOV,            MATCH_VARIABLE,       MATCH_ANY,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Mov_VarAny                             },
++	{ OP_MOV,            MATCH_MEM_REF,        MATCH_MEM_REF,        MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Mov_RefRef                             },
+ 
+ 	{ OP_RELTOREF,       MATCH_VAR_REF,        MATCH_CONSTANT,       MATCH_ANY,           MATCH_NIL,      &CCodeGen_Wasm::Emit_RelToRef_VarCst                        },
+ 
+@@ -254,7 +255,7 @@ CCodeGen_Wasm::CCodeGen_Wasm()
+ 	copyMatchers(g_mdConstMatchers);
+ }
+ 
+-void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int stackSize)
++void CCodeGen_Wasm::GenerateCode(const StatementList& statementsIn, unsigned int stackSize)
+ {
+ 	CWasmModuleBuilder moduleBuilder;
+ 
+@@ -273,6 +274,9 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
+ 	m_currentBlockDepth = 0;
+ 	m_loopBlock = -1;
+ 
++	const auto localStatements = MapRegistersToLocals(statementsIn);
++	const auto& statements = localStatements;
++
+ 	BuildLabelFlows(statements);
+ 	PrepareSignatures(moduleBuilder, statements);
+ 	PrepareLocalVars(statements);
+@@ -322,6 +326,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
+ 
+ 	moduleBuilder.AddFunction(std::move(function));
+ 	moduleBuilder.WriteModule(*m_stream);
++	m_registerLocals.clear();
+ 
+ 	assert(m_params.empty());
+ }
+@@ -335,14 +340,16 @@ void CCodeGen_Wasm::RegisterExternalSymbols(CObjectFile*) const
+ {
+ }
+ 
++//The register allocator's registers become wasm locals (see MapRegistersToLocals): the engine
++//keeps locals in machine registers, while context fields are memory loads and stores.
+ unsigned int CCodeGen_Wasm::GetAvailableRegisterCount() const
+ {
+-	return 0;
++	return 16;
+ }
+ 
+ unsigned int CCodeGen_Wasm::GetAvailableMdRegisterCount() const
+ {
+-	return 0;
++	return 16;
+ }
+ 
+ bool CCodeGen_Wasm::Has128BitsCallOperands() const
+@@ -587,6 +594,51 @@ void CCodeGen_Wasm::RegisterSignature(CWasmModuleBuilder& moduleBuilder, std::st
+ 	m_signatures.insert(std::make_pair(signature, static_cast<uint32>(m_signatures.size())));
+ }
+ 
++//Registers are turned into temporaries, which already live in locals; they get stack locations
++//past any real temporary so each register is its own local.
++StatementList CCodeGen_Wasm::MapRegistersToLocals(const StatementList& statements)
++{
++	static constexpr uint32 REGISTER_LOCATION_BASE = 0x40000000;
++	m_registerLocals.clear();
++	std::map<std::pair<SYM_TYPE, uint32>, SymbolPtr> locals;
++	StatementList result = statements;
++	for(auto& statement : result)
++	{
++		statement.VisitOperands(
++		    [&](SymbolRefPtr& symbolRef, bool) {
++			    auto symbol = symbolRef->GetSymbol();
++			    SYM_TYPE localType;
++			    switch(symbol->m_type)
++			    {
++			    case SYM_REGISTER:
++				    localType = SYM_TEMPORARY;
++				    break;
++			    case SYM_REG_REFERENCE:
++				    localType = SYM_TMP_REFERENCE;
++				    break;
++			    case SYM_FP_REGISTER32:
++				    localType = SYM_FP_TEMPORARY32;
++				    break;
++			    case SYM_REGISTER128:
++				    localType = SYM_TEMPORARY128;
++				    break;
++			    default:
++				    return;
++			    }
++			    auto key = std::make_pair(localType, symbol->m_valueLow);
++			    auto& local = locals[key];
++			    if(!local)
++			    {
++				    local = std::make_shared<CSymbol>(localType, REGISTER_LOCATION_BASE + symbol->m_valueLow, 0);
++				    local->m_stackLocation = REGISTER_LOCATION_BASE + symbol->m_valueLow;
++				    m_registerLocals.push_back(local);
++			    }
++			    symbolRef = std::make_shared<CSymbolRef>(local);
++		    });
++	}
++	return result;
++}
++
+ void CCodeGen_Wasm::PrepareLocalVars(const StatementList& statements)
+ {
+ 	for(const auto& statement : statements)
+@@ -806,6 +858,9 @@ void CCodeGen_Wasm::PrepareSymbolDef(CSymbol* symbol)
+ {
+ 	switch(symbol->m_type)
+ 	{
++	case SYM_REL_REFERENCE:
++		PushRelativeRefAddress(symbol);
++		break;
+ 	case SYM_RELATIVE:
+ 	case SYM_RELATIVE64:
+ 	case SYM_RELATIVE128:
+@@ -828,6 +883,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
+ {
+ 	switch(symbol->m_type)
+ 	{
++	case SYM_REL_REFERENCE:
+ 	case SYM_RELATIVE:
+ 		m_functionStream.Write8(Wasm::INST_I32_STORE);
+ 		m_functionStream.Write8(0x02);
+@@ -1393,3 +1449,13 @@ void CCodeGen_Wasm::Emit_ExtHigh64VarMem64(const STATEMENT& statement)
+ 
+ 	CommitSymbol(dst);
+ }
++
++void CCodeGen_Wasm::Emit_Mov_RefRef(const STATEMENT& statement)
++{
++	auto dst = statement.dst->GetSymbol().get();
++	auto src1 = statement.src1->GetSymbol().get();
++
++	PrepareSymbolDef(dst);
++	PrepareSymbolUse(src1);
++	CommitSymbol(dst);
++}
+diff --git a/src/Jitter_CodeGen_Wasm_Fpu.cpp b/src/Jitter_CodeGen_Wasm_Fpu.cpp
+index 60e1b6b..d486caf 100644
+--- a/src/Jitter_CodeGen_Wasm_Fpu.cpp
++++ b/src/Jitter_CodeGen_Wasm_Fpu.cpp
+@@ -181,15 +181,21 @@ void CCodeGen_Wasm::Emit_Fp_ToSingleI32_MemMem(const STATEMENT& statement)
+ 	auto dst = statement.dst->GetSymbol().get();
+ 	auto src1 = statement.src1->GetSymbol().get();
+ 
+-	assert(src1->m_type == SYM_FP_RELATIVE32);
+-
+ 	PrepareSymbolDef(dst);
+ 
+-	//Can't use PrepareSymbolUse here because src1 is a f32 and we need an i32
+-	PushRelativeAddress(src1);
+-	m_functionStream.Write8(Wasm::INST_I32_LOAD);
+-	m_functionStream.Write8(0x02);
+-	m_functionStream.Write8(0x00);
++	//src1 holds an i32 in a f32 symbol
++	if(src1->m_type == SYM_FP_RELATIVE32)
++	{
++		PushRelativeAddress(src1);
++		m_functionStream.Write8(Wasm::INST_I32_LOAD);
++		m_functionStream.Write8(0x02);
++		m_functionStream.Write8(0x00);
++	}
++	else
++	{
++		PrepareSymbolUse(src1);
++		m_functionStream.Write8(Wasm::INST_I32_REINTERPRET_F32);
++	}
+ 
+ 	m_functionStream.Write8(Wasm::INST_F32_CONVERT_I32_S);
+ 
+@@ -201,18 +207,24 @@ void CCodeGen_Wasm::Emit_Fp_ToInt32TruncS_MemMem(const STATEMENT& statement)
+ 	auto dst = statement.dst->GetSymbol().get();
+ 	auto src1 = statement.src1->GetSymbol().get();
+ 
+-	assert(dst->m_type == SYM_FP_RELATIVE32);
+-
+ 	PrepareSymbolDef(dst);
+ 	PrepareSymbolUse(src1);
+ 
+ 	m_functionStream.Write8(Wasm::INST_PREFIX_FC);
+ 	m_functionStream.Write8(Wasm::INST_I32_TRUNC_SAT_F32_S);
+ 
+-	//Can't use CommitSymbol here since we got a i32 on the stack and our dst symbol is a f32.
+-	m_functionStream.Write8(Wasm::INST_I32_STORE);
+-	m_functionStream.Write8(0x02);
+-	m_functionStream.Write8(0x00);
++	//The result is an i32 kept in a f32 symbol
++	if(dst->m_type == SYM_FP_RELATIVE32)
++	{
++		m_functionStream.Write8(Wasm::INST_I32_STORE);
++		m_functionStream.Write8(0x02);
++		m_functionStream.Write8(0x00);
++	}
++	else
++	{
++		m_functionStream.Write8(Wasm::INST_F32_REINTERPRET_I32);
++		CommitSymbol(dst);
++	}
+ }
+ 
+ void CCodeGen_Wasm::Emit_Fp_LdCst_TmpCst(const STATEMENT& statement)
+@@ -258,13 +270,25 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_fpuConstMatchers[] =
+ 	{ OP_FP_ABS_S,           MATCH_FP_MEMORY32,      MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fpu_MemMem<Wasm::INST_F32_ABS>          },
+ 	{ OP_FP_NEG_S,           MATCH_FP_MEMORY32,      MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fpu_MemMem<Wasm::INST_F32_NEG>          },
+ 
+-	{ OP_FP_TOSINGLE_I32,    MATCH_FP_MEMORY32,      MATCH_FP_RELATIVE32, MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_ToSingleI32_MemMem                   },
+-	{ OP_FP_TOINT32_TRUNC_S, MATCH_FP_RELATIVE32,    MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_ToInt32TruncS_MemMem                 },
++	{ OP_FP_TOSINGLE_I32,    MATCH_FP_MEMORY32,      MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_ToSingleI32_MemMem                   },
++	{ OP_FP_TOINT32_TRUNC_S, MATCH_FP_MEMORY32,      MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_ToInt32TruncS_MemMem                 },
+ 
+ 	{ OP_FP_LDCST,           MATCH_FP_TEMPORARY32,   MATCH_CONSTANT,      MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_LdCst_TmpCst                         },
+ 
++	{ OP_MOV,                MATCH_FP_MEMORY32,      MATCH_FP_MEMORY32,   MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_Mov_MemMem                           },
++
+ 	{ OP_FP_SETROUNDINGMODE, MATCH_NIL,              MATCH_CONSTANT,      MATCH_NIL,          MATCH_NIL,      &CCodeGen_Wasm::Emit_Fp_SetRoundingMode_Cst                  },
+ 
+ 	{ OP_MOV,                MATCH_NIL,              MATCH_NIL,           MATCH_NIL,          MATCH_NIL,      nullptr                                                      },
+ };
+ // clang-format on
++
++void CCodeGen_Wasm::Emit_Fp_Mov_MemMem(const STATEMENT& statement)
++{
++	auto dst = statement.dst->GetSymbol().get();
++	auto src1 = statement.src1->GetSymbol().get();
++
++	PrepareSymbolDef(dst);
++	PrepareSymbolUse(src1);
++	CommitSymbol(dst);
++}

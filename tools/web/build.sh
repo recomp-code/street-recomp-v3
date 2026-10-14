@@ -63,7 +63,7 @@ play() {
     cd "$ROOT/play"
     git checkout --quiet "$PLAY_COMMIT"
     git submodule update --init --recursive --quiet
-    for p in "play.patch:." "play-dependencies.patch:deps/Dependencies"; do
+    for p in "play.patch:." "play-dependencies.patch:deps/Dependencies" "play-codegen.patch:deps/CodeGen"; do
         patch="${p%%:*}"; dir="${p#*:}"
         if git -C "$dir" apply --check "$REPO/patches/$patch" 2> /dev/null; then
             git -C "$dir" apply "$REPO/patches/$patch"
@@ -116,6 +116,17 @@ site() {
     # The disc: read on demand in 1 MB pieces (HTTP Range), never downloaded whole.
     ln -f "$ROOT/game/NBAStreetV3.iso" "$SITE/data/NBAStreetV3.iso" 2> /dev/null || cp "$ROOT/game/NBAStreetV3.iso" "$SITE/data/"
     cp "$ROOT/game/iso/SLUS_211.26" "$ROOT/game/iso/DEV9.IRX" "$SITE/data/iso/"
+    # The network configuration the online mode needs, copied onto the memory card once.
+    mkdir -p "$SITE/data/mc0/BWNETCNF" && cp "$REPO/game/mc0_netcnf/BWNETCNF/"* "$SITE/data/mc0/BWNETCNF/"
+    # HD textures: the fan pack (PCSX2 format), each image read only when the game shows it.
+    pack="$ROOT/downloads/NBAStreetV3-HD-Textures.zip"
+    [ -f "$pack" ] || { mkdir -p "$ROOT/downloads" && curl -fsSL -o "$pack" \
+        https://github.com/recomp-code/street-recomp-v3/releases/download/v1.1/NBAStreetV3-HD-Textures.zip; } || true
+    if [ -f "$pack" ]; then
+        mkdir -p "$SITE/data/hd" && unzip -q -o "$pack" '*.png' -d "$SITE/data/hd"
+        grep -v '^#' "$REPO/gshost/texture_blocklist.txt" > "$SITE/data/hd/.blocklist"
+        (cd "$SITE/data/hd" && ls | sed -n 's/\.png$//p' | grep -vxFf .blocklist > index.txt; rm -f .blocklist)
+    fi
     echo "  done: tools/web/serve.sh, then open http://localhost:8088"
 }
 

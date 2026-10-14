@@ -1,5 +1,17 @@
+diff --git a/Source/gs/GSH_OpenGL/CMakeLists.txt b/Source/gs/GSH_OpenGL/CMakeLists.txt
+index 0f89436..e301d4b 100644
+--- a/Source/gs/GSH_OpenGL/CMakeLists.txt
++++ b/Source/gs/GSH_OpenGL/CMakeLists.txt
+@@ -31,6 +31,7 @@ add_library(gsh_opengl STATIC
+ 	GSH_OpenGL.h
+ 	GSH_OpenGL_Shader.cpp
+ 	GSH_OpenGL_Texture.cpp
++	GSH_OpenGL_HdTextures.cpp
+ )
+ target_link_libraries(gsh_opengl Framework_OpenGl ${GSH_OPENGL_PROJECT_LIBS})
+ target_include_directories(gsh_opengl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/Source/gs/GSH_OpenGL/)
 diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
-index 7eb9460..521ee29 100644
+index 7eb9460..08fd2c2 100644
 --- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
 +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
 @@ -111,8 +111,10 @@ void CGSH_OpenGL::ReleaseImpl()
@@ -13,7 +25,15 @@ index 7eb9460..521ee29 100644
  	m_framebuffers.clear();
  	m_depthbuffers.clear();
  	m_vertexBuffer.clear();
-@@ -160,6 +162,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+@@ -135,6 +137,7 @@ void CGSH_OpenGL::MarkNewFrame()
+ 
+ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+ {
++	m_hdFrame++;
+ 	FlushVertexBuffer();
+ 	m_renderState.isValid = false;
+ 	m_validGlState = 0;
+@@ -160,6 +163,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
  
  		if(!framebuffer && (dispLayer.bufWidth != 0))
  		{
@@ -21,7 +41,15 @@ index 7eb9460..521ee29 100644
  			framebuffer = FramebufferPtr(new CFramebuffer(dispLayer.bufPtr, dispLayer.bufWidth, FRAMEBUFFER_HEIGHT, dispLayer.psm, m_fbScale, m_multisampleEnabled));
  			m_framebuffers.push_back(framebuffer);
  			PopulateFramebuffer(framebuffer);
-@@ -265,6 +268,7 @@ void CGSH_OpenGL::NotifyPreferencesChangedImpl()
+@@ -250,6 +254,7 @@ void CGSH_OpenGL::LoadState(Framework::CZipArchiveReader& archive)
+ 	SendGSCall(
+ 	    [this]() {
+ 		    m_textureCache.InvalidateRange(0, RAMSIZE);
++		    HdInvalidate(0, RAMSIZE);
+ 	    });
+ }
+ 
+@@ -265,6 +270,7 @@ void CGSH_OpenGL::NotifyPreferencesChangedImpl()
  	LoadPreferences();
  	m_textureCache.Flush();
  	PalCache_Flush();
@@ -29,7 +57,7 @@ index 7eb9460..521ee29 100644
  	m_framebuffers.clear();
  	m_depthbuffers.clear();
  	CGSHandler::NotifyPreferencesChangedImpl();
-@@ -517,6 +521,12 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GetShaderFromCaps(const SHADERCAPS& s
+@@ -517,6 +523,12 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GetShaderFromCaps(const SHADERCAPS& s
  			glUniform1i(paletteUniform, 1);
  		}
  
@@ -42,7 +70,7 @@ index 7eb9460..521ee29 100644
  		auto vertexParamsUniformBlock = glGetUniformBlockIndex(*shader, "VertexParams");
  		if(vertexParamsUniformBlock != GL_INVALID_INDEX)
  		{
-@@ -558,7 +568,13 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+@@ -558,7 +570,13 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
  	//Get shader caps
  	//--------------------------------------------------------
  
@@ -56,9 +84,48 @@ index 7eb9460..521ee29 100644
  	FillShaderCapsFromTexture(shaderCaps, tex0Reg, tex1Reg, texAReg, clampReg);
  	FillShaderCapsFromTest(shaderCaps, testReg);
  	FillShaderCapsFromAlpha(shaderCaps, prim.nAlpha != 0, alphaReg);
-@@ -607,11 +623,11 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+@@ -568,10 +586,18 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 		shaderCaps.hasFog = 1;
+ 	}
+ 
++	GLuint hdTexture = 0;
+ 	if(!prim.nTexture)
+ 	{
+ 		shaderCaps.texSourceMode = TEXTURE_SOURCE_MODE_NONE;
+ 	}
++	else if(m_hdEnabled && (hdTexture = HdLookup(tex0Reg, clampReg)) != 0)
++	{
++		shaderCaps.texSourceMode = TEXTURE_SOURCE_MODE_STD;
++		shaderCaps.texBilinearFilter = 0;
++		shaderCaps.texUseAlphaExpansion = 0;
++		shaderCaps.texHd = 1;
++	}
+ 
+ 	//--------------------------------------------------------
+ 	// Fast path: if everything (shader caps + relevant regs) matches, skip.
+@@ -579,7 +605,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	if(m_renderState.isValid)
+ 	{
+ 		if(m_renderState.isTextureStateValid && m_renderState.isFramebufferStateValid &&
+-		   (static_cast<uint32>(m_renderState.shaderCaps) == static_cast<uint32>(shaderCaps)) &&
++		   (static_cast<ShaderCapsInt>(m_renderState.shaderCaps) == static_cast<ShaderCapsInt>(shaderCaps)) &&
+ 		   (m_renderState.primReg == primReg) &&
+ 		   (m_renderState.alphaReg == alphaReg) &&
+ 		   (m_renderState.testReg == testReg) &&
+@@ -590,6 +616,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 		   (m_renderState.tex1Reg == tex1Reg) &&
+ 		   (m_renderState.texAReg == texAReg) &&
+ 		   (m_renderState.clampReg == clampReg) &&
++		   (m_renderState.hdTexture == hdTexture) &&
+ 		   (m_renderState.fogColReg == fogColReg))
+ 		{
+ 			// Nothing changed.
+@@ -605,18 +632,18 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	//--------------------------------------------------------
+ 	uint64 prevPrimValue = m_renderState.isValid ? m_renderState.primReg : 0;
  	auto prevPrim = make_convertible<PRMODE>(prevPrimValue);
- 	bool shaderChanged = !m_renderState.isValid || (static_cast<uint32>(m_renderState.shaderCaps) != static_cast<uint32>(shaderCaps));
+-	bool shaderChanged = !m_renderState.isValid || (static_cast<uint32>(m_renderState.shaderCaps) != static_cast<uint32>(shaderCaps));
++	bool shaderChanged = !m_renderState.isValid || (static_cast<ShaderCapsInt>(m_renderState.shaderCaps) != static_cast<ShaderCapsInt>(shaderCaps));
  	bool primChanged = !m_renderState.isValid || (m_renderState.primReg != primReg);
 -	bool blendEnableChanged = primChanged && !m_hasFramebufferFetchExtension && ((!m_renderState.isValid) || (prevPrim.nAlpha != prim.nAlpha));
 -	bool alphaChanged = !m_renderState.isValid || (m_renderState.alphaReg != alphaReg);
@@ -71,7 +138,13 @@ index 7eb9460..521ee29 100644
  	                                 (m_renderState.frameReg != frameReg) || zbufChanged || (m_renderState.scissorReg != scissorReg) || testChanged;
  	bool textureEnableChanged = !m_renderState.isValid || (prevPrim.nTexture != prim.nTexture);
  	bool textureChanged = !m_renderState.isValid || !m_renderState.isTextureStateValid ||
-@@ -637,7 +653,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	                      (m_renderState.tex0Reg != tex0Reg) || (m_renderState.tex1Reg != tex1Reg) || (m_renderState.texAReg != texAReg) ||
+-	                      (m_renderState.clampReg != clampReg) || textureEnableChanged;
++	                      (m_renderState.clampReg != clampReg) || (m_renderState.hdTexture != hdTexture) || textureEnableChanged;
+ 	bool fogColorChanged = !m_renderState.isValid || (m_renderState.fogColReg != fogColReg);
+ 
+ 	bool needFlush = shaderChanged || primChanged || alphaChanged || testChanged || zbufChanged || framebufferRelatedChanged || textureChanged || fogColorChanged;
+@@ -637,7 +664,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
  	{
  		if(!m_hasFramebufferFetchExtension)
  		{
@@ -80,7 +153,24 @@ index 7eb9460..521ee29 100644
  			m_validGlState &= ~GLSTATE_BLEND;
  		}
  	}
-@@ -704,7 +720,7 @@ void CGSH_OpenGL::SetupBlendingFunction(uint64 alphaReg)
+@@ -669,6 +696,16 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+ 	if(textureChanged)
+ 	{
+ 		SetupTexture(primReg, tex0Reg, tex1Reg, texAReg, clampReg);
++		m_renderState.hdTexture = hdTexture;
++		if(hdTexture != 0)
++		{
++			//Same coordinates (normalized), the HD image instead, filtered
++			m_renderState.texture0Handle = hdTexture;
++			m_renderState.texture0AlphaAsIndex = false;
++			m_renderState.texture1Handle = 0;
++			m_renderState.texture0MinFilter = GL_LINEAR_MIPMAP_LINEAR;
++			m_renderState.texture0MagFilter = GL_LINEAR;
++		}
+ 		CHECKGLERROR();
+ 	}
+ 
+@@ -704,7 +741,7 @@ void CGSH_OpenGL::SetupBlendingFunction(uint64 alphaReg)
  {
  	auto alpha = make_convertible<ALPHA>(alphaReg);
  
@@ -89,7 +179,7 @@ index 7eb9460..521ee29 100644
  	{
  		m_fragmentParams.alphaFix = (static_cast<float>(alpha.nFix) / 255.f);
  		m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
-@@ -976,10 +992,14 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+@@ -976,10 +1013,14 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
  	auto scissor = make_convertible<SCISSOR>(scissorReg);
  	auto test = make_convertible<TEST>(testReg);
  
@@ -108,7 +198,7 @@ index 7eb9460..521ee29 100644
  
  	//Don't write to alpha in PSMCT24
  	if(frame.nPsm == PSMCT24)
-@@ -1041,6 +1061,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+@@ -1041,6 +1082,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
  
  	m_renderState.framebufferHandle = framebuffer->m_framebuffer;
  	m_validGlState |= GLSTATE_FRAMEBUFFER; //glBindFramebuffer used to set just above
@@ -116,7 +206,7 @@ index 7eb9460..521ee29 100644
  
  	//We assume that we will be drawing to this framebuffer and that we'll need
  	//to resolve samples at some point if multisampling is enabled
-@@ -1217,7 +1238,7 @@ void CGSH_OpenGL::FillShaderCapsFromAlpha(SHADERCAPS& shaderCaps, bool alphaEnab
+@@ -1217,7 +1259,7 @@ void CGSH_OpenGL::FillShaderCapsFromAlpha(SHADERCAPS& shaderCaps, bool alphaEnab
  
  	auto alpha = make_convertible<ALPHA>(alphaReg);
  
@@ -125,7 +215,7 @@ index 7eb9460..521ee29 100644
  	{
  		shaderCaps.hasAlphaBlend = alphaEnabled;
  		shaderCaps.alphaBlendA = alpha.nA;
-@@ -1371,6 +1392,34 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
+@@ -1371,6 +1413,34 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
  	m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
  }
  
@@ -160,7 +250,7 @@ index 7eb9460..521ee29 100644
  CGSH_OpenGL::FramebufferPtr CGSH_OpenGL::FindFramebuffer(const FRAME& frame) const
  {
  	auto framebufferIterator = std::find_if(std::begin(m_framebuffers), std::end(m_framebuffers),
-@@ -1724,6 +1773,26 @@ void CGSH_OpenGL::FlushVertexBuffer()
+@@ -1724,6 +1794,26 @@ void CGSH_OpenGL::FlushVertexBuffer()
  
  void CGSH_OpenGL::DoRenderPass()
  {
@@ -187,7 +277,7 @@ index 7eb9460..521ee29 100644
  	if((m_validGlState & GLSTATE_VERTEX_PARAMS) == 0)
  	{
  		glBindBuffer(GL_UNIFORM_BUFFER, m_vertexParamsBuffer);
-@@ -1841,6 +1910,38 @@ void CGSH_OpenGL::DoRenderPass()
+@@ -1841,6 +1931,38 @@ void CGSH_OpenGL::DoRenderPass()
  		break;
  	}
  
@@ -226,7 +316,7 @@ index 7eb9460..521ee29 100644
  	glDrawArrays(primitiveMode, 0, m_vertexBuffer.size());
  
  	m_drawCallCount++;
-@@ -2023,6 +2124,14 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
+@@ -2023,6 +2145,14 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
  			m_PrimitiveMode <<= m_nReg[GS_REG_PRMODE];
  		}
  
@@ -241,7 +331,23 @@ index 7eb9460..521ee29 100644
  		if(nDrawingKick)
  		{
  			// Fast skip if nothing relevant changed since last draw
-@@ -2643,3 +2752,280 @@ CGSH_OpenGL::CDepthbuffer::CDepthbuffer(uint32 basePtr, uint32 width, uint32 hei
+@@ -2118,6 +2248,7 @@ void CGSH_OpenGL::ProcessHostToLocalTransfer()
+ 		auto [transferAddress, transferSize] = GsTransfer::GetDstRange(bltBuf, trxReg, trxPos);
+ 
+ 		m_textureCache.InvalidateRange(transferAddress, transferSize);
++		HdInvalidate(transferAddress, transferSize);
+ 
+ 		bool isUpperByteTransfer = (bltBuf.nDstPsm == PSMT8H) || (bltBuf.nDstPsm == PSMT4HL) || (bltBuf.nDstPsm == PSMT4HH);
+ 		for(const auto& framebuffer : m_framebuffers)
+@@ -2231,6 +2362,7 @@ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
+ 
+ 		auto [transferAddress, transferSize] = GsTransfer::GetDstRange(bltBuf, trxReg, trxPos);
+ 		m_textureCache.InvalidateRange(transferAddress, transferSize);
++		HdInvalidate(transferAddress, transferSize);
+ 
+ 		//Write back to RAM
+ 		{
+@@ -2643,3 +2775,281 @@ CGSH_OpenGL::CDepthbuffer::CDepthbuffer(uint32 basePtr, uint32 width, uint32 hei
  	}
  	CHECKGLERROR();
  }
@@ -516,6 +622,7 @@ index 7eb9460..521ee29 100644
 +	uint32 start = fbp * 8192 + (py0 / pageSize.second) * fbw * CGsPixelFormats::PAGESIZE;
 +	uint32 size = ((py1 / pageSize.second) - (py0 / pageSize.second) + 1) * fbw * CGsPixelFormats::PAGESIZE;
 +	m_textureCache.InvalidateRange(start, size);
++	HdInvalidate(start, size);
 +	for(const auto& framebuffer : m_framebuffers)
 +	{
 +		framebuffer->m_cachedArea.Invalidate(start, size);
@@ -523,10 +630,19 @@ index 7eb9460..521ee29 100644
 +	return true;
 +}
 diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
-index 290deb7..5f1c354 100644
+index 290deb7..0312c87 100644
 --- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
 +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
-@@ -99,6 +99,11 @@ private:
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
+ #include <list>
++#include <map>
++#include <tuple>
+ #include <unordered_map>
+ #include "../GSHandler.h"
+ #include "../GsDebuggerInterface.h"
+@@ -99,6 +101,12 @@ private:
  		unsigned int alphaTestDepthTest_DepthFetch : 1;
  		unsigned int alphaTestDepthTestEqual_DepthFetch : 1;
  
@@ -534,11 +650,20 @@ index 290deb7..5f1c354 100644
 +		//exact alpha, blending and FBMSK bit masks in the shader
 +		unsigned int hasEmulatedFetch : 1;
 +		unsigned int colorWrap : 1; //COLCLAMP = 0: blending results wrap around (emulated fetch only)
++		unsigned int texHd : 1;     //HD replacement: an RGBA texture sampled with filtering
 +
  		bool isIndexedTextureSource() const
  		{
  			return texSourceMode == TEXTURE_SOURCE_MODE_IDX4 || texSourceMode == TEXTURE_SOURCE_MODE_IDX8;
-@@ -172,7 +177,7 @@ private:
+@@ -132,6 +140,7 @@ private:
+ 		GLuint shaderHandle;
+ 		GLuint framebufferHandle;
+ 		GLuint texture0Handle;
++		GLuint hdTexture;
+ 		GLint texture0MinFilter;
+ 		GLint texture0MagFilter;
+ 		GLint texture0WrapS;
+@@ -172,7 +181,7 @@ private:
  		uint32 alphaRef;
  		float alphaFix;
  		float fogColor[3];
@@ -547,7 +672,7 @@ index 290deb7..5f1c354 100644
  	};
  	static_assert(sizeof(FRAGMENTPARAMS) == 0x40, "Size of FRAGMENTPARAMS must be 64 bytes.");
  
-@@ -247,6 +252,14 @@ private:
+@@ -247,6 +256,14 @@ private:
  		Framework::OpenGl::CRenderbuffer m_colorBufferMs;
  
  		CGsCachedArea m_cachedArea;
@@ -562,7 +687,7 @@ index 290deb7..5f1c354 100644
  	};
  	typedef std::shared_ptr<CFramebuffer> FramebufferPtr;
  	typedef std::vector<FramebufferPtr> FramebufferList;
-@@ -307,8 +320,11 @@ private:
+@@ -307,8 +324,11 @@ private:
  
  	typedef std::vector<PRIM_VERTEX> VertexBuffer;
  
@@ -574,7 +699,7 @@ index 290deb7..5f1c354 100644
  	void InitializeRC();
  	void CheckExtensions();
  	void SetupTextureUpdaters();
-@@ -316,6 +332,9 @@ private:
+@@ -316,6 +336,9 @@ private:
  	void MakeLinearZOrtho(float*, float, float, float, float);
  	TEXTURE_INFO PrepareTexture(const TEX0&);
  	TEXTURE_INFO SearchTextureFramebuffer(const TEX0&);
@@ -584,10 +709,43 @@ index 290deb7..5f1c354 100644
  	GLuint PreparePalette(const TEX0&);
  
  	void ProcessPrim(uint64);
-@@ -429,6 +448,24 @@ private:
+@@ -429,6 +452,64 @@ private:
  	GLint m_copyToFbSrcSizeUniform = -1;
  
  	TextureCache m_textureCache;
++
++	struct HD_TEXTURE
++	{
++		std::string name;
++		GLuint handle = 0;
++		bool loading = false;
++		uint32 lastUse = 0;
++	};
++	struct HD_HASH
++	{
++		uint64 hash = 0;
++		uint32 pageGenSum = 0;
++		uint32 firstPage = 0;
++		uint32 pageCount = 0;
++	};
++	GLuint HdLookup(uint64 tex0Reg, uint64 clampReg);
++	void HdInvalidate(uint32 start, uint32 size);
++	uint32 HdPageGenSum(uint32 firstPage, uint32 pageCount) const;
++	uint64 HdHashTexture(const TEX0&, uint32& firstPage, uint32& pageCount) const;
++	void HdEvict();
++	bool m_hdEnabled = false;
++	std::string m_hdBaseUrl;
++	std::vector<HD_TEXTURE> m_hdTextures;
++	std::map<std::tuple<uint64, uint64, uint32>, uint32> m_hdIndex;
++	std::unordered_map<uint64, HD_HASH> m_hdHashes;
++	uint32 m_hdPageGen[512] = {};
++	uint32 m_hdGen = 0;
++	uint32 m_hdFrame = 0;
++	uint64 m_hdMemoTex0 = 0;
++	uint64 m_hdMemoClamp = 0;
++	uint32 m_hdMemoGen = ~0U;
++	uint32 m_hdMemoClut = ~0U;
++	GLuint m_hdMemoHandle = 0;
 +	FramebufferPtr m_currentFramebuffer;
 +	bool m_emulatedFetchActive = false;
 +	bool m_emulatedFetchDirty = true;
@@ -605,12 +763,345 @@ index 290deb7..5f1c354 100644
 +	uint32 m_framebufferWriteBacks = 0;
 +	uint32 m_softwareSprites = 0;
 +
++	//HD texture packs in PCSX2's format (<hash>-<clut hash>-<bits>.png), read from baseUrl as
++	//they are needed; baseUrl/index.txt lists the names (GSH_OpenGL_HdTextures.cpp)
++	void EnableHdTextures(const char* baseUrl);
++	void HdTextureLoaded(uint32 slot, uint32 textureName);
++	uint32 m_hdTexturesShown = 0;
++	uint32 m_hdTexturesLoaded = 0;
++
 +private:
  	PaletteList m_paletteCache;
  	FramebufferList m_framebuffers;
  	DepthbufferList m_depthbuffers;
+diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_HdTextures.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_HdTextures.cpp
+new file mode 100644
+index 0000000..2d1ddfa
+--- /dev/null
++++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_HdTextures.cpp
+@@ -0,0 +1,320 @@
++//HD texture replacements in PCSX2's texture pack format.
++//
++//A pack file is named <texture hash>-<palette hash>-<bits>.png, where:
++//- texture hash: XXH3-64 of the texture's 256-byte GS memory blocks, in the order PCSX2's
++//  GSLocalMemory reads them (GSTextureCache.cpp, HashTextureLevel's block path)
++//- palette hash: XXH3-64 of the 16 or 256 32-bit palette colours (paletted formats only)
++//- bits: PSM | TW << 6 | TH << 10
++//Covered: PSMCT32, PSMT8 and PSMT4 textures at least one block in size, with 32-bit palettes and
++//no region clamp (PCSX2 hashes those through another path).
++//
++//The images are read on demand from <base>/<name>.png (the browser decodes them off-thread) and
++//only while they are in use: the least recently used ones are dropped past a limit.
++
++#include "GSH_OpenGL.h"
++#include "../GsPixelFormats.h"
++#include <algorithm>
++#include <array>
++#include <cstdio>
++#include <cstring>
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#endif
++#define XXH_INLINE_ALL
++#include "../../../deps/Dependencies/xxHash/xxhash.h"
++
++namespace
++{
++	//Block number inside a page (PCSX2's GSTables.cpp), indexed [y & 7][x & 7]
++	constexpr uint8 g_blockTable32[8][8] =
++	    {
++	        {0, 1, 4, 5, 16, 17, 20, 21},
++	        {2, 3, 6, 7, 18, 19, 22, 23},
++	        {8, 9, 12, 13, 24, 25, 28, 29},
++	        {10, 11, 14, 15, 26, 27, 30, 31},
++	        {0, 1, 4, 5, 16, 17, 20, 21},
++	        {2, 3, 6, 7, 18, 19, 22, 23},
++	        {8, 9, 12, 13, 24, 25, 28, 29},
++	        {10, 11, 14, 15, 26, 27, 30, 31},
++	};
++	constexpr uint8 g_blockTable4[8][8] =
++	    {
++	        {0, 2, 8, 10, 0, 2, 8, 10},
++	        {1, 3, 9, 11, 1, 3, 9, 11},
++	        {4, 6, 12, 14, 4, 6, 12, 14},
++	        {5, 7, 13, 15, 5, 7, 13, 15},
++	        {16, 18, 24, 26, 16, 18, 24, 26},
++	        {17, 19, 25, 27, 17, 19, 25, 27},
++	        {20, 22, 28, 30, 20, 22, 28, 30},
++	        {21, 23, 29, 31, 21, 23, 29, 31},
++	};
++
++	struct PSM_LAYOUT
++	{
++		uint32 pageShiftX, pageShiftY;   //log2 of the page size in pixels
++		uint32 blockShiftX, blockShiftY; //log2 of the block size in pixels
++		const uint8 (*blockTable)[8];
++	};
++
++	bool GetLayout(uint32 psm, PSM_LAYOUT& layout)
++	{
++		switch(psm)
++		{
++		case CGSHandler::PSMCT32:
++			layout = {6, 5, 3, 3, g_blockTable32};
++			return true;
++		case CGSHandler::PSMT8:
++			layout = {7, 6, 4, 4, g_blockTable32};
++			return true;
++		case CGSHandler::PSMT4:
++			layout = {7, 7, 5, 4, g_blockTable4};
++			return true;
++		default:
++			return false;
++		}
++	}
++
++	constexpr uint32 MAX_HD_TEXTURES_LOADED = 160;
++	constexpr uint32 GS_PAGE_COUNT = 512;
++}
++
++#ifdef __EMSCRIPTEN__
++EM_JS_DEPS(ps2xHdTextures, "$UTF8ToString,$stringToNewUTF8");
++extern "C" EMSCRIPTEN_KEEPALIVE void ps2xHdTextureLoaded(CGSH_OpenGL* gs, uint32 slot, uint32 textureName)
++{
++	gs->HdTextureLoaded(slot, textureName);
++}
++#endif
++
++void CGSH_OpenGL::EnableHdTextures(const char* baseUrl)
++{
++#ifdef __EMSCRIPTEN__
++	m_hdBaseUrl = baseUrl;
++	char* list = reinterpret_cast<char*>(EM_ASM_PTR({
++		try
++		{
++			const request = new XMLHttpRequest();
++			request.open('GET', UTF8ToString($0) + '/index.txt', false);
++			request.send();
++			if(request.status != 200) return 0;
++			return stringToNewUTF8(request.responseText);
++		}
++		catch(e)
++		{
++			return 0;
++		}
++	}, baseUrl));
++	if(!list)
++	{
++		std::printf("[hd] no texture pack at %s\n", baseUrl);
++		return;
++	}
++	for(char* line = std::strtok(list, "\r\n"); line; line = std::strtok(nullptr, "\r\n"))
++	{
++		//<hash>-<clut hash>-<bits> or <hash>-<bits>; names with a region are not handled
++		uint64 hash = 0, clutHash = 0;
++		uint32 bits = 0;
++		char end = 0;
++		if(std::strstr(line, "-r")) continue;
++		if(std::sscanf(line, "%llx-%llx-%x%c", &hash, &clutHash, &bits, &end) != 3)
++		{
++			clutHash = 0;
++			if(std::sscanf(line, "%llx-%x%c", &hash, &bits, &end) != 2) continue;
++		}
++		HD_TEXTURE texture;
++		texture.name = line;
++		m_hdIndex[std::make_tuple(hash, clutHash, bits)] = static_cast<uint32>(m_hdTextures.size());
++		m_hdTextures.push_back(std::move(texture));
++	}
++	std::free(list);
++	m_hdEnabled = !m_hdTextures.empty();
++	std::printf("[hd] %u HD textures available\n", static_cast<unsigned>(m_hdTextures.size()));
++#endif
++}
++
++void CGSH_OpenGL::HdTextureLoaded(uint32 slot, uint32 textureName)
++{
++	auto& texture = m_hdTextures[slot];
++	texture.loading = false;
++	texture.handle = textureName;
++	texture.lastUse = m_hdFrame;
++	m_hdTexturesLoaded++;
++	//The loader bound its texture: Play's bindings have to be set again
++	m_validGlState &= ~GLSTATE_TEXTURE;
++	m_hdGen++;
++	HdEvict();
++}
++
++void CGSH_OpenGL::HdEvict()
++{
++	uint32 loaded = 0;
++	for(const auto& texture : m_hdTextures)
++		if(texture.handle) loaded++;
++	while(loaded > MAX_HD_TEXTURES_LOADED)
++	{
++		HD_TEXTURE* oldest = nullptr;
++		for(auto& texture : m_hdTextures)
++			if(texture.handle && (texture.lastUse != m_hdFrame) && (!oldest || texture.lastUse < oldest->lastUse))
++				oldest = &texture;
++		if(!oldest) break;
++		glDeleteTextures(1, &oldest->handle);
++		oldest->handle = 0;
++		loaded--;
++		m_renderState.isValid = false;
++		m_hdGen++;
++	}
++}
++
++void CGSH_OpenGL::HdInvalidate(uint32 start, uint32 size)
++{
++	if(!m_hdEnabled || size == 0) return;
++	uint32 first = start / 8192;
++	uint32 last = (start + size - 1) / 8192;
++	for(uint32 page = first; page <= last; page++)
++		m_hdPageGen[page % GS_PAGE_COUNT]++;
++	m_hdGen++;
++}
++
++uint32 CGSH_OpenGL::HdPageGenSum(uint32 firstPage, uint32 pageCount) const
++{
++	uint32 sum = 0;
++	for(uint32 i = 0; i < pageCount; i++)
++		sum += m_hdPageGen[(firstPage + i) % GS_PAGE_COUNT];
++	return sum;
++}
++
++uint64 CGSH_OpenGL::HdHashTexture(const TEX0& tex0, uint32& firstPage, uint32& pageCount) const
++{
++	//PCSX2's GSOffset::BNHelper walk over the texture's blocks
++	PSM_LAYOUT layout;
++	GetLayout(tex0.nPsm, layout);
++	const int bwPages = static_cast<int>(tex0.nBufWidth) >> (layout.pageShiftX - 6);
++	const int blocksWide = static_cast<int>(tex0.GetWidth()) >> layout.blockShiftX;
++	const int blocksHigh = static_cast<int>(tex0.GetHeight()) >> layout.blockShiftY;
++	const int pageMaskX = (1 << (layout.pageShiftX - layout.blockShiftX)) - 1;
++	const int pageMaskY = (1 << (layout.pageShiftY - layout.blockShiftY)) - 1;
++
++	XXH3_state_t state;
++	XXH3_64bits_reset(&state);
++	int baseBp = static_cast<int>(tex0.nBufPtr);
++	uint32 minBlock = ~0U, maxBlock = 0;
++	for(int blkY = 0; blkY < blocksHigh;)
++	{
++		int bp = baseBp;
++		for(int blkX = 0; blkX < blocksWide;)
++		{
++			uint32 block = static_cast<uint32>(bp + layout.blockTable[blkY & 7][blkX & 7]) % (RAMSIZE / 256);
++			XXH3_64bits_update(&state, m_pRAM + block * 256, 256);
++			minBlock = std::min(minBlock, block);
++			maxBlock = std::max(maxBlock, block);
++			blkX++;
++			if(!(blkX & pageMaskX)) bp += 32;
++		}
++		blkY++;
++		if(!(blkY & pageMaskY)) baseBp += 32 * bwPages;
++	}
++	firstPage = minBlock / 32;
++	pageCount = (maxBlock / 32) - firstPage + 1;
++	return XXH3_64bits_digest(&state);
++}
++
++GLuint CGSH_OpenGL::HdLookup(uint64 tex0Reg, uint64 clampReg)
++{
++	if((tex0Reg == m_hdMemoTex0) && (clampReg == m_hdMemoClamp) && (m_hdGen == m_hdMemoGen) && (m_clutVersion == m_hdMemoClut))
++	{
++		if(m_hdMemoHandle != 0)
++		{
++			for(auto& texture : m_hdTextures)
++				if(texture.handle == m_hdMemoHandle) texture.lastUse = m_hdFrame;
++		}
++		return m_hdMemoHandle;
++	}
++	m_hdMemoTex0 = tex0Reg;
++	m_hdMemoClamp = clampReg;
++	m_hdMemoGen = m_hdGen;
++	m_hdMemoClut = m_clutVersion;
++	m_hdMemoHandle = 0;
++
++	auto tex0 = make_convertible<TEX0>(tex0Reg);
++	auto clamp = make_convertible<CLAMP>(clampReg);
++	PSM_LAYOUT layout;
++	if(!GetLayout(tex0.nPsm, layout)) return 0;
++	const uint32 tw = tex0.nWidth;
++	const uint32 th = tex0.nPad0 | (tex0.nPad1 << 2);
++	if((tw < layout.blockShiftX) || (th < layout.blockShiftY) || (tw > 10) || (th > 10)) return 0;
++
++	//Region clamp/repeat: PCSX2 names those textures differently (SourceRegion::Create)
++	if((clamp.nWMS == CLAMP_MODE_REGION_CLAMP && clamp.GetMaxU() >= clamp.GetMinU() &&
++	    ((clamp.GetMaxU() - clamp.GetMinU() + 1) < (1u << tw) || clamp.GetMaxU() >= (1u << tw))) ||
++	   (clamp.nWMS == CLAMP_MODE_REGION_REPEAT && clamp.GetMinU() != 0) ||
++	   (clamp.nWMT == CLAMP_MODE_REGION_CLAMP && clamp.GetMaxV() >= clamp.GetMinV() &&
++	    ((clamp.GetMaxV() - clamp.GetMinV() + 1) < (1u << th) || clamp.GetMaxV() >= (1u << th))) ||
++	   (clamp.nWMT == CLAMP_MODE_REGION_REPEAT && clamp.GetMinV() != 0))
++		return 0;
++
++	uint64 clutHash = 0;
++	if(CGsPixelFormats::IsPsmIDTEX(tex0.nPsm))
++	{
++		if((tex0.nCPSM != PSMCT32) && (tex0.nCPSM != PSMCT24)) return 0;
++		std::array<uint32, 256> clut;
++		MakeLinearCLUT(tex0, clut);
++		clutHash = XXH3_64bits(clut.data(), sizeof(uint32) * (CGsPixelFormats::IsPsmIDTEX4(tex0.nPsm) ? 16 : 256));
++	}
++
++	//The texture's hash, again only when its memory changed
++	const uint64 hashKey = tex0Reg & ((1ULL << 34) - 1); //TBP0, TBW, PSM, TW, TH
++	auto& cached = m_hdHashes[hashKey];
++	if(cached.pageCount == 0 || cached.pageGenSum != HdPageGenSum(cached.firstPage, cached.pageCount))
++	{
++		cached.hash = HdHashTexture(tex0, cached.firstPage, cached.pageCount);
++		cached.pageGenSum = HdPageGenSum(cached.firstPage, cached.pageCount);
++	}
++
++	const uint32 bits = tex0.nPsm | (tw << 6) | (th << 10);
++	auto indexIterator = m_hdIndex.find(std::make_tuple(cached.hash, clutHash, bits));
++	if(indexIterator == std::end(m_hdIndex)) return 0;
++
++	uint32 slot = indexIterator->second;
++	auto& texture = m_hdTextures[slot];
++	texture.lastUse = m_hdFrame;
++	if(texture.handle != 0)
++	{
++		m_hdTexturesShown++;
++		m_hdMemoHandle = texture.handle;
++		return texture.handle;
++	}
++#ifdef __EMSCRIPTEN__
++	if(!texture.loading)
++	{
++		texture.loading = true;
++		//Fetched and decoded by the browser; the GL texture is made in this thread (its context)
++		EM_ASM({
++			const gs = $0;
++			const slot = $1;
++			const url = UTF8ToString($2) + '/' + UTF8ToString($3) + '.png';
++			fetch(url)
++			    .then((response) => { if(!response.ok) throw new Error(response.status); return response.blob(); })
++			    .then((blob) => createImageBitmap(blob, {premultiplyAlpha: 'none', colorSpaceConversion: 'none'}))
++			    .then((image) => {
++				    const gl = GLctx;
++				    const previous = gl.getParameter(gl.TEXTURE_BINDING_2D);
++				    const texture = gl.createTexture();
++				    gl.bindTexture(gl.TEXTURE_2D, texture);
++				    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
++				    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
++				    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
++				    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
++				    gl.generateMipmap(gl.TEXTURE_2D);
++				    gl.bindTexture(gl.TEXTURE_2D, previous);
++				    image.close();
++				    const name = GL.getNewId(GL.textures);
++				    texture.name = name;
++				    GL.textures[name] = texture;
++				    _ps2xHdTextureLoaded(gs, slot, name);
++			    })
++			    .catch((error) => { console.log('[hd] ' + url + ': ' + error); });
++		}, this, slot, m_hdBaseUrl.c_str(), texture.name.c_str());
++	}
++#endif
++	return 0;
++}
 diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
-index 3f37572..e5f7d08 100644
+index 3f37572..0fdd808 100644
 --- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
 +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Shader.cpp
 @@ -136,13 +136,14 @@ Framework::OpenGl::CShader CGSH_OpenGL::GenerateVertexShader(const SHADERCAPS& c
@@ -683,7 +1174,7 @@ index 3f37572..e5f7d08 100644
  		shaderBuilder << "	texCoord.st /= g_textureSize.st;" << std::endl;
  	}
  
-+	if(emulatedFetch && !caps.texBilinearFilter && (caps.texSourceMode != TEXTURE_SOURCE_MODE_NONE))
++	if(emulatedFetch && !caps.texBilinearFilter && !caps.texHd && (caps.texSourceMode != TEXTURE_SOURCE_MODE_NONE))
 +	{
 +		//The GS samples where the pixel starts, GL at its centre: pick the texel the GS would
 +		shaderBuilder << "	{" << std::endl;
@@ -767,7 +1258,7 @@ index 3f37572..e5f7d08 100644
  	else
  	{
 diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
-index 01a1217..aa65ff0 100644
+index 01a1217..b9bd644 100644
 --- a/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
 +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Texture.cpp
 @@ -1,5 +1,6 @@
@@ -796,7 +1287,7 @@ index 01a1217..aa65ff0 100644
  			//Another case: TEX0 is pointing to the start of a page within our framebuffer (BGDA does this)
  			if(candidateFramebuffer->m_basePtr <= tex0.GetBufPtr() &&
  			   candidateFramebuffer->m_width == tex0.GetBufWidth() &&
-@@ -183,6 +189,115 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
+@@ -183,6 +189,116 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::SearchTextureFramebuffer(const TEX0& tex0
  	}
  }
  
@@ -825,6 +1316,7 @@ index 01a1217..aa65ff0 100644
 +#endif
 +		WriteBackFramebuffer(framebuffer);
 +		m_textureCache.InvalidateRange(fbStart, fbEnd - fbStart);
++		HdInvalidate(fbStart, fbEnd - fbStart);
 +	}
 +}
 +
@@ -912,7 +1404,7 @@ index 01a1217..aa65ff0 100644
  CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
  {
  	auto texInfo = SearchTextureFramebuffer(tex0);
-@@ -191,6 +306,10 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
+@@ -191,6 +307,10 @@ CGSH_OpenGL::TEXTURE_INFO CGSH_OpenGL::PrepareTexture(const TEX0& tex0)
  		return texInfo;
  	}
  
@@ -923,8 +1415,42 @@ index 01a1217..aa65ff0 100644
  	auto texture = m_textureCache.Search(tex0);
  	if(!texture)
  	{
+diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
+index 57e58ba..c42e349 100644
+--- a/Source/gs/GSHandler.cpp
++++ b/Source/gs/GSHandler.cpp
+@@ -1060,10 +1060,18 @@ bool CGSHandler::TransferWriteHandlerPSMT4(const void* pData, uint32 nLength)
+ 			uint32 nX = (m_trxCtx.nRRX + trxPos.nDSAX) % 2048;
+ 			uint32 nY = (m_trxCtx.nRRY + trxPos.nDSAY) % 2048;
+ 
+-			uint8 currentPixel = Indexor.GetPixel(nX, nY);
+-			if(currentPixel != nPixel[j])
++			//Same address as CPixelIndexor<PSMT4>::GetPixel/SetPixel, computed once for both
++			typedef CGsPixelFormats::STORAGEPSMT4 Storage;
++			const unsigned int columnNum = (nY / Storage::COLUMNHEIGHT) & 0x01;
++			unsigned int shift = (nX & 0x18) + ((nY & 0x02) << 1);
++			const unsigned int subTable = ((nY & 0x02) >> 1) ^ columnNum;
++			uint32 columnX = nX, columnY = nY;
++			const uint32 address = Indexor.GetColumnAddress(columnX, columnY);
++			uint32* word = &reinterpret_cast<uint32*>(m_pRAM + address)[Storage::m_nColumnWordTable[subTable][nY & 0x01][nX & 0x07]];
++			const uint32 updated = (*word & ~(0xFu << shift)) | (static_cast<uint32>(nPixel[j]) << shift);
++			if(updated != *word)
+ 			{
+-				Indexor.SetPixel(nX, nY, nPixel[j]);
++				*word = updated;
+ 				dirty = true;
+ 			}
+ 
+@@ -1483,6 +1491,7 @@ CGSHandler::DISPLAY_INFO CGSHandler::GetCurrentDisplayInfo()
+ void CGSHandler::SyncCLUT(const TEX0& tex0)
+ {
+ 	if(!ProcessCLD(tex0)) return;
++	m_clutVersion++;
+ 
+ 	//assert(IsPsmIDTEX(tex0.nPsm));
+ 	switch(tex0.nPsm)
 diff --git a/Source/gs/GSHandler.h b/Source/gs/GSHandler.h
-index 66bfe59..125dd17 100644
+index 66bfe59..2de6379 100644
 --- a/Source/gs/GSHandler.h
 +++ b/Source/gs/GSHandler.h
 @@ -901,6 +901,14 @@ public:
@@ -942,3 +1468,11 @@ index 66bfe59..125dd17 100644
  
  	FlipCompleteEvent OnFlipComplete;
  	NewFrameEvent OnNewFrame;
+@@ -1107,6 +1115,7 @@ protected:
+ 	uint8* m_pRAM = nullptr;
+ 
+ 	uint16* m_pCLUT = nullptr;
++	uint32 m_clutVersion = 0; //Counts CLUT loads
+ 	uint32 m_nCBP0;
+ 	uint32 m_nCBP1;
+ 
