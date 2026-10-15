@@ -115,7 +115,7 @@ index 0f89436..0dcec41 100644
  target_link_libraries(gsh_opengl Framework_OpenGl ${GSH_OPENGL_PROJECT_LIBS})
  target_include_directories(gsh_opengl PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/Source/gs/GSH_OpenGL/)
 diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
-index 7eb9460..290e91f 100644
+index 7eb9460..6bd44cd 100644
 --- a/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
 +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.cpp
 @@ -7,6 +7,7 @@
@@ -150,7 +150,7 @@ index 7eb9460..290e91f 100644
  	m_framebuffers.clear();
  	m_depthbuffers.clear();
  	m_vertexBuffer.clear();
-@@ -135,7 +144,23 @@ void CGSH_OpenGL::MarkNewFrame()
+@@ -135,7 +144,24 @@ void CGSH_OpenGL::MarkNewFrame()
  
  void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
  {
@@ -171,10 +171,11 @@ index 7eb9460..290e91f 100644
 +	}
  	FlushVertexBuffer();
 +	PumpShaderPrecompile();
++	HdUploadQueued(2);
  	m_renderState.isValid = false;
  	m_validGlState = 0;
  
-@@ -160,6 +185,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+@@ -160,6 +186,7 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
  
  		if(!framebuffer && (dispLayer.bufWidth != 0))
  		{
@@ -182,7 +183,7 @@ index 7eb9460..290e91f 100644
  			framebuffer = FramebufferPtr(new CFramebuffer(dispLayer.bufPtr, dispLayer.bufWidth, FRAMEBUFFER_HEIGHT, dispLayer.psm, m_fbScale, m_multisampleEnabled));
  			m_framebuffers.push_back(framebuffer);
  			PopulateFramebuffer(framebuffer);
-@@ -190,7 +216,10 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
+@@ -190,7 +217,10 @@ void CGSH_OpenGL::FlipImpl(const DISPLAY_INFO& dispInfo)
  	glViewport(presentationViewport.offsetX, presentationViewport.offsetY,
  	           presentationViewport.width, presentationViewport.height);
  
@@ -194,7 +195,7 @@ index 7eb9460..290e91f 100644
  	{
  		float u1 = static_cast<float>(dispLayer.width) / static_cast<float>(framebuffer->m_width);
  		float v1 = static_cast<float>(dispLayer.height) / static_cast<float>(framebuffer->m_height);
-@@ -250,6 +279,7 @@ void CGSH_OpenGL::LoadState(Framework::CZipArchiveReader& archive)
+@@ -250,6 +280,7 @@ void CGSH_OpenGL::LoadState(Framework::CZipArchiveReader& archive)
  	SendGSCall(
  	    [this]() {
  		    m_textureCache.InvalidateRange(0, RAMSIZE);
@@ -202,7 +203,7 @@ index 7eb9460..290e91f 100644
  	    });
  }
  
-@@ -265,6 +295,7 @@ void CGSH_OpenGL::NotifyPreferencesChangedImpl()
+@@ -265,6 +296,7 @@ void CGSH_OpenGL::NotifyPreferencesChangedImpl()
  	LoadPreferences();
  	m_textureCache.Flush();
  	PalCache_Flush();
@@ -210,7 +211,7 @@ index 7eb9460..290e91f 100644
  	m_framebuffers.clear();
  	m_depthbuffers.clear();
  	CGSHandler::NotifyPreferencesChangedImpl();
-@@ -500,41 +531,128 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GetShaderFromCaps(const SHADERCAPS& s
+@@ -500,41 +532,128 @@ Framework::OpenGl::ProgramPtr CGSH_OpenGL::GetShaderFromCaps(const SHADERCAPS& s
  	auto shaderIterator = m_shaders.find(shaderCaps);
  	if(shaderIterator == m_shaders.end())
  	{
@@ -365,7 +366,7 @@ index 7eb9460..290e91f 100644
  }
  
  void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
-@@ -553,12 +671,40 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+@@ -553,12 +672,40 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
  	uint64 clampReg = m_nReg[GS_REG_CLAMP_1 + context];
  	uint64 fogColReg = m_nReg[GS_REG_FOGCOL];
  	uint64 scissorReg = m_nReg[GS_REG_SCISSOR_1 + context];
@@ -406,7 +407,7 @@ index 7eb9460..290e91f 100644
  	FillShaderCapsFromTexture(shaderCaps, tex0Reg, tex1Reg, texAReg, clampReg);
  	FillShaderCapsFromTest(shaderCaps, testReg);
  	FillShaderCapsFromAlpha(shaderCaps, prim.nAlpha != 0, alphaReg);
-@@ -568,10 +714,18 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+@@ -568,10 +715,18 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
  		shaderCaps.hasFog = 1;
  	}
  
@@ -425,7 +426,7 @@ index 7eb9460..290e91f 100644
  
  	//--------------------------------------------------------
  	// Fast path: if everything (shader caps + relevant regs) matches, skip.
-@@ -579,7 +733,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+@@ -579,7 +734,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
  	if(m_renderState.isValid)
  	{
  		if(m_renderState.isTextureStateValid && m_renderState.isFramebufferStateValid &&
@@ -434,7 +435,7 @@ index 7eb9460..290e91f 100644
  		   (m_renderState.primReg == primReg) &&
  		   (m_renderState.alphaReg == alphaReg) &&
  		   (m_renderState.testReg == testReg) &&
-@@ -590,6 +744,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+@@ -590,6 +745,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
  		   (m_renderState.tex1Reg == tex1Reg) &&
  		   (m_renderState.texAReg == texAReg) &&
  		   (m_renderState.clampReg == clampReg) &&
@@ -442,7 +443,7 @@ index 7eb9460..290e91f 100644
  		   (m_renderState.fogColReg == fogColReg))
  		{
  			// Nothing changed.
-@@ -605,18 +760,18 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+@@ -605,18 +761,18 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
  	//--------------------------------------------------------
  	uint64 prevPrimValue = m_renderState.isValid ? m_renderState.primReg : 0;
  	auto prevPrim = make_convertible<PRMODE>(prevPrimValue);
@@ -466,7 +467,7 @@ index 7eb9460..290e91f 100644
  	bool fogColorChanged = !m_renderState.isValid || (m_renderState.fogColReg != fogColReg);
  
  	bool needFlush = shaderChanged || primChanged || alphaChanged || testChanged || zbufChanged || framebufferRelatedChanged || textureChanged || fogColorChanged;
-@@ -637,7 +792,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+@@ -637,7 +793,7 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
  	{
  		if(!m_hasFramebufferFetchExtension)
  		{
@@ -475,7 +476,7 @@ index 7eb9460..290e91f 100644
  			m_validGlState &= ~GLSTATE_BLEND;
  		}
  	}
-@@ -669,6 +824,18 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
+@@ -669,6 +825,18 @@ void CGSH_OpenGL::SetRenderingContext(uint64 primReg)
  	if(textureChanged)
  	{
  		SetupTexture(primReg, tex0Reg, tex1Reg, texAReg, clampReg);
@@ -494,7 +495,7 @@ index 7eb9460..290e91f 100644
  		CHECKGLERROR();
  	}
  
-@@ -704,7 +871,7 @@ void CGSH_OpenGL::SetupBlendingFunction(uint64 alphaReg)
+@@ -704,7 +872,7 @@ void CGSH_OpenGL::SetupBlendingFunction(uint64 alphaReg)
  {
  	auto alpha = make_convertible<ALPHA>(alphaReg);
  
@@ -503,7 +504,7 @@ index 7eb9460..290e91f 100644
  	{
  		m_fragmentParams.alphaFix = (static_cast<float>(alpha.nFix) / 255.f);
  		m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
-@@ -976,10 +1143,14 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+@@ -976,10 +1144,14 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
  	auto scissor = make_convertible<SCISSOR>(scissorReg);
  	auto test = make_convertible<TEST>(testReg);
  
@@ -522,7 +523,7 @@ index 7eb9460..290e91f 100644
  
  	//Don't write to alpha in PSMCT24
  	if(frame.nPsm == PSMCT24)
-@@ -1041,6 +1212,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
+@@ -1041,6 +1213,7 @@ void CGSH_OpenGL::SetupFramebuffer(uint64 frameReg, uint64 zbufReg, uint64 sciss
  
  	m_renderState.framebufferHandle = framebuffer->m_framebuffer;
  	m_validGlState |= GLSTATE_FRAMEBUFFER; //glBindFramebuffer used to set just above
@@ -530,7 +531,7 @@ index 7eb9460..290e91f 100644
  
  	//We assume that we will be drawing to this framebuffer and that we'll need
  	//to resolve samples at some point if multisampling is enabled
-@@ -1217,7 +1389,7 @@ void CGSH_OpenGL::FillShaderCapsFromAlpha(SHADERCAPS& shaderCaps, bool alphaEnab
+@@ -1217,7 +1390,7 @@ void CGSH_OpenGL::FillShaderCapsFromAlpha(SHADERCAPS& shaderCaps, bool alphaEnab
  
  	auto alpha = make_convertible<ALPHA>(alphaReg);
  
@@ -539,7 +540,7 @@ index 7eb9460..290e91f 100644
  	{
  		shaderCaps.hasAlphaBlend = alphaEnabled;
  		shaderCaps.alphaBlendA = alpha.nA;
-@@ -1371,6 +1543,34 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
+@@ -1371,6 +1544,34 @@ void CGSH_OpenGL::SetupTexture(uint64 primReg, uint64 tex0Reg, uint64 tex1Reg, u
  	m_validGlState &= ~GLSTATE_FRAGMENT_PARAMS;
  }
  
@@ -574,7 +575,7 @@ index 7eb9460..290e91f 100644
  CGSH_OpenGL::FramebufferPtr CGSH_OpenGL::FindFramebuffer(const FRAME& frame) const
  {
  	auto framebufferIterator = std::find_if(std::begin(m_framebuffers), std::end(m_framebuffers),
-@@ -1724,6 +1924,26 @@ void CGSH_OpenGL::FlushVertexBuffer()
+@@ -1724,6 +1925,26 @@ void CGSH_OpenGL::FlushVertexBuffer()
  
  void CGSH_OpenGL::DoRenderPass()
  {
@@ -601,7 +602,7 @@ index 7eb9460..290e91f 100644
  	if((m_validGlState & GLSTATE_VERTEX_PARAMS) == 0)
  	{
  		glBindBuffer(GL_UNIFORM_BUFFER, m_vertexParamsBuffer);
-@@ -1841,6 +2061,39 @@ void CGSH_OpenGL::DoRenderPass()
+@@ -1841,6 +2062,39 @@ void CGSH_OpenGL::DoRenderPass()
  		break;
  	}
  
@@ -641,7 +642,7 @@ index 7eb9460..290e91f 100644
  	glDrawArrays(primitiveMode, 0, m_vertexBuffer.size());
  
  	m_drawCallCount++;
-@@ -2023,6 +2276,30 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
+@@ -2023,6 +2277,30 @@ void CGSH_OpenGL::VertexKick(uint8 nRegister, uint64 nValue)
  			m_PrimitiveMode <<= m_nReg[GS_REG_PRMODE];
  		}
  
@@ -672,7 +673,7 @@ index 7eb9460..290e91f 100644
  		if(nDrawingKick)
  		{
  			// Fast skip if nothing relevant changed since last draw
-@@ -2118,6 +2395,7 @@ void CGSH_OpenGL::ProcessHostToLocalTransfer()
+@@ -2118,6 +2396,7 @@ void CGSH_OpenGL::ProcessHostToLocalTransfer()
  		auto [transferAddress, transferSize] = GsTransfer::GetDstRange(bltBuf, trxReg, trxPos);
  
  		m_textureCache.InvalidateRange(transferAddress, transferSize);
@@ -680,7 +681,7 @@ index 7eb9460..290e91f 100644
  
  		bool isUpperByteTransfer = (bltBuf.nDstPsm == PSMT8H) || (bltBuf.nDstPsm == PSMT4HL) || (bltBuf.nDstPsm == PSMT4HH);
  		for(const auto& framebuffer : m_framebuffers)
-@@ -2231,6 +2509,7 @@ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
+@@ -2231,6 +2510,7 @@ void CGSH_OpenGL::ProcessLocalToLocalTransfer()
  
  		auto [transferAddress, transferSize] = GsTransfer::GetDstRange(bltBuf, trxReg, trxPos);
  		m_textureCache.InvalidateRange(transferAddress, transferSize);
@@ -688,7 +689,7 @@ index 7eb9460..290e91f 100644
  
  		//Write back to RAM
  		{
-@@ -2643,3 +2922,281 @@ CGSH_OpenGL::CDepthbuffer::CDepthbuffer(uint32 basePtr, uint32 width, uint32 hei
+@@ -2643,3 +2923,281 @@ CGSH_OpenGL::CDepthbuffer::CDepthbuffer(uint32 basePtr, uint32 width, uint32 hei
  	}
  	CHECKGLERROR();
  }
@@ -971,7 +972,7 @@ index 7eb9460..290e91f 100644
 +	return true;
 +}
 diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
-index 290deb7..f0702fb 100644
+index 290deb7..571943c 100644
 --- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
 +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
 @@ -1,7 +1,11 @@
@@ -1057,7 +1058,7 @@ index 290deb7..f0702fb 100644
  	GLuint PreparePalette(const TEX0&);
  
  	void ProcessPrim(uint64);
-@@ -429,6 +455,161 @@ private:
+@@ -429,6 +455,162 @@ private:
  	GLint m_copyToFbSrcSizeUniform = -1;
  
  	TextureCache m_textureCache;
@@ -1097,6 +1098,7 @@ index 290deb7..f0702fb 100644
 +	uint64 HdHashExpanded(const TEX0&, int x0, int y0, int x1, int y1, uint32& firstPage, uint32& pageCount) const;
 +	bool HdCanHashTexture(const TEX0&) const;
 +	void HdEvict();
++	void HdUploadQueued(uint32 count);
 +	void FinishShader(const Framework::OpenGl::ProgramPtr&);
 +	void PumpShaderPrecompile();
 +	ShaderMap m_pendingShaders;
@@ -1507,10 +1509,10 @@ index 0000000..6c10d29
 +}
 diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_HdTextures.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_HdTextures.cpp
 new file mode 100644
-index 0000000..5a47eec
+index 0000000..5b71152
 --- /dev/null
 +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_HdTextures.cpp
-@@ -0,0 +1,445 @@
+@@ -0,0 +1,466 @@
 +//HD texture replacements in PCSX2's texture pack format.
 +//
 +//A pack file is named <texture hash>-<palette hash>-<bits>.png, where:
@@ -1655,6 +1657,40 @@ index 0000000..5a47eec
 +	std::free(list);
 +	m_hdEnabled = !m_hdTextures.empty();
 +	std::printf("[hd] %u HD textures available\n", static_cast<unsigned>(m_hdTextures.size()));
++#endif
++}
++
++//Once per shown frame: GL textures for up to `count` decoded HD images (texture upload + mipmaps
++//take a few ms each on phones; all of a scene's at once made a visible stall)
++void CGSH_OpenGL::HdUploadQueued(uint32 count)
++{
++#ifdef __EMSCRIPTEN__
++	if(!m_hdEnabled) return;
++	EM_ASM({
++		const queue = self.ps2xHdQueue;
++		for(let left = $0; queue && queue.length && left > 0; left--)
++		{
++			const item = queue.shift();
++			const gs = item[0];
++			const slot = item[1];
++			const image = item[2];
++			const gl = GLctx;
++			const previous = gl.getParameter(gl.TEXTURE_BINDING_2D);
++			const texture = gl.createTexture();
++			gl.bindTexture(gl.TEXTURE_2D, texture);
++			gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
++			gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
++			gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
++			gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
++			gl.generateMipmap(gl.TEXTURE_2D);
++			gl.bindTexture(gl.TEXTURE_2D, previous);
++			image.close();
++			const name = GL.getNewId(GL.textures);
++			texture.name = name;
++			GL.textures[name] = texture;
++			_ps2xHdTextureLoaded(gs, slot, name);
++		}
++	}, count);
 +#endif
 +}
 +
@@ -1934,21 +1970,8 @@ index 0000000..5a47eec
 +			    .then((response) => { if(!response.ok) throw new Error(response.status); return response.blob(); })
 +			    .then((blob) => createImageBitmap(blob, {premultiplyAlpha: 'none', colorSpaceConversion: 'none'}))
 +			    .then((image) => {
-+				    const gl = GLctx;
-+				    const previous = gl.getParameter(gl.TEXTURE_BINDING_2D);
-+				    const texture = gl.createTexture();
-+				    gl.bindTexture(gl.TEXTURE_2D, texture);
-+				    gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-+				    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
-+				    gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
-+				    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
-+				    gl.generateMipmap(gl.TEXTURE_2D);
-+				    gl.bindTexture(gl.TEXTURE_2D, previous);
-+				    image.close();
-+				    const name = GL.getNewId(GL.textures);
-+				    texture.name = name;
-+				    GL.textures[name] = texture;
-+				    _ps2xHdTextureLoaded(gs, slot, name);
++				    //Uploaded by HdUploadQueued, a few per frame: a match start brings ~90 at once
++				    (self.ps2xHdQueue = self.ps2xHdQueue || []).push([gs, slot, image]);
 +			    })
 +			    .catch((error) => { console.log('[hd] ' + url + ': ' + error); });
 +		}, this, slot, m_hdBaseUrl.c_str(), texture.name.c_str());

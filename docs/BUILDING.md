@@ -199,7 +199,7 @@ their own patches, and the few runtime changes shared with native code are behin
 - FSR 1 (`GSH_OpenGL_Fsr.cpp`): a GLSL ES 3.0 port of AMD's EASU + RCAS (MIT). It runs in `FlipImpl`
   only when the window is larger than the displayed image.
 - Shaders built ahead of time: `PrecompileShaders` / `PumpShaderPrecompile` start the compile and
-  link without waiting for their status; `FinishShader` binds uniforms once a program is built
+  link without waiting for their status (HD images are also uploaded two per frame, not all at once); `FinishShader` binds uniforms once a program is built
   (`KHR_parallel_shader_compile`), or right away when a draw needs it.
 - VU microprograms (`ee/VuExecutor.cpp`): partitions are remembered per (micro memory contents,
   block start), so swapping microprograms back in reuses their blocks.

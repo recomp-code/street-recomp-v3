@@ -195,7 +195,8 @@ nativo están dentro de `__EMSCRIPTEN__`.
 - FSR 1 (`GSH_OpenGL_Fsr.cpp`): port a GLSL ES 3.0 de EASU + RCAS de AMD (MIT). Se aplica en
   `FlipImpl` solo cuando la ventana es más grande que la imagen mostrada.
 - Shaders compilados por adelantado: `PrecompileShaders` / `PumpShaderPrecompile` lanzan la
-  compilación y el enlace sin esperar su estado; `FinishShader` asigna los uniforms cuando el
+  compilación y el enlace sin esperar su estado (las imágenes HD también se suben de dos en dos por
+  cuadro, no todas a la vez); `FinishShader` asigna los uniforms cuando el
   programa ya está listo (`KHR_parallel_shader_compile`), o en el momento si un dibujo lo necesita.
 - Microprogramas de la VU (`ee/VuExecutor.cpp`): las particiones se recuerdan por (contenido de la
   micromemoria, inicio del bloque), así que al volver a cargar un microprograma se reutilizan sus
