@@ -2482,7 +2482,7 @@ index 01a1217..3d867f5 100644
  	return texInfo;
  }
 diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
-index 57e58ba..f5fc7e1 100644
+index 57e58ba..0c5bac6 100644
 --- a/Source/gs/GSHandler.cpp
 +++ b/Source/gs/GSHandler.cpp
 @@ -1,5 +1,6 @@
@@ -2500,7 +2500,23 @@ index 57e58ba..f5fc7e1 100644
  #include "GsPixelFormats.h"
  #include "string_format.h"
  #include "ThreadUtils.h"
-@@ -978,30 +980,43 @@ bool CGSHandler::TransferWriteHandlerGeneric(const void* pData, uint32 nLength)
+@@ -152,6 +154,7 @@ void CGSHandler::ResetBase()
+ 	memset(m_nReg, 0, sizeof(uint64) * 0x80);
+ 	memset(m_pRAM, 0, RAMSIZE);
+ 	memset(m_pCLUT, 0, CLUTSIZE);
++	m_lastClutLoadKey = ~0ULL;
+ 	memset(&m_trxCtx, 0, sizeof(m_trxCtx));
+ 	m_nPMODE = 0;
+ 	m_nSMODE2 = 0x3; // Interlacing with fullframe
+@@ -285,6 +288,7 @@ void CGSHandler::SaveState(Framework::CZipArchiveWriter& archive)
+ 
+ void CGSHandler::LoadState(Framework::CZipArchiveReader& archive)
+ {
++	m_lastClutLoadKey = ~0ULL;
+ 	archive.BeginReadFile(STATE_RAM)->Read(GetRam(), RAMSIZE);
+ 	archive.BeginReadFile(STATE_REGS)->Read(m_nReg, sizeof(uint64) * CGSHandler::REGISTER_MAX);
+ 	archive.BeginReadFile(STATE_TRXCTX)->Read(&m_trxCtx, sizeof(TRXCONTEXT));
+@@ -978,30 +982,43 @@ bool CGSHandler::TransferWriteHandlerGeneric(const void* pData, uint32 nLength)
  
  	nLength /= sizeof(typename Storage::Unit);
  
@@ -2561,7 +2577,7 @@ index 57e58ba..f5fc7e1 100644
  
  	return nDirty;
  }
-@@ -1037,44 +1052,80 @@ bool CGSHandler::TransferWriteHandlerPSMCT24(const void* pData, uint32 nLength)
+@@ -1037,44 +1054,80 @@ bool CGSHandler::TransferWriteHandlerPSMCT24(const void* pData, uint32 nLength)
  	return true;
  }
  
@@ -2666,16 +2682,83 @@ index 57e58ba..f5fc7e1 100644
  
  	return dirty;
  }
-@@ -1483,6 +1534,7 @@ CGSHandler::DISPLAY_INFO CGSHandler::GetCurrentDisplayInfo()
- void CGSHandler::SyncCLUT(const TEX0& tex0)
+@@ -1484,19 +1537,34 @@ void CGSHandler::SyncCLUT(const TEX0& tex0)
  {
  	if(!ProcessCLD(tex0)) return;
-+	m_clutVersion++;
  
- 	//assert(IsPsmIDTEX(tex0.nPsm));
- 	switch(tex0.nPsm)
+-	//assert(IsPsmIDTEX(tex0.nPsm));
+-	switch(tex0.nPsm)
++	//Games reload the same palette before most draws (CLD = 1). A 32-bit palette is one
++	//contiguous run of GS memory (1 KB for 256 colours, 64 bytes for 16): when that memory and the
++	//load's parameters are what the last load read, the CLUT already holds it.
++	const bool eightBit = (tex0.nPsm == PSMT8) || (tex0.nPsm == PSMT8H);
++	const bool fourBit = (tex0.nPsm == PSMT4) || (tex0.nPsm == PSMT4HH) || (tex0.nPsm == PSMT4HL);
++	if(!eightBit && !fourBit) return;
++	const bool plain32 = (tex0.nCSM == 0) && ((tex0.nCPSM == PSMCT32) || (tex0.nCPSM == PSMCT24));
++	const uint32 sourceSize = eightBit ? 1024 : 64;
++	const uint32 sourcePtr = tex0.GetCLUTPtr() & (RAMSIZE - 1);
++	const uint64 loadKey = static_cast<uint64>(sourcePtr) | (static_cast<uint64>(tex0.nCPSM) << 32) |
++	                       (static_cast<uint64>(tex0.nCSA) << 38) | (static_cast<uint64>(eightBit) << 43);
++	if(plain32 && (sourcePtr + sourceSize <= RAMSIZE))
++	{
++		if((m_lastClutLoadKey == loadKey) && (memcmp(m_lastClutSource, m_pRAM + sourcePtr, sourceSize) == 0))
++		{
++			return;
++		}
++		memcpy(m_lastClutSource, m_pRAM + sourcePtr, sourceSize);
++		m_lastClutLoadKey = loadKey;
++	}
++	else
+ 	{
+-	case PSMT8:
+-	case PSMT8H:
+-		ReadCLUT8(tex0);
+-		break;
+-	case PSMT4:
+-	case PSMT4HH:
+-	case PSMT4HL:
+-		ReadCLUT4(tex0);
+-		break;
++		m_lastClutLoadKey = ~0ULL;
+ 	}
++
++	//Only a palette that really changed makes what was derived from the old one stale
++	const bool changed = eightBit ? ReadCLUT8(tex0) : ReadCLUT4(tex0);
++	if(changed) m_clutVersion++;
+ }
+ 
+ bool CGSHandler::ProcessCLD(const TEX0& tex0)
+@@ -1584,7 +1652,7 @@ bool CGSHandler::ReadCLUT8_16(const TEX0& tex0)
+ 	return changed;
+ }
+ 
+-void CGSHandler::ReadCLUT4(const TEX0& tex0)
++bool CGSHandler::ReadCLUT4(const TEX0& tex0)
+ {
+ 	bool changed = false;
+ 
+@@ -1663,9 +1731,10 @@ void CGSHandler::ReadCLUT4(const TEX0& tex0)
+ 	{
+ 		ProcessClutTransfer(tex0.nCSA, 0);
+ 	}
++	return changed;
+ }
+ 
+-void CGSHandler::ReadCLUT8(const TEX0& tex0)
++bool CGSHandler::ReadCLUT8(const TEX0& tex0)
+ {
+ 	assert(tex0.nCSA == 0);
+ 
+@@ -1742,6 +1811,7 @@ void CGSHandler::ReadCLUT8(const TEX0& tex0)
+ 	{
+ 		ProcessClutTransfer(tex0.nCSA, 0);
+ 	}
++	return changed;
+ }
+ 
+ bool CGSHandler::IsCompatibleFramebufferPSM(unsigned int psmFb, unsigned int psmTex)
 diff --git a/Source/gs/GSHandler.h b/Source/gs/GSHandler.h
-index 66bfe59..587ae8d 100644
+index 66bfe59..fd1330b 100644
 --- a/Source/gs/GSHandler.h
 +++ b/Source/gs/GSHandler.h
 @@ -901,6 +901,14 @@ public:
@@ -2693,7 +2776,20 @@ index 66bfe59..587ae8d 100644
  
  	FlipCompleteEvent OnFlipComplete;
  	NewFrameEvent OnNewFrame;
-@@ -1107,6 +1115,10 @@ protected:
+@@ -1080,8 +1088,10 @@ protected:
+ 	bool ReadCLUT4_16(const TEX0&);
+ 	template <typename Indexor>
+ 	bool ReadCLUT8_16(const TEX0&);
+-	void ReadCLUT4(const TEX0&);
+-	void ReadCLUT8(const TEX0&);
++	bool ReadCLUT4(const TEX0&);
++	bool ReadCLUT8(const TEX0&);
++	uint64 m_lastClutLoadKey = ~0ULL;
++	uint8 m_lastClutSource[1024] = {};
+ 
+ 	static bool IsCompatibleFramebufferPSM(unsigned int, unsigned int);
+ 
+@@ -1107,6 +1117,10 @@ protected:
  	uint8* m_pRAM = nullptr;
  
  	uint16* m_pCLUT = nullptr;
