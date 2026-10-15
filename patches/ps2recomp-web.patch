@@ -2688,6 +2688,24 @@ index 0000000..96f355f
 +// Disc files the game opens through cdrom0: (PS2X_VFS_LOG=1 run to a match), besides the ELF.
 +"SLUS_211.26",
 +"DEV9.IRX",
+diff --git a/ps2xRuntime/web/known_shaders.inc b/ps2xRuntime/web/known_shaders.inc
+new file mode 100644
+index 0000000..415e116
+--- /dev/null
++++ b/ps2xRuntime/web/known_shaders.inc
+@@ -0,0 +1,12 @@
++// Shader variants (Play!'s SHADERCAPS) this game uses, compiled during the loading screens so a
++// draw never waits for one. Collected from "[gsh] new shader" log lines (boot, menus, matches).
++    0x0000000000000000ull, 0x0000000000000424ull, 0x0000000000000524ull, 0x0000000000002424ull,
++    0x0000000000002524ull, 0x0000000000002c00ull, 0x0000000000002c24ull, 0x0000000000002e00ull,
++    0x0000000000002f00ull, 0x0000000000002f03ull, 0x0000000000002f27ull, 0x0000000006002f00ull,
++    0x0000000007002f00ull, 0x000000001a002424ull, 0x000000001a002500ull, 0x000000001a002524ull,
++    0x000000001a002c00ull, 0x000000001a002c24ull, 0x000000001a002c27ull, 0x000000001a002c48ull,
++    0x000000001a002e00ull, 0x000000001a002e24ull, 0x000000001a002e48ull, 0x000000001a002f00ull,
++    0x000000001a002f24ull, 0x000000001a006524ull, 0x000000001a006f24ull, 0x0000000060002c00ull,
++    0x0000000060002c03ull, 0x0000000060002c27ull, 0x0000004000002500ull, 0x0000004000002503ull,
++    0x0000004000002527ull, 0x000000401a002500ull, 0x000000401a002524ull, 0x000000401a002548ull,
++    0x000000401a006524ull,
 diff --git a/ps2xRuntime/web/library_fetch_stream.js b/ps2xRuntime/web/library_fetch_stream.js
 new file mode 100644
 index 0000000..ab13bcc
@@ -2988,10 +3006,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..c9f0c5c
+index 0000000..8d8c4ed
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,1153 @@
+@@ -0,0 +1,1233 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -3037,8 +3055,11 @@ index 0000000..c9f0c5c
 +#include <map>
 +#include <atomic>
 +#include <cstdio>
++#include <cstdlib>
 +#include <cstring>
++#include <iterator>
 +#include <memory>
++#include <string>
 +#include <vector>
 +
 +extern "C" uint32 LWL_Proxy(uint32, uint32, CMIPS*);
@@ -3049,6 +3070,11 @@ index 0000000..c9f0c5c
 +extern "C" void SWR_Proxy(uint32, uint32, CMIPS*);
 +extern "C" void SDL_Proxy(uint32, uint64, CMIPS*);
 +extern "C" void SDR_Proxy(uint32, uint64, CMIPS*);
++
++EM_JS_DEPS(ps2xShaderList, "$stringToNewUTF8,$UTF8ToString");
++
++// The shader list kept by an earlier session ("hex,hex,..."), read from IndexedDB (GL thread)
++extern "C" EMSCRIPTEN_KEEPALIVE void ps2xPrecompileShaderList(char* list);
 +
 +namespace
 +{
@@ -3901,11 +3927,42 @@ index 0000000..c9f0c5c
 +			// Also where time goes on the GL thread (GPU-bound devices show it here)
 +			auto& gs = *h.gsWeb;
 +			std::printf("[webgs] %.1f game fps on screen (gl %.1f ms/frame, max %.0f ms, longest frame gap %.0f ms, fb copies %.0f/frame; "
-+			            "shaders %u in %.0f ms, read-backs %u in %.0f ms, texture uploads %u (%u unchanged, skipped), hd loaded %u)\n",
++			            "shaders %u in %.0f ms (%u precompiled), read-backs %u in %.0f ms, texture uploads %u (%u unchanged, skipped), hd loaded %u)\n",
 +			            h.frames * 1000.0 / (time - h.statsStart), h.rafs ? h.glMs / h.rafs : 0.0, h.glMaxMs, h.rafMaxMs,
-+			            h.frames ? static_cast<double>(gs.m_dstCopies) / h.frames : 0.0, gs.m_shaderCompiles, gs.m_shaderCompileMs,
++			            h.frames ? static_cast<double>(gs.m_dstCopies) / h.frames : 0.0, gs.m_shaderCompiles, gs.m_shaderCompileMs, gs.m_shadersPrecompiled,
 +			            gs.m_framebufferWriteBacks, gs.m_writeBackMs, gs.m_textureUploads,
 +			            gs.m_textureUploadsSkipped, gs.m_hdTexturesLoaded - h.hdLoadedBefore);
++			if(auto added = gs.TakeNewShaderCaps(); !added.empty())
++			{
++				// Remembered for the next session (precompiled then)
++				std::string list;
++				for(uint64_t caps : added)
++				{
++					char hex[20];
++					std::snprintf(hex, sizeof(hex), "%s%016llx", list.empty() ? "" : ",", static_cast<unsigned long long>(caps));
++					list += hex;
++				}
++				EM_ASM({
++					const added = UTF8ToString($0).split(',');
++					try
++					{
++						const open = indexedDB.open('ps2x', 1);
++						open.onupgradeneeded = () => open.result.createObjectStore('kv');
++						open.onsuccess = () => {
++							const store = open.result.transaction('kv', 'readwrite').objectStore('kv');
++							const get = store.get('shaders-v1');
++							get.onsuccess = () => {
++								const known = new Set((get.result || '').split(',').filter((c) => c.length == 16));
++								for(const c of added) known.add(c);
++								store.put([...known].slice(-1024).join(','), 'shaders-v1');
++							};
++						};
++					}
++					catch(e)
++					{
++					}
++				}, list.c_str());
++			}
 +			gs.m_slowestBatchMs = 0.0;
 +			for(double& slowest : gs.m_slowestMs)
 +				slowest = 0.0;
@@ -4071,6 +4128,34 @@ index 0000000..c9f0c5c
 +			h->gsWeb->EnableHdTextures("data/hd");
 +		h->gsWeb->SetHalfRateImage(g_halfRate);
 +		h->gsWeb->SetFsr(g_fsr);
++		{
++			// Shaders built ahead of time: the game's known variants, then the ones this browser
++			// met in earlier sessions (IndexedDB). With KHR_parallel_shader_compile the driver
++			// builds them in the background; without it, one per frame.
++			const bool parallel = EM_ASM_INT({ return GLctx.getExtension('KHR_parallel_shader_compile') ? 1 : 0; }) != 0;
++			h->gsWeb->SetParallelShaderCompile(parallel);
++			static const uint64_t knownShaders[] = {
++#include "known_shaders.inc"
++			    0};
++			h->gsWeb->PrecompileShaders(knownShaders, std::size(knownShaders) - 1);
++			std::printf("[webgs] %zu known shaders queued (parallel compile %s)\n", std::size(knownShaders) - 1, parallel ? "yes" : "no");
++			EM_ASM({
++				try
++				{
++					const open = indexedDB.open('ps2x', 1);
++					open.onupgradeneeded = () => open.result.createObjectStore('kv');
++					open.onsuccess = () => {
++						const get = open.result.transaction('kv').objectStore('kv').get('shaders-v1');
++						get.onsuccess = () => {
++							if(get.result) _ps2xPrecompileShaderList(stringToNewUTF8(get.result));
++						};
++					};
++				}
++				catch(e)
++				{
++				}
++			});
++		}
 +		std::printf("[webgs] picture at %d fps\n", g_halfRate ? 30 : 60);
 +
 +		ring->consumerAlive = 1;
@@ -4144,6 +4229,19 @@ index 0000000..c9f0c5c
 +{
 +	emscripten_async_run_in_main_runtime_thread(EM_FUNC_SIG_VI, &StartOnMainThread, header);
 +	return true;
++}
++
++extern "C" EMSCRIPTEN_KEEPALIVE void ps2xPrecompileShaderList(char* list)
++{
++	std::vector<uint64_t> caps;
++	for(char* item = std::strtok(list, ","); item; item = std::strtok(nullptr, ","))
++		caps.push_back(std::strtoull(item, nullptr, 16));
++	std::free(list);
++	if(g_host && !caps.empty())
++	{
++		g_host->gsWeb->PrecompileShaders(caps.data(), caps.size());
++		std::printf("[webgs] %zu shaders from earlier sessions queued\n", caps.size());
++	}
 +}
 diff --git a/ps2xRuntime/web/raylib_headless.cpp b/ps2xRuntime/web/raylib_headless.cpp
 new file mode 100644

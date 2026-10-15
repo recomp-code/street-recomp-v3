@@ -97,7 +97,14 @@ nbastreet-v3-recomp/tools/web/serve.sh      # después abre http://localhost:808
   se leen y escriben como valores de 64 bits en vez de vectores de 128, las llamadas entre funciones
   del juego toman un camino corto y el enlace final va totalmente optimizado (`-O3`). En un partido,
   en un Mac con chip M, el hilo del juego pasó de ~48% a ~31% de ocupación y el de la VU1 de ~62% a
-  ~52%, que es lo que permite a los teléfonos más lentos ir al día.
+  ~52%, que es lo que permite a los teléfonos más lentos ir al día. Cuando el juego cambia los
+  microprogramas de la unidad vectorial (varias veces por cuadro) se reutilizan sus bloques ya
+  compilados en vez de analizarlos otra vez.
+- **Sin tirones por shaders:** todas las variantes de shaders gráficos que usa el juego se compilan
+  durante las pantallas de carga, en segundo plano donde el navegador lo permite
+  (`KHR_parallel_shader_compile`), en vez de a mitad de un cuadro (eso tardaba hasta ~1 s en algunos
+  teléfonos). Las variantes que aparecen en un dispositivo se recuerdan (IndexedDB) y se compilan por
+  adelantado en la siguiente visita.
 - **Gráficos nítidos:**
   - resolución interna de 1x a 4x;
   - **AMD FidelityFX Super Resolution 1** (FSR 1: escalado EASU que sigue los bordes + nitidez RCAS)

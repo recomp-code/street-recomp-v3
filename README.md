@@ -96,7 +96,12 @@ nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in
   written as plain 64-bit values instead of 128-bit vectors, guest function calls take a short path,
   and the final link is fully optimized (`-O3`). In a match on an M-series Mac the game thread went
   from ~48% to ~31% busy and the VU1 worker from ~62% to ~52%, which is what lets slower phones
-  keep up.
+  keep up. When the game swaps vector-unit microprograms (several times a frame) their compiled
+  blocks are reused instead of being analyzed again.
+- **No shader stutter:** every graphics shader variant the game uses is built during the loading
+  screens, in the background where the browser allows it (`KHR_parallel_shader_compile`), instead
+  of in the middle of a frame (that took up to ~1 s on some phones). Variants met on a device are
+  remembered (IndexedDB) and built ahead of time on the next visit.
 - **Sharp graphics:**
   - internal resolution 1x to 4x;
   - **AMD FidelityFX Super Resolution 1** (FSR 1: EASU edge-adaptive upscaling + RCAS sharpening)

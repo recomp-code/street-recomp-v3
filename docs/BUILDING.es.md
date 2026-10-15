@@ -173,7 +173,9 @@ nativo están dentro de `__EMSCRIPTEN__`.
   - `play_gs_host.cpp`: hilo GL, hilo de la VU1, ajustes, caché de estado de WebGL;
   - `library_fetch_stream.js`: streaming del disco por HTTP Range, lectura anticipada, Cache Storage,
     plazos y reintentos, sin caché HTTP;
-  - `site/index.html`: pantalla de inicio, AudioWorklet, mandos, diagnóstico.
+  - `site/index.html`: pantalla de inicio, AudioWorklet, mandos, diagnóstico;
+  - `known_shaders.inc`: las variantes de shaders del juego (`SHADERCAPS` de Play!), compiladas al
+    arrancar junto con las que el navegador recuerda en IndexedDB.
 - IOP / SPU2: interpolación gaussiana, barridos de volumen, AutoDMA a ritmo, limitador de salida.
 - Planificador del EE: espera dormida con el tiempo avanzando en pasos de 1 ms, rebase del vblank
   tras atascos.
@@ -192,6 +194,12 @@ nativo están dentro de `__EMSCRIPTEN__`.
   `HashTextureLevel` de PCSX2.
 - FSR 1 (`GSH_OpenGL_Fsr.cpp`): port a GLSL ES 3.0 de EASU + RCAS de AMD (MIT). Se aplica en
   `FlipImpl` solo cuando la ventana es más grande que la imagen mostrada.
+- Shaders compilados por adelantado: `PrecompileShaders` / `PumpShaderPrecompile` lanzan la
+  compilación y el enlace sin esperar su estado; `FinishShader` asigna los uniforms cuando el
+  programa ya está listo (`KHR_parallel_shader_compile`), o en el momento si un dibujo lo necesita.
+- Microprogramas de la VU (`ee/VuExecutor.cpp`): las particiones se recuerdan por (contenido de la
+  micromemoria, inicio del bloque), así que al volver a cargar un microprograma se reutilizan sus
+  bloques.
 
 **Los otros parches de Play!**
 - `play-codegen.patch`: el backend JIT de WebAssembly pone los registros en locales de wasm (VU1
@@ -219,8 +227,10 @@ enviarlos.
 
 **Medir:**
 - `?debug` muestra estadísticas del render.
-- Cada 5 s el registro imprime una línea `[webgs]`: fps, tiempo de GL, subidas de texturas, texturas
-  HD cargadas.
+- Cada 5 s el registro imprime una línea `[webgs]`: fps, tiempo de GL, shaders compilados al momento
+  / por adelantado, subidas de texturas, texturas HD cargadas.
+- Las líneas `[gsh] new shader <caps>` indican variantes que faltan en `known_shaders.inc`; añádelas
+  ahí.
 - Las DevTools de Chrome pueden perfilar cada hilo por separado: el del juego, el de la VU1 y el de GL.
 - Referencia, un partido en un Mac con chip M: hilo del juego ~31%, hilo de la VU1 ~52%, hilo de GL
   ~35% ocupados.

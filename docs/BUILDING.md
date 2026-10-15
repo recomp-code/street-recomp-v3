@@ -179,7 +179,9 @@ their own patches, and the few runtime changes shared with native code are behin
   - `play_gs_host.cpp`: GL thread, VU1 worker, settings, WebGL state cache;
   - `library_fetch_stream.js`: disc streaming over HTTP Range, read-ahead, Cache Storage, timeouts
     and retries, no HTTP cache;
-  - `site/index.html`: start screen, AudioWorklet, gamepads, diagnostics.
+  - `site/index.html`: start screen, AudioWorklet, gamepads, diagnostics;
+  - `known_shaders.inc`: the game's shader variants (Play!'s `SHADERCAPS`), built at start-up
+    together with the ones the browser remembers in IndexedDB.
 - IOP / SPU2: Gaussian interpolation, volume sweeps, paced AutoDMA, output limiter.
 - EE scheduler: idle-loop sleep with time flowing in 1 ms steps, vblank rebase after stalls.
 - DEV9 sockets over a WebSocket (online).
@@ -196,6 +198,11 @@ their own patches, and the few runtime changes shared with native code are behin
   (`<hash>-r<w>x<h>-…`), hashed like PCSX2's `HashTextureLevel` unswizzled path.
 - FSR 1 (`GSH_OpenGL_Fsr.cpp`): a GLSL ES 3.0 port of AMD's EASU + RCAS (MIT). It runs in `FlipImpl`
   only when the window is larger than the displayed image.
+- Shaders built ahead of time: `PrecompileShaders` / `PumpShaderPrecompile` start the compile and
+  link without waiting for their status; `FinishShader` binds uniforms once a program is built
+  (`KHR_parallel_shader_compile`), or right away when a draw needs it.
+- VU microprograms (`ee/VuExecutor.cpp`): partitions are remembered per (micro memory contents,
+  block start), so swapping microprograms back in reuses their blocks.
 
 **The other Play! patches**
 - `play-codegen.patch`: the WebAssembly JIT backend maps registers to wasm locals (VU1 ~20% faster).
@@ -221,7 +228,9 @@ Check that they apply on clean checkouts of the pinned commits (`git apply --che
 
 **Measuring:**
 - `?debug` shows renderer statistics.
-- Every 5 s the log prints a `[webgs]` line: fps, GL time, texture uploads, HD textures loaded.
+- Every 5 s the log prints a `[webgs]` line: fps, GL time, shaders compiled on demand / ahead of time,
+  texture uploads, HD textures loaded.
+- `[gsh] new shader <caps>` lines name variants missing from `known_shaders.inc`; add them there.
 - Chrome DevTools can profile each worker separately: the game thread, the VU1 worker, the GL thread.
 - Reference, a match on an M-series Mac: game thread ~31%, VU1 worker ~52%, GL thread ~35% busy.
 
