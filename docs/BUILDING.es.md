@@ -205,7 +205,10 @@ nativo están dentro de `__EMSCRIPTEN__`.
   bloques completos se juntan en el hilo que alimenta al GS (VIF1/VU1), se reordenan ahí en bloques GS
   de 256 bytes, y el hilo del GS solo compara y copia bloques, en el mismo orden que antes (cualquier
   otra orden que llegue a mitad de una transferencia recibe antes los datos recibidos, como antes).
-  El hilo de GL pasó de ~40% a ~29% en un partido. Las líneas `[webgs] image transfers` cuentan ambos caminos.
+  El reordenamiento corre en un hilo auxiliar (`SwizzleThreadProc`); el hilo del GS espera los bloques de
+  una transferencia al llegar a ella, así que el hilo VIF1/VU1 (el más cargado en teléfonos) solo junta datos.
+  El hilo de GL pasó de ~40% a ~29% en un partido. Las líneas `[webgs] image transfers` cuentan ambos
+  caminos; `[webgs] VU1 worker N% busy` y `[sched] ... game thread N% busy` muestran la carga de cada hilo.
 - Microprogramas de la VU (`ee/VuExecutor.cpp`): las particiones se recuerdan por (contenido de la
   micromemoria, inicio del bloque), así que al volver a cargar un microprograma se reutilizan sus
   bloques.

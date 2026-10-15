@@ -1756,7 +1756,7 @@ index 31a296b..f3532df 100644
      std::vector<ScheduledEvent> m_deadlines;
      std::deque<GuestInvocation> m_pendingInvocations;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index f09ec48..b868392 100644
+index f09ec48..3f282c3 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -10,6 +10,7 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
@@ -1824,7 +1824,7 @@ index f09ec48..b868392 100644
  bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
  {
      accountCycles(cycles);
-@@ -541,6 +585,71 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -541,6 +585,77 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return true;
      }
  
@@ -1839,7 +1839,7 @@ index f09ec48..b868392 100644
 +    // bursts (choppy sound, uneven frames). Sleeping is dropped for good if wake-ups are late.
 +    static bool s_sleepUnreliable = false;
 +    static uint32_t s_sleeps = 0u, s_lateSleeps = 0u;
-+    static double s_maxLateMs = 0.0;
++    static double s_maxLateMs = 0.0, s_sleptMs = 0.0;
 +    static auto s_sleepReport = std::chrono::steady_clock::now();
 +    if (running != nullptr && hostDeadline != INT64_MAX && !s_sleepUnreliable && eeIdleLoopAt(running->activeContext().pc))
 +    {
@@ -1864,7 +1864,12 @@ index f09ec48..b868392 100644
 +            s_maxLateMs = std::max(s_maxLateMs, lateMs);
 +            if (now - s_sleepReport >= std::chrono::seconds(5))
 +            {
-+                std::printf("[sched] idle sleeps %u, %u woke >4 ms late (max %.0f ms)\n", s_sleeps, s_lateSleeps, s_maxLateMs);
++                // Time asleep in the game's frame waits: the rest is the game thread's load (game
++                // code, IOP, sound); near 100% it can't keep up with the frame rate
++                const double windowMs = std::chrono::duration<double, std::milli>(now - s_sleepReport).count();
++                std::printf("[sched] idle sleeps %u, %u woke >4 ms late (max %.0f ms); game thread %.0f%% busy\n", s_sleeps, s_lateSleeps,
++                            s_maxLateMs, windowMs > 0.0 ? 100.0 * (1.0 - s_sleptMs / windowMs) : 0.0);
++                s_sleptMs = 0.0;
 +                if (s_sleeps >= 200u && s_lateSleeps * 20u > s_sleeps)
 +                {
 +                    s_sleepUnreliable = true;
@@ -1875,6 +1880,7 @@ index f09ec48..b868392 100644
 +                s_sleepReport = now;
 +            }
 +            const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count());
++            s_sleptMs += static_cast<double>(ns) / 1e6;
 +            last = now;
 +            // Up to (not past) the deadline's cycle: reaching it stays with the logic above
 +            const uint64_t limit = m_nextHostDeadlineCycle.load(std::memory_order_acquire);
@@ -1896,7 +1902,7 @@ index f09ec48..b868392 100644
      renewTimeSlice();
      return false;
  }
-@@ -1946,9 +2055,9 @@ void EeScheduler::makeRunning(GuestThread &item)
+@@ -1946,9 +2061,9 @@ void EeScheduler::makeRunning(GuestThread &item)
          struct Slot { uint64_t ticks = 0; uint32_t entry = 0; int priority = 0; uint32_t switches = 0; };
          static Slot s_slots[256];
          static int s_lastId = -1;
@@ -1908,7 +1914,7 @@ index f09ec48..b868392 100644
          if (s_lastId >= 0)
              s_slots[s_lastId & 255].ticks += tsc - s_lastTsc;
          s_lastTsc = tsc;
-@@ -2206,11 +2315,17 @@ void EeScheduler::processDueDeadlines()
+@@ -2206,11 +2321,17 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -1928,7 +1934,7 @@ index f09ec48..b868392 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -2293,6 +2408,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -2293,6 +2414,22 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }
@@ -3006,10 +3012,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..0bcba7d
+index 0000000..4b8187a
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,1246 @@
+@@ -0,0 +1,1255 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -3962,6 +3968,15 @@ index 0000000..0bcba7d
 +					{
 +					}
 +				}, list.c_str());
++			}
++			// VIF1/VU1 worker load: what it didn't spend waiting for the game's data or for the GL
++			// thread (two frames queued); near 100% it holds the picture (and the game) back
++			{
++				const double windowMs = time - h.statsStart;
++				std::printf("[webgs] VU1 worker %.0f%% busy (waited %.0f ms for data, %.0f ms for the GL thread)\n",
++				            windowMs > 0.0 ? 100.0 * (1.0 - (h.idleMs + h.vblankWaitMs) / windowMs) : 0.0, h.idleMs, h.vblankWaitMs);
++				if(!g_debug)
++					h.idleMs = h.vblankWaitMs = 0.0;
 +			}
 +			std::printf("[webgs] image transfers: %u swizzled in the VU1 worker; on the GL thread: %u format, %u alignment, %u range, %u interrupted\n",
 +			            gs.m_producerSwizzled, gs.m_producerDirect[0], gs.m_producerDirect[1], gs.m_producerDirect[2], gs.m_producerDirect[3]);
