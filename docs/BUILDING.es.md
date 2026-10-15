@@ -153,6 +153,101 @@ Los bugs del recompilador encontrados (y corregidos en `patches/ps2recomp.patch`
 `docs/PORTING_NOTES.md`; varios afectan a cualquier juego de PS2 portado con PS2Recomp
 (SQRT.S, saltos BLTZ/BGEZ de 64 bits, MMI, VU0...).
 
+## Versión de navegador (WebAssembly)
+
+`tools/web/build.sh` (Mac, después de `tools/macos/install.sh`) compila la versión de navegador con
+fuentes en versiones fijas más los parches de `patches/`. No toca las compilaciones nativas: los
+cambios web van en sus propios parches, y los pocos cambios del runtime compartidos con el código
+nativo están dentro de `__EMSCRIPTEN__`.
+
+| Pieza | Versión | Parche |
+| --- | --- | --- |
+| Emscripten | 6.0.12 | |
+| FFmpeg (videos MPEG-2) | 7.1.2 | |
+| PS2Recomp | 2c5fbb9 | `ps2recomp.patch` (compartido con nativo) + `ps2recomp-web.patch` |
+| Play! (render del GS, JIT de VU1) | 83700b2c | `play.patch`, `play-codegen.patch`, `play-dependencies.patch` |
+
+**`ps2recomp-web.patch`**
+- `ps2xRuntime/web/`:
+  - `web_platform.cpp`: arranque, memory card, anillo de sonido;
+  - `play_gs_host.cpp`: hilo GL, hilo de la VU1, ajustes, caché de estado de WebGL;
+  - `library_fetch_stream.js`: streaming del disco por HTTP Range, lectura anticipada, Cache Storage,
+    plazos y reintentos, sin caché HTTP;
+  - `site/index.html`: pantalla de inicio, AudioWorklet, mandos, diagnóstico;
+  - `known_shaders.inc`: las variantes de shaders del juego (`SHADERCAPS` de Play!), compiladas al
+    arrancar junto con las que el navegador recuerda en IndexedDB.
+- IOP / SPU2: interpolación gaussiana, barridos de volumen, AutoDMA a ritmo, limitador de salida.
+- Planificador del EE: espera dormida con el tiempo avanzando en pasos de 1 ms, rebase del vblank
+  tras atascos.
+- Sockets del DEV9 por un WebSocket (online).
+- Caminos rápidos solo para WebAssembly en el runtime del código recompilado:
+  - macros de registros de 64 bits escalares (`ps2_runtime_macros.h`);
+  - camino corto para las llamadas del juego (`dispatchGuestBranch`);
+  - atómicos acquire/release en los índices del anillo del GS.
+
+**`play.patch`** (el GS OpenGL de Play! sobre WebGL2)
+- Arreglos de precisión para efectos que WebGL no tiene.
+- Caché de texturas con hash de contenido y un pool de texturas.
+- Imagen a media tasa (`?fps=30`).
+- Packs de texturas HD en formato PCSX2 (`GSH_OpenGL_HdTextures.cpp`), incluidas las texturas con
+  región de clamp (`<hash>-r<an>x<al>-…`), con el mismo hash que la ruta sin swizzle de
+  `HashTextureLevel` de PCSX2.
+- FSR 1 (`GSH_OpenGL_Fsr.cpp`): port a GLSL ES 3.0 de EASU + RCAS de AMD (MIT). Se aplica en
+  `FlipImpl` solo cuando la ventana es más grande que la imagen mostrada. Cálculo de color en mediump
+  (FP16 en GPUs de teléfono, como la ruta de media precisión de AMD); las zonas planas de 2x2 toman un
+  atajo bilineal (EASU limita a ese rango de todos modos), sin 8 de las 12 lecturas ni el análisis de
+  bordes.
+- Shaders compilados por adelantado: `PrecompileShaders` / `PumpShaderPrecompile` lanzan la
+  compilación y el enlace sin esperar su estado (las imágenes HD también se suben de dos en dos por
+  cuadro, no todas a la vez); `FinishShader` asigna los uniforms cuando el
+  programa ya está listo (`KHR_parallel_shader_compile`), o en el momento si un dibujo lo necesita.
+- Subidas de texturas (`GSHandler.cpp`, `SetProducerSwizzle`): las transferencias de PSMCT32/PSMT8/PSMT4 en
+  bloques completos se juntan en el hilo que alimenta al GS (VIF1/VU1), se reordenan ahí en bloques GS
+  de 256 bytes, y el hilo del GS solo compara y copia bloques, en el mismo orden que antes (cualquier
+  otra orden que llegue a mitad de una transferencia recibe antes los datos recibidos, como antes).
+  El hilo de GL pasó de ~40% a ~29% en un partido. Las líneas `[webgs] image transfers` cuentan ambos caminos.
+- Microprogramas de la VU (`ee/VuExecutor.cpp`): las particiones se recuerdan por (contenido de la
+  micromemoria, inicio del bloque), así que al volver a cargar un microprograma se reutilizan sus
+  bloques.
+
+**Los otros parches de Play!**
+- `play-codegen.patch`: el backend JIT de WebAssembly pone los registros en locales de wasm (VU1
+  ~20% más rápida).
+- `play-dependencies.patch`: opciones de compilación para excepciones nativas de wasm + SIMD.
+
+**Actualizar:** `git pull` y luego `tools/web/build.sh`. Los parches cambiados se vuelven a aplicar
+solos (antes se restauran los archivos de Play! que toca el parche; las carpetas de compilación se
+conservan). Si cambia `ps2recomp-web.patch`, se recompila el juego entero (1-3 horas);
+`tools/web/build.sh game` recompila solo el juego y actualiza `web-site`.
+
+**Regenerar los parches** (colaboradores), desde los árboles de compilación:
+
+```sh
+# REPO = tu copia de nbastreet-v3-recomp
+cd ~/NBAStreetRecomp/PS2Recomp-web && git diff <commit con ps2recomp.patch aplicado> HEAD -- . \
+    ':!ps2xRuntime/src/runner/register_functions.cpp' > "$REPO"/patches/ps2recomp-web.patch
+cd ~/NBAStreetRecomp/play && git add -N <archivos nuevos> && git diff -- . ':!deps' > "$REPO"/patches/play.patch
+git -C deps/CodeGen diff > "$REPO"/patches/play-codegen.patch
+git -C deps/Dependencies diff > "$REPO"/patches/play-dependencies.patch
+```
+
+Comprueba que se aplican sobre copias limpias de los commits fijados (`git apply --check`) antes de
+enviarlos.
+
+**Medir:**
+- `?debug` muestra estadísticas del render.
+- Cada 5 s el registro imprime una línea `[webgs]`: fps, tiempo de GL, shaders compilados al momento
+  / por adelantado, subidas de texturas, texturas HD cargadas.
+- Las líneas `[gsh] new shader <caps>` indican variantes que faltan en `known_shaders.inc`; añádelas
+  ahí.
+- Las DevTools de Chrome pueden perfilar cada hilo por separado: el del juego, el de la VU1 y el de GL.
+- Referencia, un partido en un Mac con chip M: hilo del juego ~31%, hilo de la VU1 ~52%, hilo de GL
+  ~35% ocupados.
+
+**Servidor:** HTTPS + COOP/COEP, Brotli precomprimido y `Cache-Control: private, no-cache`
+(`tools/web/Caddyfile.server`); `/net` → `tools/web/net_relay.py` (online), `/diag` →
+`tools/web/diag_server.py` (diagnóstico opcional). El sitio sirve tu imagen del disco: mantenlo privado.
+
 ## Contribuir
 
 Issues y pull requests bienvenidos. Antes de nada lee `docs/PORTING_NOTES.md`: explica la

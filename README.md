@@ -77,21 +77,43 @@ nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in
 
 - **Fast streaming, no install:** the 4.7 GB disc is never downloaded. It is read in 1 MB HTTP Range
   pieces as the game asks for them. Read-ahead follows each stream (videos, music) and only grows
-  once a reader really moves through the disc. A cold start downloads about 64 MB in its first 30 s,
-  27 MB of which is the game code (Brotli, 380 MB uncompressed).
+  once a reader really moves through the disc. A cold start downloads about 60 MB in its first 30 s,
+  23.5 MB of which is the game code (Brotli, 280 MB uncompressed).
+- **Reliable start:** every disc read has a deadline and is retried (a dead connection after a
+  network change no longer leaves the game at "Arrancando el juego…"), and disc reads bypass the
+  browser's HTTP cache, which made requests for the one disc file wait behind each other.
 - **Instant second visit:** the browser keeps the game code, and the disc pieces already read go into
   its Cache Storage, kept across visits. Disc reads run in the background, so the game never freezes
   waiting for the network.
 - **60 fps, multi-threaded:**
   - WebGL2 runs in its own thread (OffscreenCanvas);
   - a worker thread runs the PS2 vector unit (VU1, through a JIT to WebAssembly) and the GIF;
-  - the game thread sleeps in the game's own frame-wait loops instead of spinning, which saves battery.
+  - the game thread sleeps in the game's own frame-wait loops instead of spinning, which saves battery;
+  - the graphics stream between the game thread and the VU1 worker is a lock-free ring with proper
+    acquire/release ordering (on ARM phones and Apple silicon a weaker version could show a stale
+    packet and freeze the picture).
+- **Faster game code:** the recompiled game is tuned for WebAssembly: registers are read and
+  written as plain 64-bit values instead of 128-bit vectors, guest function calls take a short path,
+  and the final link is fully optimized (`-O3`). In a match on an M-series Mac the game thread went
+  from ~48% to ~31% busy and the VU1 worker from ~62% to ~52%, which is what lets slower phones
+  keep up. When the game swaps vector-unit microprograms (several times a frame) their compiled
+  blocks are reused instead of being analyzed again.
+- **No shader stutter:** every graphics shader variant the game uses is built during the loading
+  screens, in the background where the browser allows it (`KHR_parallel_shader_compile`), instead
+  of in the middle of a frame (that took up to ~1 s on some phones). Variants met on a device are
+  remembered (IndexedDB) and built ahead of time on the next visit.
 - **Sharp graphics:**
   - internal resolution 1x to 4x;
+  - **AMD FidelityFX Super Resolution 1** (FSR 1: EASU edge-adaptive upscaling + RCAS sharpening)
+    when the window is larger than the rendered image, e.g. phones at 1x: sharper than plain
+    scaling at no measurable cost (on by default, "Escalado" setting);
   - accurate blending, framebuffer effects and palettes ported to WebGL2;
   - fullscreen.
 - **HD textures:** the fan pack in PCSX2 format, recognized with PCSX2's own texture hash and loaded
-  image by image while the game shows it (decoded off-thread by the browser).
+  image by image while the game shows it (decoded off-thread by the browser). Textures drawn through
+  a clamp region (menu and HUD text, `<hash>-r<w>x<h>-…` names) are matched too, with PCSX2's region
+  hash. The pack covers ~240 distinct textures (jerseys, court props, some menu text), so most of
+  the picture stays at the game's own detail.
 - **Clean sound:**
   - SPU2 with the hardware's Gaussian interpolation, volume sweeps and soft peak limiting;
   - played through an AudioWorklet with adaptive buffering;
@@ -100,18 +122,22 @@ nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in
   WebSocket to a small relay (`tools/web/net_relay.py`) that can only reach the game server.
 - **Controllers and keyboard:** any browser gamepad (standard or not) and keyboard.
 - **Saves:** kept in the browser (OPFS) across visits.
-- **Settings on the start screen:** resolution, HD textures, sound buffer, online.
+- **Settings on the start screen:** resolution, FSR upscaling, 60/30 fps picture, HD textures,
+  sound buffer, online.
+- **Diagnostics:** an "Enviar diagnóstico" button sends the browser, GPU, sound figures and the last
+  log lines to the server (`tools/web/diag_server.py`, optional), to look into slow devices.
 - **Works on** desktop Chrome and Firefox and on Android Chrome. Phones start at 1x resolution and get
   a larger sound buffer.
 
 - Click **Jugar** (browsers only allow sound after a click). The first load downloads the game code
-  (~27 MB compressed), then the browser keeps it; the disc streams in 1 MB pieces as needed.
+  (~24 MB compressed), then the browser keeps it; the disc streams in 1 MB pieces as needed.
 - Keys as in the table below (START = Enter, SELECT = Backspace); controllers work too.
   `?scale=1..4` sets the internal resolution (default 2, 1 on phones), `?debug` shows renderer
   statistics.
-- **Settings on the start screen** (kept in the browser): internal resolution, HD textures (the fan
-  pack, read image by image as the game shows them; on by default), sound buffer and online.
-  The same as page parameters: `?scale=1..4`, `?hd=0/1`, `?audio=stable|normal|low`, `?online=0/1`.
+- **Settings on the start screen** (kept in the browser): internal resolution, upscaling (FSR 1 or
+  bilinear), picture rate, HD textures (the fan pack, read image by image as the game shows them; on
+  by default), sound buffer and online. The same as page parameters: `?scale=1..4`, `?fsr=0/1`,
+  `?fps=30`, `?hd=0/1`, `?audio=stable|normal|low`, `?online=0/1`.
 - **Online works:** the game's network goes over a WebSocket (`/net`) to `tools/web/net_relay.py`
   on the server, which only reaches the game server. The network configuration is put on the
   browser's memory card the first time.
@@ -120,8 +146,11 @@ nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in
 
 How it works: the runtime and the game run in WebAssembly threads; the PS2 graphics (GS, VIF1,
 VU1) are drawn with the renderer of the [Play!](https://github.com/jpd002/Play-) emulator on WebGL2,
-with fixes for effects WebGL lacks (`patches/play.patch`) and a faster VU1 JIT (registers in wasm
-locals, `patches/play-codegen.patch`); the SPU2 sound goes to an AudioWorklet.
+with fixes for effects WebGL lacks, HD textures and FSR 1 (`patches/play.patch`) and a faster VU1 JIT
+(registers in wasm locals, `patches/play-codegen.patch`); the SPU2 sound goes to an AudioWorklet.
+Technical details (patches, updating, measuring): [docs/BUILDING.md](docs/BUILDING.md#browser-build-webassembly).
+Server pieces: online needs `tools/web/net_relay.py`, the diagnostics button `tools/web/diag_server.py`
+(both set up as shown in `tools/web/Caddyfile.server`).
 
 ## Controls
 
