@@ -2,6 +2,9 @@
 # Behind Cloudflare (orange cloud) use SSL mode "Full": Caddy makes its own certificate here.
 # Online: run tools/web/net_relay.py on 127.0.0.1:8765 (see nbarecomp-net.service below); /net
 # carries the game's network traffic to it over a WebSocket.
+# Diagnostics (optional): the page's "Enviar diagnóstico" button POSTs the browser, GPU, sound
+# figures and the last log lines to /diag; tools/web/diag_server.py on 127.0.0.1:8766 keeps the
+# last 50 reports (see nbarecomp-diag.service below). Without it the button just reports an error.
 # Optional password: add inside the site block
 #	basic_auth {
 #		player <hash from: caddy hash-password --plaintext 'your-password'>
@@ -21,6 +24,9 @@ play.example.com:443 {
 	handle /net {
 		reverse_proxy 127.0.0.1:8765
 	}
+	handle /diag {
+		reverse_proxy 127.0.0.1:8766
+	}
 	handle {
 		root * /opt/nbarecomp/site
 		file_server {
@@ -36,6 +42,18 @@ play.example.com:443 {
 #   [Service]
 #   ExecStart=/usr/bin/python3 /opt/nbarecomp/net_relay.py --server your-game-server.example.com --listen 127.0.0.1:8765
 #   DynamicUser=yes
+#   Restart=always
+#   [Install]
+#   WantedBy=multi-user.target
+
+# /etc/systemd/system/nbarecomp-diag.service (reports in /var/lib/nbarecomp-diag):
+#   [Unit]
+#   Description=NBA Street V3 web: diagnostic reports from the page
+#   After=network-online.target
+#   [Service]
+#   ExecStart=/usr/bin/python3 /opt/nbarecomp/diag_server.py
+#   DynamicUser=yes
+#   StateDirectory=nbarecomp-diag
 #   Restart=always
 #   [Install]
 #   WantedBy=multi-user.target

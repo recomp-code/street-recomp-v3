@@ -65,11 +65,17 @@ play() {
     git submodule update --init --recursive --quiet
     for p in "play.patch:." "play-dependencies.patch:deps/Dependencies" "play-codegen.patch:deps/CodeGen"; do
         patch="${p%%:*}"; dir="${p#*:}"
-        if git -C "$dir" apply --check "$REPO/patches/$patch" 2> /dev/null; then
-            git -C "$dir" apply "$REPO/patches/$patch"
-        elif ! git -C "$dir" apply --check --reverse "$REPO/patches/$patch" 2> /dev/null; then
-            echo "  $patch does not apply: reset $ROOT/play/$dir (git checkout -- .) and run again"; exit 1
+        git -C "$dir" apply --check --reverse "$REPO/patches/$patch" 2> /dev/null && continue # already applied
+        if ! git -C "$dir" apply --check "$REPO/patches/$patch" 2> /dev/null; then
+            # An older version of the patch (after a git pull): back to the original files first.
+            # Only the files the patch touches; the build folders stay.
+            echo "  $patch changed: updating $ROOT/play/$dir"
+            git -C "$dir" apply --numstat "$REPO/patches/$patch" | cut -f3 | while read -r f; do
+                if git -C "$dir" cat-file -e "HEAD:$f" 2> /dev/null; then git -C "$dir" checkout --quiet HEAD -- "$f"
+                else git -C "$dir" rm --quiet --cached --ignore-unmatch -- "$f"; rm -f "$dir/$f"; fi
+            done
         fi
+        git -C "$dir" apply "$REPO/patches/$patch" || { echo "  $patch does not apply: reset $ROOT/play/$dir (git checkout -- .) and run again"; exit 1; }
     done
     emcmake cmake -S . -B build_wasm -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_PLAY=ON -DBUILD_TESTS=OFF \
         -DBUILD_LIBRETRO_CORE=OFF -DPLAY_WASM_EXCEPTIONS=ON > "$LOGS/web_play.log" 2>&1 || fail "$LOGS/web_play.log" "Play! configure"

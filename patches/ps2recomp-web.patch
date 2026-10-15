@@ -33,10 +33,10 @@ index a2d29cb..c36b1c7 100644
      set_source_files_properties(${PS2X_DEV9_SOURCES} src/emulator/core/iop_dev9.cpp
          PROPERTIES COMPILE_OPTIONS "/W0;/wd4996;/utf-8")
 diff --git a/ps2xIOP/include/ps2x/host_intrin.h b/ps2xIOP/include/ps2x/host_intrin.h
-index 43bc85f..f92bccb 100644
+index 43bc85f..ea93884 100644
 --- a/ps2xIOP/include/ps2x/host_intrin.h
 +++ b/ps2xIOP/include/ps2x/host_intrin.h
-@@ -9,6 +9,12 @@
+@@ -9,6 +9,21 @@
  // sse2neon spells the cycle counter _rdtsc (CNTVCT_EL0); callers use the MSVC/GCC name. The rate
  // differs from an x86 TSC, but every user either calibrates it or only compares ticks.
  static inline uint64_t __rdtsc() { return _rdtsc(); }
@@ -49,6 +49,15 @@ index 43bc85f..f92bccb 100644
  #else
  #include <x86intrin.h>
  #endif
++
++// Ticks for the frame-budget statistics only. Free where the CPU has a cycle counter; in the
++// browser every clock read is a call into JavaScript (thousands per frame on the game thread),
++// so the statistics stay at zero there.
++#if defined(__EMSCRIPTEN__)
++static inline uint64_t ps2xStatTicks() { return 0; }
++#else
++static inline uint64_t ps2xStatTicks() { return __rdtsc(); }
++#endif
 diff --git a/ps2xIOP/src/emulator/core/iop_dev9.cpp b/ps2xIOP/src/emulator/core/iop_dev9.cpp
 index e383599..6ed7fb0 100644
 --- a/ps2xIOP/src/emulator/core/iop_dev9.cpp
@@ -92,7 +101,7 @@ index c8b9ef1..18f08c7 100644
      }
  
 diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
-index 1bbdb22..297541b 100644
+index 1bbdb22..4dd9ebd 100644
 --- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
 +++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
 @@ -3,10 +3,12 @@
@@ -108,7 +117,7 @@ index 1bbdb22..297541b 100644
  
  namespace ps2x::iop
  {
-@@ -102,6 +104,108 @@ namespace ps2x::iop::detail
+@@ -102,6 +104,94 @@ namespace ps2x::iop::detail
          {
              return static_cast<int16_t>(std::clamp(value, -32768, 32767));
          }
@@ -193,20 +202,6 @@ index 1bbdb22..297541b 100644
 +            value = std::clamp(value + levelStep, low, high);
 +        }
 +
-+        // The final mix often goes past 16 bits in loud moments (the game's music stream is
-+        // already at full scale): round the peaks off above 3/4 of full scale instead of
-+        // cutting them flat, which sounds harsh.
-+        int16_t softLimit(int32_t value)
-+        {
-+            constexpr int32_t knee = 24576;
-+            constexpr double room = 32767.0 - knee;
-+            const int32_t magnitude = std::abs(value);
-+            if (magnitude <= knee)
-+                return static_cast<int16_t>(value);
-+            const double limited = knee + room * std::tanh((magnitude - knee) / room);
-+            return static_cast<int16_t>(value < 0 ? -limited : limited);
-+        }
-+
 +        void pushHistory(std::array<int16_t, 4> &history, int16_t sample)
 +        {
 +            history[0] = history[1];
@@ -217,7 +212,7 @@ index 1bbdb22..297541b 100644
      }
  
      Spu2::Spu2() : m_ram(kRamWords)
-@@ -116,6 +220,7 @@ namespace ps2x::iop::detail
+@@ -116,6 +206,7 @@ namespace ps2x::iop::detail
          for (Core &core : m_cores)
              core = Core{};
          m_irqInfo = 0u;
@@ -225,7 +220,7 @@ index 1bbdb22..297541b 100644
          m_irqPending = false;
          m_lastCycle = 0u;
          m_cycleInitialized = false;
-@@ -135,6 +240,45 @@ namespace ps2x::iop::detail
+@@ -135,6 +226,45 @@ namespace ps2x::iop::detail
          return m_cores[static_cast<size_t>(core) & 1u].admas != 0u;
      }
  
@@ -271,7 +266,7 @@ index 1bbdb22..297541b 100644
      void Spu2::checkIrq(uint32_t address)
      {
          address &= kRamMask;
-@@ -230,14 +374,24 @@ namespace ps2x::iop::detail
+@@ -230,14 +360,24 @@ namespace ps2x::iop::detail
          const int coreIndex = offset >= 0x400u ? 1 : 0;
          Core &core = m_cores[static_cast<size_t>(coreIndex)];
          const uint32_t reg = offset & 0x3FFu;
@@ -298,7 +293,7 @@ index 1bbdb22..297541b 100644
              case 0x4: voice.pitch = value; break;
              case 0x6: voice.adsr1 = value; break;
              case 0x8: voice.adsr2 = value; break;
-@@ -306,6 +460,7 @@ namespace ps2x::iop::detail
+@@ -306,6 +446,7 @@ namespace ps2x::iop::detail
              {
                  core.admaL.clear();
                  core.admaR.clear();
@@ -306,7 +301,7 @@ index 1bbdb22..297541b 100644
              }
              break;
          case kRegEndxLo: core.endx &= 0xFF0000u; break;
-@@ -322,24 +477,13 @@ namespace ps2x::iop::detail
+@@ -322,24 +463,13 @@ namespace ps2x::iop::detail
          m_statDmaBytes += bytes;
          if (core.admas != 0u)
          {
@@ -338,7 +333,7 @@ index 1bbdb22..297541b 100644
              // Bound the backlog (about a quarter second) so a stalled consumer cannot grow it.
              while (core.admaL.size() > 12000u)
                  core.admaL.pop_front();
-@@ -388,6 +532,7 @@ namespace ps2x::iop::detail
+@@ -388,6 +518,7 @@ namespace ps2x::iop::detail
          voice.lsaWritten = false;
          core.endx &= ~(1u << voiceIndex);
          decodeBlock(voice);
@@ -346,7 +341,7 @@ index 1bbdb22..297541b 100644
      }
  
      void Spu2::keyOff(Voice &voice)
-@@ -519,7 +664,9 @@ namespace ps2x::iop::detail
+@@ -519,7 +650,9 @@ namespace ps2x::iop::detail
          if (voice.phase == Phase::Off)
              return 0;
  
@@ -357,7 +352,7 @@ index 1bbdb22..297541b 100644
          tickEnvelope(voice);
          const int32_t out = (sample * voice.env) >> 15;
  
-@@ -528,7 +675,10 @@ namespace ps2x::iop::detail
+@@ -528,7 +661,10 @@ namespace ps2x::iop::detail
          {
              voice.counter -= 0x1000u;
              if (++voice.sampleIndex < 28)
@@ -368,7 +363,7 @@ index 1bbdb22..297541b 100644
              voice.sampleIndex = 0;
              const uint8_t flags = voice.blockFlags;
              if ((flags & 0x1u) != 0u)
-@@ -554,6 +704,7 @@ namespace ps2x::iop::detail
+@@ -554,6 +690,7 @@ namespace ps2x::iop::detail
              voice.nax = voice.blockAddr;
              if (voice.phase == Phase::Off)
                  break;
@@ -376,7 +371,7 @@ index 1bbdb22..297541b 100644
          }
          return out;
      }
-@@ -562,9 +713,14 @@ namespace ps2x::iop::detail
+@@ -562,9 +699,14 @@ namespace ps2x::iop::detail
      {
          int32_t coreOutL[2] = {0, 0};
          int32_t coreOutR[2] = {0, 0};
@@ -391,7 +386,7 @@ index 1bbdb22..297541b 100644
              int32_t dryL = 0;
              int32_t dryR = 0;
              for (int v = 0; v < 24; ++v)
-@@ -577,8 +733,10 @@ namespace ps2x::iop::detail
+@@ -577,8 +719,10 @@ namespace ps2x::iop::detail
                      continue;
                  }
                  const int32_t out = renderVoice(core, c, v);
@@ -404,7 +399,7 @@ index 1bbdb22..297541b 100644
                  voice.outVolL = static_cast<int16_t>(volL);
                  voice.outVolR = static_cast<int16_t>(volR);
                  if ((core.vmixl & (1u << v)) != 0u)
-@@ -586,9 +744,16 @@ namespace ps2x::iop::detail
+@@ -586,9 +730,16 @@ namespace ps2x::iop::detail
                  if ((core.vmixr & (1u << v)) != 0u)
                      dryR += (out * volR) >> 15;
              }
@@ -421,7 +416,7 @@ index 1bbdb22..297541b 100644
              if (!core.admaL.empty() || !core.admaR.empty())
              {
                  const int32_t inL = core.admaL.empty() ? 0 : core.admaL.front();
-@@ -598,22 +763,33 @@ namespace ps2x::iop::detail
+@@ -598,22 +749,51 @@ namespace ps2x::iop::detail
                  if (!core.admaR.empty())
                      core.admaR.pop_front();
                  // BVOL/AVOL are plain signed 16-bit volumes (no sweep mode).
@@ -458,12 +453,30 @@ index 1bbdb22..297541b 100644
  
 -        m_outBlock.push_back(static_cast<int16_t>(coreOutL[1]));
 -        m_outBlock.push_back(static_cast<int16_t>(coreOutR[1]));
-+        m_outBlock.push_back(softLimit(dryOutL));
-+        m_outBlock.push_back(softLimit(dryOutR));
++        // Output stage: the final mix often goes past 16 bits in loud moments (the game's music
++        // stream is already at full scale). A DC blocker (as PCSX2) keeps the headroom, then a
++        // limiter lowers the gain at once on a peak and brings it back over ~100 ms: no flat-topped
++        // or waveshaped samples, which sounded like a blown speaker.
++        float left = static_cast<float>(dryOutL);
++        float right = static_cast<float>(dryOutR);
++        const float dcLeft = left - m_dcInL + 0.9995f * m_dcOutL;
++        const float dcRight = right - m_dcInR + 0.9995f * m_dcOutR;
++        m_dcInL = left;
++        m_dcInR = right;
++        m_dcOutL = dcLeft;
++        m_dcOutR = dcRight;
++        const float peak = std::max(std::fabs(dcLeft), std::fabs(dcRight));
++        const float needed = peak > 31000.0f ? 31000.0f / peak : 1.0f;
++        if (needed < m_limiterGain)
++            m_limiterGain = needed;
++        else
++            m_limiterGain += (needed - m_limiterGain) * 0.0002f;
++        m_outBlock.push_back(clamp16(static_cast<int32_t>(std::lround(dcLeft * m_limiterGain))));
++        m_outBlock.push_back(clamp16(static_cast<int32_t>(std::lround(dcRight * m_limiterGain))));
      }
  
      void Spu2::advanceTo(uint64_t iopCycle)
-@@ -648,10 +824,10 @@ namespace ps2x::iop::detail
+@@ -648,10 +828,10 @@ namespace ps2x::iop::detail
              for (const Core &core : m_cores)
                  for (const Voice &voice : core.voices)
                      active += voice.phase != Phase::Off ? 1 : 0;
@@ -477,7 +490,7 @@ index 1bbdb22..297541b 100644
              m_statKeyOns = 0u;
              m_statDmaBytes = 0u;
 diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
-index be7a058..9c6c6f2 100644
+index be7a058..15cba82 100644
 --- a/ps2xIOP/src/emulator/core/iop_spu2.h
 +++ b/ps2xIOP/src/emulator/core/iop_spu2.h
 @@ -27,6 +27,7 @@ namespace ps2x::iop::detail
@@ -500,11 +513,13 @@ index be7a058..9c6c6f2 100644
              uint8_t blockFlags = 0;
              int sampleIndex = 0;
              uint32_t counter = 0;
-@@ -105,6 +111,14 @@ namespace ps2x::iop::detail
+@@ -105,6 +111,16 @@ namespace ps2x::iop::detail
          std::array<Core, 2> m_cores{};
          uint16_t m_irqInfo = 0;
          bool m_irqPending = false;
 +        bool m_mmixWritten[2] = {false, false};
++        float m_dcInL = 0, m_dcInR = 0, m_dcOutL = 0, m_dcOutR = 0; // output DC blocker
++        float m_limiterGain = 1.0f;                                 // output limiter
 +        // AutoDMA reads IOP memory as the sound plays, like the hardware's two-half input buffer:
 +        // one 1024-byte half (256 stereo samples) now, the next one 256 samples later.
 +        const uint8_t *m_admaPending[2] = {nullptr, nullptr};
@@ -1467,6 +1482,58 @@ index 0000000..2f99b0d
 +#endif
 +
 +#endif
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 423e0f0..44d2e92 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -713,9 +713,9 @@ namespace ps2x::iop::detail
+                 }();
+                 const uint32_t traceArgs[4] = {cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]};
+                 const uint32_t traceRa = cpu.gpr[31];
+-                const uint64_t importStart = __rdtsc();
++                const uint64_t importStart = ps2xStatTicks();
+                 const ImportDisposition disposition = dispatchImport(*import, cpu);
+-                g_iopStatImportTicks += __rdtsc() - importStart;
++                g_iopStatImportTicks += ps2xStatTicks() - importStart;
+                 // PS2X_IOP_IMPORT_TRACE_SKIP="thbase,thevent": libraries left out of the trace.
+                 static const std::string s_traceSkip = []
+                 {
+@@ -1035,9 +1035,9 @@ namespace ps2x::iop::detail
+                     serviceDev9();
+                     serviceAlarms();
+                     {
+-                        const uint64_t spuStart = __rdtsc();
++                        const uint64_t spuStart = ps2xStatTicks();
+                         serviceSpu2();
+-                        g_iopStatSpu2Ticks += __rdtsc() - spuStart;
++                        g_iopStatSpu2Ticks += ps2xStatTicks() - spuStart;
+                     }
+                     servicePendingDmaInterrupts();
+                     servicePendingGuestCallbacks();
+@@ -1059,9 +1059,9 @@ namespace ps2x::iop::detail
+                         continue;
+                     }
+                     const uint64_t before = totalCycles;
+-                    const uint64_t cpuStart = __rdtsc();
++                    const uint64_t cpuStart = ps2xStatTicks();
+                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+-                    g_iopStatCpuTicks += __rdtsc() - cpuStart;
++                    g_iopStatCpuTicks += ps2xStatTicks() - cpuStart;
+                     kernel.endTimeslice(*next, kThreadReturnSentinel);
+                     if (totalCycles == before)
+                         ++totalCycles;
+@@ -1296,9 +1296,9 @@ namespace ps2x::iop::detail
+         const uint64_t iopCycles = total / 8u;
+         m_impl->eeCycleCarry = total % 8u;
+         ++g_iopStatRunCalls;
+-        const uint64_t runStart = __rdtsc();
++        const uint64_t runStart = ps2xStatTicks();
+         m_impl->runCycles(iopCycles);
+-        g_iopStatRunTicks += __rdtsc() - runStart;
++        g_iopStatRunTicks += ps2xStatTicks() - runStart;
+     }
+ 
+     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
 index f29c1d1..c485f3c 100644
 --- a/ps2xRuntime/CMakeLists.txt
@@ -1598,6 +1665,65 @@ index f29c1d1..c485f3c 100644
  if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
      target_sources(ps2EntryRunner PRIVATE
          src/lib/ps2_debug_panel.cpp
+diff --git a/ps2xRuntime/include/ps2_runtime.h b/ps2xRuntime/include/ps2_runtime.h
+index e08c07b..8989a24 100644
+--- a/ps2xRuntime/include/ps2_runtime.h
++++ b/ps2xRuntime/include/ps2_runtime.h
+@@ -253,6 +253,11 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
+ {
+     (void)rdram;
+     (void)valueHi;
++#if defined(__EMSCRIPTEN__)
++    // Browser build: no write watches (a debugging aid), so no check on every guest store
++    (void)guestAddr; (void)size; (void)valueLo; (void)op; (void)ctx;
++    return;
++#endif
+     if (g_ps2WriteWatchCount == 0u)
+         return;
+     const uint32_t address = guestAddr & PS2_RAM_MASK;
+diff --git a/ps2xRuntime/include/ps2_runtime_macros.h b/ps2xRuntime/include/ps2_runtime_macros.h
+index 6ad81e7..f3d7a6a 100644
+--- a/ps2xRuntime/include/ps2_runtime_macros.h
++++ b/ps2xRuntime/include/ps2_runtime_macros.h
+@@ -839,6 +839,38 @@ static PS2_FORCEINLINE void Ps2SetGprLow64(R5900Context *ctx, int reg, __m128i n
+ 
+ #define SET_GPR_S64(ctx_ptr, reg_idx, val) SET_GPR_U64(ctx_ptr, reg_idx, val)
+ 
++#if defined(__EMSCRIPTEN__)
++// WebAssembly: the registers' low 64 bits are read and written as plain scalars. The SSE forms
++// above become a 128-bit load, a lane shuffle and a 128-bit store per register write once
++// translated to wasm SIMD; these are a single 32/64-bit load or store (upper half untouched).
++static PS2_FORCEINLINE uint64_t Ps2GprLow64(const R5900Context *ctx, int reg)
++{
++    uint64_t value;
++    std::memcpy(&value, &ctx->r[reg], sizeof(value));
++    return value;
++}
++static PS2_FORCEINLINE void Ps2SetGprLow64Scalar(R5900Context *ctx, int reg, uint64_t value)
++{
++    std::memcpy(&ctx->r[reg], &value, sizeof(value));
++}
++#undef GPR_U32
++#undef GPR_S32
++#undef GPR_U64
++#undef GPR_S64
++#undef SET_GPR_U32
++#undef SET_GPR_ZE32
++#undef SET_GPR_S32
++#undef SET_GPR_U64
++#define GPR_U32(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0U : static_cast<uint32_t>(Ps2GprLow64(ctx_ptr, reg_idx)))
++#define GPR_S32(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0 : static_cast<int32_t>(Ps2GprLow64(ctx_ptr, reg_idx)))
++#define GPR_U64(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0ULL : Ps2GprLow64(ctx_ptr, reg_idx))
++#define GPR_S64(ctx_ptr, reg_idx) ((reg_idx == 0) ? 0LL : static_cast<int64_t>(Ps2GprLow64(ctx_ptr, reg_idx)))
++#define SET_GPR_U32(ctx_ptr, reg_idx, val) do { if ((reg_idx) != 0) Ps2SetGprLow64Scalar(ctx_ptr, reg_idx, (uint64_t)(int64_t)(int32_t)(val)); } while (0)
++#define SET_GPR_ZE32(ctx_ptr, reg_idx, val) do { if ((reg_idx) != 0) Ps2SetGprLow64Scalar(ctx_ptr, reg_idx, (uint64_t)(uint32_t)(val)); } while (0)
++#define SET_GPR_S32(ctx_ptr, reg_idx, val) do { if ((reg_idx) != 0) Ps2SetGprLow64Scalar(ctx_ptr, reg_idx, (uint64_t)(int64_t)(int32_t)(val)); } while (0)
++#define SET_GPR_U64(ctx_ptr, reg_idx, val) do { if ((reg_idx) != 0) Ps2SetGprLow64Scalar(ctx_ptr, reg_idx, (uint64_t)(int64_t)(val)); } while (0)
++#endif
++
+ #define SET_GPR_VEC(ctx_ptr, reg_idx, val) \
+     do                                     \
+     {                                      \
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
 index 31a296b..f3532df 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
@@ -1630,7 +1756,7 @@ index 31a296b..f3532df 100644
      std::vector<ScheduledEvent> m_deadlines;
      std::deque<GuestInvocation> m_pendingInvocations;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index f09ec48..eab69c4 100644
+index f09ec48..b868392 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -10,6 +10,7 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
@@ -1698,7 +1824,7 @@ index f09ec48..eab69c4 100644
  bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
  {
      accountCycles(cycles);
-@@ -541,6 +585,48 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -541,6 +585,71 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return true;
      }
  
@@ -1709,22 +1835,45 @@ index f09ec48..eab69c4 100644
 +    // jump at the deadline ran the IOP and the SPU2 through a whole frame at once, with no EE
 +    // code in between, and the game's sound streamer (fed from the EE) fell behind the SPU2,
 +    // which then played repeated blocks (crackling).
-+    if (running != nullptr && hostDeadline != INT64_MAX && eeIdleLoopAt(running->activeContext().pc))
++    // Some systems (phones) wake a sleeping thread far later than asked: then time arrives in
++    // bursts (choppy sound, uneven frames). Sleeping is dropped for good if wake-ups are late.
++    static bool s_sleepUnreliable = false;
++    static uint32_t s_sleeps = 0u, s_lateSleeps = 0u;
++    static double s_maxLateMs = 0.0;
++    static auto s_sleepReport = std::chrono::steady_clock::now();
++    if (running != nullptr && hostDeadline != INT64_MAX && !s_sleepUnreliable && eeIdleLoopAt(running->activeContext().pc))
 +    {
 +        constexpr uint64_t kEeClockHz = 294912000ull;
 +        const auto until = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(hostDeadline));
 +        auto last = std::chrono::steady_clock::now();
 +        for (;;)
 +        {
++            const auto stepEnd = std::min(until, last + std::chrono::milliseconds(1));
 +            {
 +                std::unique_lock lock(m_eventMutex);
-+                const auto stepEnd = std::min(until, last + std::chrono::milliseconds(1));
 +                if (m_eventCv.wait_until(lock, stepEnd, [this]()
 +                                         { return !m_events.empty() || m_checkpointPending.load(std::memory_order_acquire) ||
 +                                                  m_stopRequested.load(std::memory_order_acquire); }))
 +                    break;
 +            }
 +            const auto now = std::chrono::steady_clock::now();
++            const double lateMs = std::chrono::duration<double, std::milli>(now - stepEnd).count();
++            ++s_sleeps;
++            if (lateMs > 4.0)
++                ++s_lateSleeps;
++            s_maxLateMs = std::max(s_maxLateMs, lateMs);
++            if (now - s_sleepReport >= std::chrono::seconds(5))
++            {
++                std::printf("[sched] idle sleeps %u, %u woke >4 ms late (max %.0f ms)\n", s_sleeps, s_lateSleeps, s_maxLateMs);
++                if (s_sleeps >= 200u && s_lateSleeps * 20u > s_sleeps)
++                {
++                    s_sleepUnreliable = true;
++                    std::printf("[sched] this system wakes threads late: the game spins in its wait loops instead of sleeping\n");
++                }
++                s_sleeps = s_lateSleeps = 0u;
++                s_maxLateMs = 0.0;
++                s_sleepReport = now;
++            }
 +            const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count());
 +            last = now;
 +            // Up to (not past) the deadline's cycle: reaching it stays with the logic above
@@ -1747,7 +1896,19 @@ index f09ec48..eab69c4 100644
      renewTimeSlice();
      return false;
  }
-@@ -2206,11 +2292,17 @@ void EeScheduler::processDueDeadlines()
+@@ -1946,9 +2055,9 @@ void EeScheduler::makeRunning(GuestThread &item)
+         struct Slot { uint64_t ticks = 0; uint32_t entry = 0; int priority = 0; uint32_t switches = 0; };
+         static Slot s_slots[256];
+         static int s_lastId = -1;
+-        static uint64_t s_lastTsc = __rdtsc(), s_windowTsc = s_lastTsc;
++        static uint64_t s_lastTsc = ps2xStatTicks(), s_windowTsc = s_lastTsc;
+         static auto s_windowStart = std::chrono::steady_clock::now();
+-        const uint64_t tsc = __rdtsc();
++        const uint64_t tsc = ps2xStatTicks();
+         if (s_lastId >= 0)
+             s_slots[s_lastId & 255].ticks += tsc - s_lastTsc;
+         s_lastTsc = tsc;
+@@ -2206,11 +2315,17 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -1767,7 +1928,7 @@ index f09ec48..eab69c4 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -2293,6 +2385,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -2293,6 +2408,22 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }
@@ -2112,7 +2273,7 @@ index 0e1a2ad..721e03b 100644
          }
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-index db0ff1d..93ca363 100644
+index db0ff1d..7d536d1 100644
 --- a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 @@ -21,7 +21,7 @@
@@ -2142,7 +2303,23 @@ index db0ff1d..93ca363 100644
  // ps2_runtime.cpp, frame-budget report (PS2X_NBA_FRAME_LOG): time the game blocked on a full ring.
  extern uint64_t g_ps2StatRingWaitTicks;
  
-@@ -192,6 +198,80 @@ namespace ps2_gsdump
+@@ -163,13 +169,13 @@ namespace ps2_gsdump
+                         if (hostGone())
+                             return false;
+                         SetEvent(dataEvent);
+-                        const uint64_t waitStart = __rdtsc();
++                        const uint64_t waitStart = ps2xStatTicks();
+                         header->producerWaiting = 1u;
+                         MemoryBarrier();
+                         if (header->readPos == r) // still full after announcing the wait
+                             WaitForSingleObject(spaceEvent, 20);
+                         header->producerWaiting = 0u;
+-                        g_ps2StatRingWaitTicks += __rdtsc() - waitStart;
++                        g_ps2StatRingWaitTicks += ps2xStatTicks() - waitStart;
+                         continue;
+                     }
+                     const uint64_t offset = static_cast<uint64_t>(w) % capacity;
+@@ -192,6 +198,81 @@ namespace ps2_gsdump
                      SetEvent(dataEvent);
              }
          };
@@ -2191,27 +2368,28 @@ index db0ff1d..93ca363 100644
 +            {
 +                while (size != 0u)
 +                {
++                    // Atomics on both indices (see Available() in web/play_gs_host.cpp): the
++                    // acquire on readPos keeps the host's reads of a block before it is overwritten.
 +                    const int64_t w = header->writePos;
-+                    const int64_t r = header->readPos;
++                    const int64_t r = __atomic_load_n(&header->readPos, __ATOMIC_ACQUIRE);
 +                    const uint64_t freeBytes = capacity - static_cast<uint64_t>(w - r);
 +                    if (freeBytes == 0u)
 +                    {
 +                        if (hostGone())
 +                            return false;
-+                        const uint64_t waitStart = __rdtsc();
++                        const uint64_t waitStart = ps2xStatTicks();
 +                        header->producerWaiting = 1u;
 +                        __atomic_thread_fence(__ATOMIC_SEQ_CST);
 +                        if (header->readPos == r)
 +                            ps2live::eventWait(&events->space, 20);
 +                        header->producerWaiting = 0u;
-+                        g_ps2StatRingWaitTicks += __rdtsc() - waitStart;
++                        g_ps2StatRingWaitTicks += ps2xStatTicks() - waitStart;
 +                        continue;
 +                    }
 +                    const uint64_t offset = static_cast<uint64_t>(w) % capacity;
 +                    const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
 +                    std::memcpy(data + offset, src, chunk);
-+                    __atomic_thread_fence(__ATOMIC_RELEASE);
-+                    header->writePos = w + static_cast<int64_t>(chunk);
++                    __atomic_store_n(&header->writePos, w + static_cast<int64_t>(chunk), __ATOMIC_RELEASE);
 +                    src += chunk;
 +                    size -= chunk;
 +                }
@@ -2223,7 +2401,23 @@ index db0ff1d..93ca363 100644
  #elif defined(__APPLE__) || defined(__linux__)
          // POSIX version of the live ring above: shm_open mapping, events as shared words
          // (ps2live::eventSet/eventWait), the host started with posix_spawn.
-@@ -342,6 +422,11 @@ namespace ps2_gsdump
+@@ -305,13 +386,13 @@ namespace ps2_gsdump
+                         if (hostGone())
+                             return false;
+                         ps2live::eventSet(&events->data);
+-                        const uint64_t waitStart = __rdtsc();
++                        const uint64_t waitStart = ps2xStatTicks();
+                         header->producerWaiting = 1u;
+                         __atomic_thread_fence(__ATOMIC_SEQ_CST);
+                         if (header->readPos == r) // still full after announcing the wait
+                             ps2live::eventWait(&events->space, 20);
+                         header->producerWaiting = 0u;
+-                        g_ps2StatRingWaitTicks += __rdtsc() - waitStart;
++                        g_ps2StatRingWaitTicks += ps2xStatTicks() - waitStart;
+                         continue;
+                     }
+                     const uint64_t offset = static_cast<uint64_t>(w) % capacity;
+@@ -342,6 +423,11 @@ namespace ps2_gsdump
  #if defined(PS2X_GS_LIVE_RING)
              LiveRing live;
              bool liveActive = false;
@@ -2235,7 +2429,7 @@ index db0ff1d..93ca363 100644
  #endif
              bool headerWritten = false;
              bool finished = false;
-@@ -373,6 +458,22 @@ namespace ps2_gsdump
+@@ -373,6 +459,22 @@ namespace ps2_gsdump
                  if (size == 0)
                      return;
  #if defined(PS2X_GS_LIVE_RING)
@@ -2258,7 +2452,7 @@ index db0ff1d..93ca363 100644
                  if (liveActive)
                  {
                      if (!live.write(static_cast<const uint8_t *>(data), size))
-@@ -410,7 +511,7 @@ namespace ps2_gsdump
+@@ -410,7 +512,7 @@ namespace ps2_gsdump
              void endPacket()
              {
  #if defined(PS2X_GS_LIVE_RING)
@@ -2267,7 +2461,7 @@ index db0ff1d..93ca363 100644
                      live.signal();
  #endif
              }
-@@ -471,8 +572,16 @@ namespace ps2_gsdump
+@@ -471,8 +573,16 @@ namespace ps2_gsdump
              {
                  Writer &init = w;
  #if defined(PS2X_GS_LIVE_RING)
@@ -2316,8 +2510,43 @@ index 7532552..b8c6172 100644
  #elif defined(__linux__)
          const timespec timeout{static_cast<time_t>(timeoutMs / 1000u), static_cast<long>(timeoutMs % 1000u) * 1000000l};
          syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, nullptr, 0);
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index e493c89..2c27875 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -1570,7 +1570,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     // tag, so the game's end-of-frame wait (0x003E1910) times out and its thread
+                     // falls into an endless error loop that eats the EE's time.
+                     const int kMaxChainTags = 1 << 20;
+-                    const uint64_t chainWalkStart = __rdtsc(); // frame-budget report: cost per tag
++                    const uint64_t chainWalkStart = ps2xStatTicks(); // frame-budget report: cost per tag
+                     std::vector<uint8_t> chainBuf = takeChainBuffer(); // recycled: pages already mapped
+                     // Chains are rebuilt every frame with similar sizes: start at the size of
+                     // the last one instead of growing (and copying) tag by tag.
+@@ -1773,7 +1773,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         }
+                     }
+                     {
+-                        const uint64_t copyStart = __rdtsc();
++                        const uint64_t copyStart = ps2xStatTicks();
+                         size_t total = 0;
+                         for (const ChainSegment &seg : chainSegments)
+                             total += seg.size;
+@@ -1790,10 +1790,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             const ChainSegment &seg = chainSegments[i];
+                             chainBuf.insert(chainBuf.end(), seg.data, seg.data + seg.size);
+                         }
+-                        g_ps2StatChainCopyTicks += __rdtsc() - copyStart;
++                        g_ps2StatChainCopyTicks += ps2xStatTicks() - copyStart;
+                         g_ps2StatChainBytes += total;
+                     }
+-                    g_ps2StatChainTicks += __rdtsc() - chainWalkStart;
++                    g_ps2StatChainTicks += ps2xStatTicks() - chainWalkStart;
+                     g_ps2StatChainTags += static_cast<uint64_t>(tagsProcessed);
+                     if (tagsProcessed >= kMaxChainTags)
+                     {
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 5c92038..6f265a4 100644
+index 5c92038..7e83d49 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -91,6 +91,20 @@ namespace
@@ -2341,7 +2570,52 @@ index 5c92038..6f265a4 100644
              while (IsAudioStreamProcessed(stream))
              {
                  const size_t got = ps2x::iop::readAudioFrames(buffer.data(), kFrames);
-@@ -3322,6 +3336,10 @@ void PS2Runtime::run()
+@@ -780,9 +794,9 @@ uint64_t g_ps2StatRingWaitTicks = 0;
+ 
+ void PS2Runtime::advanceIopEeCycles(uint64_t eeCycles) noexcept
+ {
+-    const uint64_t start = __rdtsc();
++    const uint64_t start = ps2xStatTicks();
+     m_iopSubsystem->runEeCycles(eeCycles);
+-    g_ps2StatIopTicks += __rdtsc() - start;
++    g_ps2StatIopTicks += ps2xStatTicks() - start;
+ }
+ 
+ void PS2Runtime::resetIop()
+@@ -1937,6 +1951,32 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+ {
+     ctx->pc = targetPc;
+     const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
++#if defined(__EMSCRIPTEN__)
++    // Web: every guest jal comes through here (millions per second). With the debug hooks off
++    // (they need PS2X_* variables, which the browser never sets) a call to a recompiled function
++    // only needs the safe point and one table lookup; anything else takes the full path below.
++    static const bool s_debugHooks = callWatch().count != 0 || std::getenv("PS2X_DUMP_ON_CALL") != nullptr ||
++                                     verifyState().perFunction > 0 || callHist().enabled;
++    if (isCall && !s_debugHooks && targetPc >= 0x80000u)
++    {
++        uint32_t slot = 0u;
++        const RecompiledFunction fastFn = generatedFunctionTableSlot(targetPc, slot) ? g_ps2RecompiledFunctionTable[slot] : nullptr;
++        if (fastFn != nullptr)
++        {
++            if (m_eeScheduler && m_eeScheduler->checkpointDue(EeScheduler::kGuestDispatchCycles))
++                return false;
++            pushDispatchPc(targetPc);
++            const uint32_t entrySp = static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[29]));
++            fastFn(rdram, ctx, this);
++            if (isStopRequested() || ctx->pc == 0u)
++                return false;
++            if (ctx->pc == targetPc && static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[29])) == entrySp &&
++                static_cast<uint32_t>(_mm_cvtsi128_si32(ctx->r[31])) == fallthroughPc)
++                ctx->pc = fallthroughPc;
++            return ctx->pc == fallthroughPc;
++        }
++    }
++#endif
+     // COP0 Count is refreshed by the generated mfc0 $9 itself (cop0_translator / fix_cop0_count.ps1).
+     if (callWatch().count != 0)
+         noteWatchedCall(ctx, targetPc, sourcePc);
+@@ -3322,6 +3362,10 @@ void PS2Runtime::run()
          spu2Output.pump();
          uint32_t presentWidth = FB_WIDTH;
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
@@ -2367,6 +2641,21 @@ index aff25e6..1de2f76 100644
      return true;
  }
  
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index a857acc..8809d65 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -368,8 +368,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         return;
+     struct StatTimer
+     {
+-        uint64_t start = __rdtsc();
+-        ~StatTimer() { g_ps2StatVif1Ticks += __rdtsc() - start; }
++        uint64_t start = ps2xStatTicks();
++        ~StatTimer() { g_ps2StatVif1Ticks += ps2xStatTicks() - start; }
+     } statTimer;
+ 
+     uint32_t pos = 0;
 diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
 index 563bcbd..66ce2e9 100644
 --- a/ps2xRuntime/src/main.cpp
@@ -2401,10 +2690,10 @@ index 0000000..96f355f
 +"DEV9.IRX",
 diff --git a/ps2xRuntime/web/library_fetch_stream.js b/ps2xRuntime/web/library_fetch_stream.js
 new file mode 100644
-index 0000000..e7c7019
+index 0000000..ab13bcc
 --- /dev/null
 +++ b/ps2xRuntime/web/library_fetch_stream.js
-@@ -0,0 +1,229 @@
+@@ -0,0 +1,254 @@
 +/**
 + * WasmFS fetch backend for the game disc, replacing Emscripten's (src/lib/libwasmfs_fetch.js):
 + * the same on-demand HTTP Range reads, plus
@@ -2433,6 +2722,35 @@ index 0000000..e7c7019
 +    // Persistent chunk store (absent in some private modes: then memory only).
 +    var diskCache = (typeof caches !== 'undefined') ? caches.open('ps2x-disc-v1').catch(() => null) : Promise.resolve(null);
 +
++    // fetch() with a deadline and retries: on phones a request can stall for good (a dead
++    // connection after a network change), and with no timeout the game waited on it forever
++    // ("starting the game..." that never ends). A 404 is final; anything else is retried.
++    async function fetchRetry(url, init, expectBytes) {
++      for (var attempt = 1; ; attempt++) {
++        var abort = new AbortController();
++        var timer = setTimeout(() => abort.abort(), 15000 + (expectBytes || 0) / 256); // + 4 s per MB
++        try {
++          // cache: 'no-store': the chunks are kept in Cache Storage already, and Chrome's HTTP
++          // cache makes requests for one URL queue behind a single writer (up to 20 s each):
++          // on a cold start the disc reads stalled behind each other until they timed out.
++          var response = await fetch(url, Object.assign({cache: 'no-store'}, init, {signal: abort.signal}));
++          if (response.status === 404) throw response;
++          if (!response.ok) throw new Error(`HTTP ${response.status}`);
++          if (init.method === 'HEAD') return response;
++          var bytes = new Uint8Array(await response.arrayBuffer());
++          if (expectBytes && bytes.byteLength !== expectBytes) throw new Error(`short read ${bytes.byteLength}/${expectBytes}`);
++          return bytes;
++        } catch (e) {
++          if (e && e.status === 404) throw e;
++          if (attempt >= 6) throw {status: 0};
++          console.warn(`[disc] ${url.split('/').pop()}: ${e && e.name === 'AbortError' ? 'timed out' : e}; retrying (${attempt})`);
++          await new Promise((r) => setTimeout(r, 500 * attempt));
++        } finally {
++          clearTimeout(timer);
++        }
++      }
++    }
++
 +    function chunkKey(info, i) {
 +      return `${info.url}?ps2x-chunk=${i}&size=${info.chunkSize}&v=${encodeURIComponent(info.version)}`;
 +    }
@@ -2457,15 +2775,13 @@ index 0000000..e7c7019
 +      info = wasmFS$JSMemoryRanges[file] = {url, chunkSize, size: 0, chunks: new Map(), pending: new Map(),
 +                                            ready: false, streams: []};
 +      info.opening = (async () => {
-+        var head = await fetch(url, {method: 'HEAD', headers: {'Range': 'bytes=0-'}});
++        var head = await fetchRetry(url, {method: 'HEAD', headers: {'Range': 'bytes=0-'}});
 +        var length = head.ok && head.headers.has('Content-Length') ? parseInt(head.headers.get('Content-Length'), 10) : 0;
 +        if (head.ok && head.headers.get('Accept-Ranges') == 'bytes' && length > chunkSize * 2) {
 +          info.size = length;
 +          info.version = head.headers.get('ETag') || head.headers.get('Last-Modified') || String(length);
 +        } else {
-+          var whole = await fetch(url);
-+          if (!whole.ok) throw whole;
-+          var data = new Uint8Array(await whole.arrayBuffer());
++          var data = await fetchRetry(url, {});
 +          info.size = data.byteLength;
 +          info.chunkSize = Math.max(1, data.byteLength);
 +          info.chunks.set(0, data);
@@ -2522,9 +2838,7 @@ index 0000000..e7c7019
 +          missing.splice(0, b - a + 1);
 +          var start = a * info.chunkSize;
 +          var end = Math.min((b + 1) * info.chunkSize, info.size);
-+          var response = await fetch(info.url, {headers: {'Range': `bytes=${start}-${end - 1}`}});
-+          if (!response.ok) throw response;
-+          var bytes = new Uint8Array(await response.arrayBuffer());
++          var bytes = await fetchRetry(info.url, {headers: {'Range': `bytes=${start}-${end - 1}`}}, end - start);
 +          for (var j = a; j <= b; j++) {
 +            var chunk = bytes.slice(j * info.chunkSize - start, (j + 1) * info.chunkSize - start);
 +            arrived(j, chunk);
@@ -2674,10 +2988,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..dc55db6
+index 0000000..c9f0c5c
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,970 @@
+@@ -0,0 +1,1153 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -2850,6 +3164,9 @@ index 0000000..dc55db6
 +		// Debug counters (printed every 2 s from inside the packet loop).
 +		uint64_t nVif = 0, nVifReg = 0, nXfer = 0, nVsync = 0, nRegs = 0, nFifo = 0;
 +		double vuMs = 0.0, gsMs = 0.0, debugStart = 0.0;
++		double glMs = 0.0, glMaxMs = 0.0, rafMaxMs = 0.0, lastRaf = 0.0;
++		uint32_t rafs = 0;
++		uint32_t hdLoadedBefore = 0;
 +		uint64_t vuSlices = 0;
 +		uint64_t drawCalls = 0;
 +		uint64_t totalVsyncs = 0;
@@ -2902,6 +3219,8 @@ index 0000000..dc55db6
 +	bool g_debug = false; // <page>?debug: GS statistics every 2 s, F8/F9 dumps
 +	int g_scale = 2;      // internal resolution (decided on the page thread, from the URL)
 +	bool g_hd = true;     // HD texture pack (data/hd/): on unless <page>?hd=0 (start screen setting)
++	bool g_halfRate = false; // picture at 30 fps (the game at 60): <page>?fps=30
++	bool g_fsr = true;       // FSR 1 upscaling to the window: on unless <page>?fsr=0 (start screen setting)
 +	ps2live::RingHeader* g_ring = nullptr;
 +	// Canvas size in device pixels, measured on the page thread (the GL thread can't read CSS)
 +	std::atomic<uint32_t> g_wantedWidth{0};
@@ -2991,9 +3310,14 @@ index 0000000..dc55db6
 +
 +	// --- ring reading ------------------------------------------------------------------------
 +
++	// The indices are atomics: the producer publishes writePos with a release store after copying
++	// the bytes, and this acquire load makes those bytes visible here. With plain loads, ARM
++	// (phones, Apple silicon) could serve the packet bytes before the new writePos, and the reader
++	// saw a stale packet id ("unknown packet").
 +	uint64_t Available(Host& h)
 +	{
-+		return static_cast<uint64_t>(h.ring->writePos - h.ring->readPos);
++		const int64_t w = __atomic_load_n(&h.ring->writePos, __ATOMIC_ACQUIRE);
++		return static_cast<uint64_t>(w - h.ring->readPos);
 +	}
 +
 +	// Copies size bytes at offset `skip` past the read position, without consuming them.
@@ -3014,8 +3338,7 @@ index 0000000..dc55db6
 +
 +	void Consume(Host& h, uint64_t size)
 +	{
-+		__atomic_thread_fence(__ATOMIC_RELEASE);
-+		h.ring->readPos = h.ring->readPos + static_cast<int64_t>(size);
++		__atomic_store_n(&h.ring->readPos, h.ring->readPos + static_cast<int64_t>(size), __ATOMIC_RELEASE);
 +		__atomic_thread_fence(__ATOMIC_SEQ_CST); // readPos store before the producerWaiting load
 +		if(h.ring->producerWaiting)
 +			ps2live::eventSet(&ps2live::ringEvents(h.ring)->space);
@@ -3420,15 +3743,179 @@ index 0000000..dc55db6
 +		// The GS calls the worker thread queued (draws, transfers, flips) run here, in the thread
 +		// that owns the canvas (OffscreenCanvas); the last flip is what the page shows.
 +		const double gsStart = emscripten_get_now();
++		// WebGL state cache, once: Play! sets the whole texture/buffer state for every draw (about
++		// 3000 WebGL calls per frame in a match). Each call goes to Chrome's GPU process, which
++		// on phones made this thread too slow for 60 fps. Calls that change nothing are dropped
++		// here, below all of Play!'s 58 places that touch the state, so none can disagree.
++		// It also counts the calls that remain (statistics).
++		EM_ASM({
++			if (self.ps2xGlWrapped || typeof GLctx === 'undefined' || !GLctx) return;
++			self.ps2xGlWrapped = true;
++			self.ps2xGlCalls = 0;
++			self.ps2xGlMs = 0;
++			self.ps2xGlSkipped = 0;
++			self.ps2xGlByName = {};
++			const gl = GLctx;
++			const raw = {};
++			const proto = Object.getPrototypeOf(gl);
++			for (const name of Object.getOwnPropertyNames(proto)) {
++				let original;
++				try { original = gl[name]; } catch (e) { continue; }
++				if (typeof original !== 'function' || name === 'constructor') continue;
++				raw[name] = original.bind(gl);
++			}
++			const counted = raw;
++			const skip = () => { self.ps2xGlSkipped++; };
++			let activeUnit = gl.TEXTURE0;
++			const boundTextures = new Map(); // unit -> texture (TEXTURE_2D)
++			const boundBuffers = new Map();  // target -> buffer
++			const boundBases = new Map();    // target:index -> buffer
++			let vertexArray = null;
++			let program = null;
++			let readFramebuffer = null;
++			let drawFramebuffer = null;
++			const enabled = new Map();
++			let viewport = '';
++			let scissor = '';
++			let colorMask = '';
++			let depthMask = null;
++			let blendFunc = '';
++			let blendEquation = '';
++			let depthFunc = null;
++			gl.activeTexture = function(unit) { if (unit === activeUnit) return skip(); activeUnit = unit; counted.activeTexture(unit); };
++			gl.bindTexture = function(target, texture) {
++				if (target === gl.TEXTURE_2D) {
++					if (boundTextures.get(activeUnit) === texture) return skip();
++					boundTextures.set(activeUnit, texture);
++				}
++				counted.bindTexture(target, texture);
++			};
++			gl.texParameteri = function(target, pname, value) {
++				const texture = target === gl.TEXTURE_2D ? boundTextures.get(activeUnit) : null;
++				if (texture) {
++					const params = texture.ps2xParams || (texture.ps2xParams = {});
++					if (params[pname] === value) return skip();
++					params[pname] = value;
++				}
++				counted.texParameteri(target, pname, value);
++			};
++			gl.bindBuffer = function(target, buffer) {
++				if (boundBuffers.get(target) === buffer) return skip();
++				boundBuffers.set(target, buffer);
++				counted.bindBuffer(target, buffer);
++			};
++			gl.bindBufferBase = function(target, index, buffer) {
++				// (It also binds the generic target; skipped, that one keeps its cached value.)
++				const key = target + ':' + index;
++				if (boundBases.get(key) === buffer) return skip();
++				boundBases.set(key, buffer);
++				boundBuffers.set(target, buffer);
++				counted.bindBufferBase(target, index, buffer);
++			};
++			// Shader parameter blocks re-sent unchanged: compared with the last upload
++			gl.bufferData = function(target, data, usage, offset, length) {
++				const buffer = boundBuffers.get(target);
++				if (target === gl.UNIFORM_BUFFER && buffer && data && data.buffer && typeof offset === 'number' && length > 0 && length <= 1024) {
++					const bytes = new Uint8Array(data.buffer, data.byteOffset + offset, length);
++					const last = buffer.ps2xLast;
++					if (last && last.length === length && usage === buffer.ps2xUsage) {
++						let same = true;
++						for (let i = 0; i < length; i++) if (last[i] !== bytes[i]) { same = false; break; }
++						if (same) return skip();
++					}
++					buffer.ps2xLast = bytes.slice();
++					buffer.ps2xUsage = usage;
++				} else if (buffer) {
++					buffer.ps2xLast = null;
++				}
++				return counted.bufferData.apply(null, arguments);
++			};
++			gl.bindBufferRange = function(target, index, buffer, offset, size) {
++				boundBases.delete(target + ':' + index);
++				boundBuffers.set(target, buffer);
++				counted.bindBufferRange(target, index, buffer, offset, size);
++			};
++			gl.bindVertexArray = function(vao) {
++				if (vao === vertexArray) return skip();
++				vertexArray = vao;
++				boundBuffers.delete(gl.ELEMENT_ARRAY_BUFFER);
++				counted.bindVertexArray(vao);
++			};
++			gl.useProgram = function(p) { if (p === program) return skip(); program = p; counted.useProgram(p); };
++			gl.bindFramebuffer = function(target, fb) {
++				if (target === gl.FRAMEBUFFER) {
++					if (fb === drawFramebuffer && fb === readFramebuffer) return skip();
++					drawFramebuffer = readFramebuffer = fb;
++				} else if (target === gl.DRAW_FRAMEBUFFER) {
++					if (fb === drawFramebuffer) return skip();
++					drawFramebuffer = fb;
++				} else if (target === gl.READ_FRAMEBUFFER) {
++					if (fb === readFramebuffer) return skip();
++					readFramebuffer = fb;
++				}
++				counted.bindFramebuffer(target, fb);
++			};
++			gl.enable = function(cap) { if (enabled.get(cap) === true) return skip(); enabled.set(cap, true); counted.enable(cap); };
++			gl.disable = function(cap) { if (enabled.get(cap) === false) return skip(); enabled.set(cap, false); counted.disable(cap); };
++			gl.viewport = function(x, y, w, h) { const k = x + ',' + y + ',' + w + ',' + h; if (k === viewport) return skip(); viewport = k; counted.viewport(x, y, w, h); };
++			gl.scissor = function(x, y, w, h) { const k = x + ',' + y + ',' + w + ',' + h; if (k === scissor) return skip(); scissor = k; counted.scissor(x, y, w, h); };
++			gl.colorMask = function(r, g, b, a) { const k = '' + r + g + b + a; if (k === colorMask) return skip(); colorMask = k; counted.colorMask(r, g, b, a); };
++			gl.depthMask = function(f) { if (f === depthMask) return skip(); depthMask = f; counted.depthMask(f); };
++			gl.depthFunc = function(f) { if (f === depthFunc) return skip(); depthFunc = f; counted.depthFunc(f); };
++			gl.blendFuncSeparate = function(a, b, c, d) { const k = a + ',' + b + ',' + c + ',' + d; if (k === blendFunc) return skip(); blendFunc = k; counted.blendFuncSeparate(a, b, c, d); };
++			gl.blendFunc = function(a, b) { blendFunc = ''; counted.blendFunc(a, b); };
++			gl.blendEquationSeparate = function(a, b) { const k = a + ',' + b; if (k === blendEquation) return skip(); blendEquation = k; counted.blendEquationSeparate(a, b); };
++			gl.blendEquation = function(a) { blendEquation = ''; counted.blendEquation(a); };
++			// Deleted objects leave the bindings (as GL does)
++			gl.deleteTexture = function(t) { for (const [u, b] of boundTextures) if (b === t) boundTextures.set(u, null); counted.deleteTexture(t); };
++			gl.deleteBuffer = function(b) {
++				for (const [k, v] of boundBuffers) if (v === b) boundBuffers.set(k, null);
++				for (const [k, v] of boundBases) if (v === b) boundBases.set(k, null);
++				counted.deleteBuffer(b);
++			};
++			gl.deleteFramebuffer = function(f) {
++				if (drawFramebuffer === f) drawFramebuffer = null;
++				if (readFramebuffer === f) readFramebuffer = null;
++				counted.deleteFramebuffer(f);
++			};
++			gl.deleteVertexArray = function(v) { if (vertexArray === v) vertexArray = null; counted.deleteVertexArray(v); };
++			gl.deleteProgram = function(p) { if (program === p) program = null; counted.deleteProgram(p); };
++			// Wrapped elsewhere in Emscripten's code paths: keep the cache right if anything
++			// saves and restores bindings with getParameter
++		});
 +		h.gsWeb->Pump();
-+		h.gsMs += emscripten_get_now() - gsStart;
++		const double pumpMs = emscripten_get_now() - gsStart;
++		h.gsMs += pumpMs;
++		h.glMs += pumpMs;
++		h.glMaxMs = std::max(h.glMaxMs, pumpMs);
++		if(h.lastRaf != 0.0)
++			h.rafMaxMs = std::max(h.rafMaxMs, time - h.lastRaf);
++		h.lastRaf = time;
++		h.rafs++;
 +		if(g_debug)
 +			DebugStats(h);
 +		if(h.statsStart == 0.0)
 +			h.statsStart = time; // rAF time is page-relative; emscripten_get_now() is absolute with pthreads
 +		if(time - h.statsStart >= 5000.0)
 +		{
-+			std::printf("[webgs] %.1f game fps on screen\n", h.frames * 1000.0 / (time - h.statsStart));
++			// Also where time goes on the GL thread (GPU-bound devices show it here)
++			auto& gs = *h.gsWeb;
++			std::printf("[webgs] %.1f game fps on screen (gl %.1f ms/frame, max %.0f ms, longest frame gap %.0f ms, fb copies %.0f/frame; "
++			            "shaders %u in %.0f ms, read-backs %u in %.0f ms, texture uploads %u (%u unchanged, skipped), hd loaded %u)\n",
++			            h.frames * 1000.0 / (time - h.statsStart), h.rafs ? h.glMs / h.rafs : 0.0, h.glMaxMs, h.rafMaxMs,
++			            h.frames ? static_cast<double>(gs.m_dstCopies) / h.frames : 0.0, gs.m_shaderCompiles, gs.m_shaderCompileMs,
++			            gs.m_framebufferWriteBacks, gs.m_writeBackMs, gs.m_textureUploads,
++			            gs.m_textureUploadsSkipped, gs.m_hdTexturesLoaded - h.hdLoadedBefore);
++			gs.m_slowestBatchMs = 0.0;
++			for(double& slowest : gs.m_slowestMs)
++				slowest = 0.0;
++			h.hdLoadedBefore = gs.m_hdTexturesLoaded;
++			h.glMs = h.glMaxMs = h.rafMaxMs = 0.0;
++			h.rafs = 0;
++			gs.m_dstCopies = gs.m_shaderCompiles = gs.m_textureUploads = gs.m_textureUploadsSkipped = 0;
++			gs.m_shaderCompileMs = gs.m_writeBackMs = gs.m_textureUploadMs = 0.0;
++			if(!g_debug)
++				gs.m_framebufferWriteBacks = 0;
 +			h.frames = 0;
 +			h.statsStart = time;
 +		}
@@ -3535,7 +4022,9 @@ index 0000000..dc55db6
 +		attr.minorVersion = 0;
 +		attr.alpha = EM_FALSE;
 +		attr.antialias = EM_FALSE;
-+		attr.preserveDrawingBuffer = EM_TRUE; // a vsync without changes keeps the last picture
++		// Not preserved: the browser swaps instead of copying the whole picture every frame (a
++		// heavy copy on phone GPUs). A frame with no flip draws nothing, so the last one stays.
++		attr.preserveDrawingBuffer = EM_FALSE;
 +		attr.powerPreference = EM_WEBGL_POWER_PREFERENCE_HIGH_PERFORMANCE;
 +		attr.proxyContextToMainThread = EMSCRIPTEN_WEBGL_CONTEXT_PROXY_DISALLOW;
 +		g_context = emscripten_webgl_create_context("#canvas", &attr);
@@ -3580,6 +4069,9 @@ index 0000000..dc55db6
 +		h->gsWeb->Pump();
 +		if(g_hd)
 +			h->gsWeb->EnableHdTextures("data/hd");
++		h->gsWeb->SetHalfRateImage(g_halfRate);
++		h->gsWeb->SetFsr(g_fsr);
++		std::printf("[webgs] picture at %d fps\n", g_halfRate ? 30 : 60);
 +
 +		ring->consumerAlive = 1;
 +		ring->consumerFlags = 1; // never waits on the data event: no wake-ups needed
@@ -3619,6 +4111,11 @@ index 0000000..dc55db6
 +		});
 +		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
 +		g_hd = EM_ASM_INT({ return new URLSearchParams(location.search).get('hd') === '0' ? 0 : 1; }) != 0;
++		g_fsr = EM_ASM_INT({ return new URLSearchParams(location.search).get('fsr') === '0' ? 0 : 1; }) != 0;
++		g_halfRate = EM_ASM_INT({
++			const fps = new URLSearchParams(location.search).get('fps');
++			return fps === '30' ? 1 : 0;
++		}) != 0;
 +		OnPageFrame(0.0, nullptr); // first size, before the GL thread starts
 +
 +		emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, EM_TRUE, &OnKey);
@@ -3778,10 +4275,10 @@ index 0000000..ac06b4b
 +void SetSoundPitch(Sound, float) {}
 diff --git a/ps2xRuntime/web/site/index.html b/ps2xRuntime/web/site/index.html
 new file mode 100644
-index 0000000..5aadcad
+index 0000000..9f04f73
 --- /dev/null
 +++ b/ps2xRuntime/web/site/index.html
-@@ -0,0 +1,258 @@
+@@ -0,0 +1,295 @@
 +<!doctype html>
 +<html lang="es">
 +<head>
@@ -3830,6 +4327,16 @@ index 0000000..5aadcad
 +          <option value="3">3x · 1920×1344</option>
 +          <option value="4">4x · 2560×1792</option>
 +        </select>
++        <label for="optFsr">Escalado</label>
++        <select id="optFsr">
++          <option value="1">FSR 1 (más nítido)</option>
++          <option value="0">Normal (bilineal)</option>
++        </select>
++        <label for="optFps">Imagen</label>
++        <select id="optFps">
++          <option value="auto">60 fps</option>
++          <option value="30">30 fps (menos trabajo gráfico; el juego sigue a 60)</option>
++        </select>
 +        <label for="optHd">Texturas HD</label>
 +        <select id="optHd"><option value="1">Sí</option><option value="0">No (menos memoria y datos)</option></select>
 +        <label for="optAudio">Sonido</label>
@@ -3849,6 +4356,7 @@ index 0000000..5aadcad
 +    <button id="sound" hidden>Activar sonido</button>
 +    <span style="flex:1"></span>
 +    <button id="full">Pantalla completa</button>
++    <button id="diagBtn">Enviar diagnóstico</button>
 +    <button id="logBtn">Log</button>
 +  </footer>
 +</main>
@@ -3872,6 +4380,28 @@ index 0000000..5aadcad
 +    if (m) fps.textContent = m[1] + ' fps';
 +    if (text.includes('[webgs] live GS stream connected')) statusBox.hidden = true;
 +  }
++  // Sends this session's statistics (frame times, sound, disc waits) and the device's details to
++  // the server, only when the player presses the button, to find what slows a given device down.
++  const diagBtn = document.getElementById('diagBtn');
++  diagBtn.onclick = async () => {
++    let gpu = '?';
++    try {
++      const gl = document.createElement('canvas').getContext('webgl2');
++      const info = gl.getExtension('WEBGL_debug_renderer_info');
++      gpu = info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
++    } catch (e) {}
++    const report = [
++      'url: ' + location.href, 'agent: ' + navigator.userAgent, 'gpu: ' + gpu,
++      `cores: ${navigator.hardwareConcurrency} memory: ${navigator.deviceMemory || '?'} GB screen: ${screen.width}x${screen.height} @${devicePixelRatio}`,
++      'audio: ' + (typeof audioContext !== 'undefined' && audioContext ? `${audioContext.state} base latency ${audioContext.baseLatency} output latency ${audioContext.outputLatency}` : 'none'),
++      '', ...lines.slice(-3000)].join('\n');
++    diagBtn.disabled = true; diagBtn.textContent = 'Enviando…';
++    try {
++      const response = await fetch('diag', { method: 'POST', body: report });
++      diagBtn.textContent = response.ok ? 'Enviado ✓' : 'Error al enviar';
++    } catch (e) { diagBtn.textContent = 'Error al enviar'; }
++    setTimeout(() => { diagBtn.disabled = false; diagBtn.textContent = 'Enviar diagnóstico'; }, 4000);
++  };
 +  document.getElementById('logBtn').onclick = () => { log.classList.toggle('open'); log.textContent = lines.join('\n'); };
 +  document.getElementById('full').onclick = () => document.getElementById('stage').requestFullscreen?.();
 +  if (!crossOriginIsolated) {
@@ -3895,8 +4425,8 @@ index 0000000..5aadcad
 +    preRun: [() => Module.addRunDependency('play-click')],
 +  };
 +  // Settings on the start screen: kept in this browser, handed to the game as page parameters
-+  // (?scale, ?hd, ?audio, ?online), which a link can also set.
-+  const settingNames = { scale: 'optScale', hd: 'optHd', audio: 'optAudio', online: 'optOnline' };
++  // (?scale, ?fsr, ?hd, ?audio, ?online), which a link can also set.
++  const settingNames = { scale: 'optScale', fsr: 'optFsr', fps: 'optFps', hd: 'optHd', audio: 'optAudio', online: 'optOnline' };
 +  const saved = (() => { try { return JSON.parse(localStorage.getItem('ps2x-settings') || '{}'); } catch (e) { return {}; } })();
 +  const params = new URLSearchParams(location.search);
 +  for (const [name, id] of Object.entries(settingNames)) {
@@ -3944,17 +4474,18 @@ index 0000000..5aadcad
 +        this.frac = 0;
 +        // Frames kept queued: ~50 ms (phones ~100 ms), growing after each underrun up to 150 ms
 +        // (phones 200 ms), whose threads get descheduled more often
-+        const sizes = { low: [1600, 4800], normal: [2400, 7200], stable: [4800, 9600] }[o.mode] || [2400, 7200];
++        // [starting target, largest target] in frames (48 kHz); stable rides out ~1/3 s hiccups
++        const sizes = { low: [1600, 4800], normal: [2400, 7200], stable: [6000, 16000] }[o.mode] || [2400, 7200];
 +        this.target = sizes[0];
 +        this.maxTarget = sizes[1];
 +        this.level = this.target;
 +        this.capture = null;
 +        this.port.onmessage = (e) => { if (e.data === 'capture') this.capture = []; };
 +      }
-+      sample(pos) {
-+        const k = (pos % this.frames) * 2;
-+        return [this.ring[k] / 32768, this.ring[k + 1] / 32768];
-+      }
++      // No allocations in here: the audio thread must never wait for the garbage collector
++      // (on phones its pauses were heard as glitches).
++      left16(pos) { return this.ring[(pos % this.frames) * 2] * (1 / 32768); }
++      right16(pos) { return this.ring[(pos % this.frames) * 2 + 1] * (1 / 32768); }
 +      process(inputs, outputs) {
 +        const left = outputs[0][0], right = outputs[0][1];
 +        const written = Atomics.load(this.index, 0);
@@ -3966,7 +4497,8 @@ index 0000000..5aadcad
 +          this.fadeFrom = read; this.fadeLeft = 128;
 +          read = (written - this.target) >>> 0; queued = this.target; this.level = queued; this.skips++;
 +        }
-+        if (this.waiting && queued >= this.target * 0.7) { this.waiting = false; this.fadeIn = 0; }
++        // Back from a gap as soon as some sound is queued (it fades in), not after a long silence
++        if (this.waiting && queued >= this.target * 0.4) { this.waiting = false; this.fadeIn = 0; }
 +        if (!this.waiting && queued < left.length + 2) {
 +          // Ran dry: keep a bit more sound queued from now on
 +          this.waiting = true; this.underruns++;
@@ -3978,12 +4510,14 @@ index 0000000..5aadcad
 +        const step = 1 + Math.max(-0.03, Math.min(0.03, (this.level - this.target) / this.target * 0.04));
 +        for (let i = 0; i < left.length; i++) {
 +          if (!this.waiting && ((written - read) >>> 0) > 1) {
-+            const [l0, r0] = this.sample(read), [l1, r1] = this.sample((read + 1) >>> 0);
-+            let outL = l0 + (l1 - l0) * this.frac;
-+            let outR = r0 + (r1 - r0) * this.frac;
++            const next = (read + 1) >>> 0;
++            const l0 = this.left16(read), r0 = this.right16(read);
++            let outL = l0 + (this.left16(next) - l0) * this.frac;
++            let outR = r0 + (this.right16(next) - r0) * this.frac;
 +            if (this.fadeLeft > 0) { // cross-fade from where it was before a jump
-+              const [ol, or] = this.sample(this.fadeFrom), k = this.fadeLeft / 128;
-+              outL = outL * (1 - k) + ol * k; outR = outR * (1 - k) + or * k;
++              const k = this.fadeLeft / 128;
++              outL = outL * (1 - k) + this.left16(this.fadeFrom) * k;
++              outR = outR * (1 - k) + this.right16(this.fadeFrom) * k;
 +              this.fadeFrom = (this.fadeFrom + 1) >>> 0; this.fadeLeft--;
 +            }
 +            if (this.fadeIn < 128) { // back from a gap: fade in instead of a click
@@ -4042,7 +4576,7 @@ index 0000000..5aadcad
 +</html>
 diff --git a/ps2xRuntime/web/web_platform.cpp b/ps2xRuntime/web/web_platform.cpp
 new file mode 100644
-index 0000000..b6d3e2b
+index 0000000..5d7c3b0
 --- /dev/null
 +++ b/ps2xRuntime/web/web_platform.cpp
 @@ -0,0 +1,195 @@
@@ -4205,7 +4739,7 @@ index 0000000..b6d3e2b
 +namespace
 +{
 +	// Single producer (the game thread) and single consumer (the AudioWorklet), counted in frames.
-+	constexpr uint32_t kAudioRingFrames = 16384; // ~340 ms
++	constexpr uint32_t kAudioRingFrames = 32768; // ~680 ms
 +	alignas(16) int16_t g_audioRing[kAudioRingFrames * 2];
 +	alignas(8) std::atomic<uint32_t> g_audioIndex[2]; // [0] written, [1] read (by the worklet)
 +}

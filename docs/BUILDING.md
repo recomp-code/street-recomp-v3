@@ -160,6 +160,75 @@ The recompiler bugs found (and fixed in `patches/ps2recomp.patch`) are documente
 `docs/PORTING_NOTES.md`; several affect any PS2 game ported with PS2Recomp (SQRT.S, 64-bit
 BLTZ/BGEZ branches, MMI, VU0...).
 
+## Browser build (WebAssembly)
+
+`tools/web/build.sh` (Mac, after `tools/macos/install.sh`) builds the browser version from pinned
+sources plus the patches in `patches/`. It never touches the native builds: the web changes live in
+their own patches, and the few runtime changes shared with native code are behind `__EMSCRIPTEN__`.
+
+| Piece | Version | Patch |
+| --- | --- | --- |
+| Emscripten | 6.0.12 | |
+| FFmpeg (MPEG-2 videos) | 7.1.2 | |
+| PS2Recomp | 2c5fbb9 | `ps2recomp.patch` (shared with native) + `ps2recomp-web.patch` |
+| Play! (GS renderer, VU1 JIT) | 83700b2c | `play.patch`, `play-codegen.patch`, `play-dependencies.patch` |
+
+**`ps2recomp-web.patch`**
+- `ps2xRuntime/web/`:
+  - `web_platform.cpp`: start-up, memory card, sound ring;
+  - `play_gs_host.cpp`: GL thread, VU1 worker, settings, WebGL state cache;
+  - `library_fetch_stream.js`: disc streaming over HTTP Range, read-ahead, Cache Storage, timeouts
+    and retries, no HTTP cache;
+  - `site/index.html`: start screen, AudioWorklet, gamepads, diagnostics.
+- IOP / SPU2: Gaussian interpolation, volume sweeps, paced AutoDMA, output limiter.
+- EE scheduler: idle-loop sleep with time flowing in 1 ms steps, vblank rebase after stalls.
+- DEV9 sockets over a WebSocket (online).
+- WebAssembly-only fast paths in the recompiled code's runtime:
+  - scalar 64-bit GPR macros (`ps2_runtime_macros.h`);
+  - a short path for guest calls (`dispatchGuestBranch`);
+  - acquire/release atomics on the GS ring indices.
+
+**`play.patch`** (Play!'s OpenGL GS on WebGL2)
+- Accuracy fixes for effects WebGL lacks.
+- Texture cache with content hashing and a texture pool.
+- Half-rate picture (`?fps=30`).
+- HD texture packs in PCSX2's format (`GSH_OpenGL_HdTextures.cpp`), including clamp-region textures
+  (`<hash>-r<w>x<h>-…`), hashed like PCSX2's `HashTextureLevel` unswizzled path.
+- FSR 1 (`GSH_OpenGL_Fsr.cpp`): a GLSL ES 3.0 port of AMD's EASU + RCAS (MIT). It runs in `FlipImpl`
+  only when the window is larger than the displayed image.
+
+**The other Play! patches**
+- `play-codegen.patch`: the WebAssembly JIT backend maps registers to wasm locals (VU1 ~20% faster).
+- `play-dependencies.patch`: build flags for native wasm exceptions + SIMD.
+
+**Updating:** `git pull`, then `tools/web/build.sh`. Changed patches are re-applied by themselves (Play!
+files the patch touches are restored first; build folders are kept). A changed
+`ps2recomp-web.patch` means a full game rebuild (1-3 hours); `tools/web/build.sh game` rebuilds only
+the game and refreshes `web-site`.
+
+**Regenerating the patches** (contributors), from the build trees:
+
+```sh
+# REPO = your nbastreet-v3-recomp checkout
+cd ~/NBAStreetRecomp/PS2Recomp-web && git diff <commit with ps2recomp.patch applied> HEAD -- . \
+    ':!ps2xRuntime/src/runner/register_functions.cpp' > "$REPO"/patches/ps2recomp-web.patch
+cd ~/NBAStreetRecomp/play && git add -N <new files> && git diff -- . ':!deps' > "$REPO"/patches/play.patch
+git -C deps/CodeGen diff > "$REPO"/patches/play-codegen.patch
+git -C deps/Dependencies diff > "$REPO"/patches/play-dependencies.patch
+```
+
+Check that they apply on clean checkouts of the pinned commits (`git apply --check`) before sending.
+
+**Measuring:**
+- `?debug` shows renderer statistics.
+- Every 5 s the log prints a `[webgs]` line: fps, GL time, texture uploads, HD textures loaded.
+- Chrome DevTools can profile each worker separately: the game thread, the VU1 worker, the GL thread.
+- Reference, a match on an M-series Mac: game thread ~31%, VU1 worker ~52%, GL thread ~35% busy.
+
+**Server:** HTTPS + COOP/COEP, precompressed Brotli and `Cache-Control: private, no-cache`
+(`tools/web/Caddyfile.server`); `/net` → `tools/web/net_relay.py` (online), `/diag` →
+`tools/web/diag_server.py` (optional diagnostics). The site serves your disc image: keep it private.
+
 ## Contributing
 
 Issues and pull requests are welcome. First read `docs/PORTING_NOTES.md` (Spanish): it explains the
