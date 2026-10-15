@@ -193,7 +193,10 @@ nativo están dentro de `__EMSCRIPTEN__`.
   región de clamp (`<hash>-r<an>x<al>-…`), con el mismo hash que la ruta sin swizzle de
   `HashTextureLevel` de PCSX2.
 - FSR 1 (`GSH_OpenGL_Fsr.cpp`): port a GLSL ES 3.0 de EASU + RCAS de AMD (MIT). Se aplica en
-  `FlipImpl` solo cuando la ventana es más grande que la imagen mostrada.
+  `FlipImpl` solo cuando la ventana es más grande que la imagen mostrada. Cálculo de color en mediump
+  (FP16 en GPUs de teléfono, como la ruta de media precisión de AMD); las zonas planas de 2x2 toman un
+  atajo bilineal (EASU limita a ese rango de todos modos), sin 8 de las 12 lecturas ni el análisis de
+  bordes.
 - Shaders compilados por adelantado: `PrecompileShaders` / `PumpShaderPrecompile` lanzan la
   compilación y el enlace sin esperar su estado (las imágenes HD también se suben de dos en dos por
   cuadro, no todas a la vez); `FinishShader` asigna los uniforms cuando el

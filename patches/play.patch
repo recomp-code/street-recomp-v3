@@ -972,10 +972,10 @@ index 7eb9460..6bd44cd 100644
 +	return true;
 +}
 diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL.h b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
-index 290deb7..571943c 100644
+index 290deb7..d475fb2 100644
 --- a/Source/gs/GSH_OpenGL/GSH_OpenGL.h
 +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL.h
-@@ -1,7 +1,11 @@
+@@ -1,7 +1,12 @@
  #pragma once
  
 +#include <chrono>
@@ -983,11 +983,12 @@ index 290deb7..571943c 100644
 +#include <map>
 +#include <tuple>
  #include <unordered_map>
++#include <unordered_set>
 +#include <deque>
  #include "../GSHandler.h"
  #include "../GsDebuggerInterface.h"
  #include "../GsCachedArea.h"
-@@ -99,6 +103,12 @@ private:
+@@ -99,6 +104,12 @@ private:
  		unsigned int alphaTestDepthTest_DepthFetch : 1;
  		unsigned int alphaTestDepthTestEqual_DepthFetch : 1;
  
@@ -1000,7 +1001,7 @@ index 290deb7..571943c 100644
  		bool isIndexedTextureSource() const
  		{
  			return texSourceMode == TEXTURE_SOURCE_MODE_IDX4 || texSourceMode == TEXTURE_SOURCE_MODE_IDX8;
-@@ -132,6 +142,7 @@ private:
+@@ -132,6 +143,7 @@ private:
  		GLuint shaderHandle;
  		GLuint framebufferHandle;
  		GLuint texture0Handle;
@@ -1008,7 +1009,7 @@ index 290deb7..571943c 100644
  		GLint texture0MinFilter;
  		GLint texture0MagFilter;
  		GLint texture0WrapS;
-@@ -172,9 +183,10 @@ private:
+@@ -172,9 +184,10 @@ private:
  		uint32 alphaRef;
  		float alphaFix;
  		float fogColor[3];
@@ -1021,7 +1022,7 @@ index 290deb7..571943c 100644
  
  	enum
  	{
-@@ -247,6 +259,14 @@ private:
+@@ -247,6 +260,14 @@ private:
  		Framework::OpenGl::CRenderbuffer m_colorBufferMs;
  
  		CGsCachedArea m_cachedArea;
@@ -1036,7 +1037,7 @@ index 290deb7..571943c 100644
  	};
  	typedef std::shared_ptr<CFramebuffer> FramebufferPtr;
  	typedef std::vector<FramebufferPtr> FramebufferList;
-@@ -307,8 +327,11 @@ private:
+@@ -307,8 +328,11 @@ private:
  
  	typedef std::vector<PRIM_VERTEX> VertexBuffer;
  
@@ -1048,7 +1049,7 @@ index 290deb7..571943c 100644
  	void InitializeRC();
  	void CheckExtensions();
  	void SetupTextureUpdaters();
-@@ -316,6 +339,9 @@ private:
+@@ -316,6 +340,9 @@ private:
  	void MakeLinearZOrtho(float*, float, float, float, float);
  	TEXTURE_INFO PrepareTexture(const TEX0&);
  	TEXTURE_INFO SearchTextureFramebuffer(const TEX0&);
@@ -1058,7 +1059,7 @@ index 290deb7..571943c 100644
  	GLuint PreparePalette(const TEX0&);
  
  	void ProcessPrim(uint64);
-@@ -429,6 +455,162 @@ private:
+@@ -429,6 +456,165 @@ private:
  	GLint m_copyToFbSrcSizeUniform = -1;
  
  	TextureCache m_textureCache;
@@ -1143,6 +1144,9 @@ index 290deb7..571943c 100644
 +	uint32 m_hdMemoGen = ~0U;
 +	uint32 m_hdMemoClut = ~0U;
 +	GLuint m_hdMemoHandle = 0;
++	uint32 m_hdMemoSlot = 0;
++	std::unordered_set<uint64> m_hdPackShapes; //bits | region << 32 of the pack's images
++	std::unordered_set<uint64> m_hdPackHashes; //their texture hashes
 +	FramebufferPtr m_currentFramebuffer;
 +	bool m_emulatedFetchActive = false;
 +	bool m_emulatedFetchDirty = true;
@@ -1223,10 +1227,10 @@ index 290deb7..571943c 100644
  	DepthbufferList m_depthbuffers;
 diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_Fsr.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_Fsr.cpp
 new file mode 100644
-index 0000000..6c10d29
+index 0000000..eae183d
 --- /dev/null
 +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_Fsr.cpp
-@@ -0,0 +1,280 @@
+@@ -0,0 +1,289 @@
 +//AMD FidelityFX Super Resolution 1 (FSR 1) on the final image: EASU scales the displayed
 +//framebuffer to the window (edge-adaptive, 12 taps) into a texture, then RCAS sharpens it onto
 +//the screen. GLSL ES 3.0 port of ffx_fsr1.h (FsrEasuF / FsrRcasF, MIT license, Copyright (c)
@@ -1253,12 +1257,15 @@ index 0000000..6c10d29
 +}
 +)";
 +
++	//Colour math in mediump (FP16 on phone GPUs, twice the throughput, like ffx_fsr1.h's FsrEasuH);
++	//positions in highp. Flat 2x2 neighbourhoods (most of a frame) take a bilinear shortcut: EASU
++	//clamps its result to the 2x2's range, so there it can't differ by more than that range.
 +	const char* g_fsrEasuShader = R"(
-+precision highp float;
++precision mediump float;
 +precision highp int;
 +uniform highp sampler2D g_source;
-+uniform vec2 g_scale;   //source pixels per output pixel
-+uniform ivec2 g_srcMax; //last source pixel
++uniform highp vec2 g_scale;   //source pixels per output pixel
++uniform ivec2 g_srcMax;       //last source pixel
 +out vec4 fragColor;
 +
 +vec3 Fetch(ivec2 p)
@@ -1277,13 +1284,13 @@ index 0000000..6c10d29
 +	float dc = lD - lC;
 +	float cb = lC - lB;
 +	float dirX = lD - lB;
-+	float lenX = clamp(abs(dirX) / max(max(abs(dc), abs(cb)), 1.0e-8), 0.0, 1.0);
++	float lenX = clamp(abs(dirX) / max(max(abs(dc), abs(cb)), 1.0e-4), 0.0, 1.0);
 +	dir.x += dirX * w;
 +	len += lenX * lenX * w;
 +	float ec = lE - lC;
 +	float ca = lC - lA;
 +	float dirY = lE - lA;
-+	float lenY = clamp(abs(dirY) / max(max(abs(ec), abs(ca)), 1.0e-8), 0.0, 1.0);
++	float lenY = clamp(abs(dirY) / max(max(abs(ec), abs(ca)), 1.0e-4), 0.0, 1.0);
 +	dir.y += dirY * w;
 +	len += lenY * lenY * w;
 +}
@@ -1309,19 +1316,27 @@ index 0000000..6c10d29
 +	//  e f g h
 +	//  i j k l
 +	//    n o
-+	vec2 pp = gl_FragCoord.xy * g_scale - 0.5;
-+	vec2 fp = floor(pp);
-+	pp -= fp;
++	highp vec2 pp = gl_FragCoord.xy * g_scale - 0.5;
++	highp vec2 fp = floor(pp);
 +	ivec2 p = ivec2(fp);
++	vec2 t = vec2(pp - fp);
++	vec3 fC = Fetch(p);
++	vec3 gC = Fetch(p + ivec2(1, 0));
++	vec3 jC = Fetch(p + ivec2(0, 1));
++	vec3 kC = Fetch(p + ivec2(1, 1));
++	vec3 min4 = min(min(fC, gC), min(jC, kC));
++	vec3 max4 = max(max(fC, gC), max(jC, kC));
++	vec3 range = max4 - min4;
++	if(max(range.r, max(range.g, range.b)) < (2.0 / 255.0))
++	{
++		fragColor = vec4(mix(mix(fC, gC, t.x), mix(jC, kC, t.x), t.y), 1.0);
++		return;
++	}
 +	vec3 bC = Fetch(p + ivec2(0, -1));
 +	vec3 cC = Fetch(p + ivec2(1, -1));
 +	vec3 eC = Fetch(p + ivec2(-1, 0));
-+	vec3 fC = Fetch(p);
-+	vec3 gC = Fetch(p + ivec2(1, 0));
 +	vec3 hC = Fetch(p + ivec2(2, 0));
 +	vec3 iC = Fetch(p + ivec2(-1, 1));
-+	vec3 jC = Fetch(p + ivec2(0, 1));
-+	vec3 kC = Fetch(p + ivec2(1, 1));
 +	vec3 lC = Fetch(p + ivec2(2, 1));
 +	vec3 nC = Fetch(p + ivec2(0, 2));
 +	vec3 oC = Fetch(p + ivec2(1, 2));
@@ -1330,14 +1345,14 @@ index 0000000..6c10d29
 +
 +	vec2 dir = vec2(0.0);
 +	float len = 0.0;
-+	EasuSet(dir, len, (1.0 - pp.x) * (1.0 - pp.y), bL, eL, fL, gL, jL);
-+	EasuSet(dir, len, pp.x * (1.0 - pp.y), cL, fL, gL, hL, kL);
-+	EasuSet(dir, len, (1.0 - pp.x) * pp.y, fL, iL, jL, kL, nL);
-+	EasuSet(dir, len, pp.x * pp.y, gL, jL, kL, lL, oL);
++	EasuSet(dir, len, (1.0 - t.x) * (1.0 - t.y), bL, eL, fL, gL, jL);
++	EasuSet(dir, len, t.x * (1.0 - t.y), cL, fL, gL, hL, kL);
++	EasuSet(dir, len, (1.0 - t.x) * t.y, fL, iL, jL, kL, nL);
++	EasuSet(dir, len, t.x * t.y, gL, jL, kL, lL, oL);
 +
 +	vec2 dir2 = dir * dir;
 +	float dirR = dir2.x + dir2.y;
-+	bool zro = dirR < (1.0 / 32768.0);
++	bool zro = dirR < (1.0 / 4096.0);
 +	dirR = zro ? 1.0 : inversesqrt(dirR);
 +	dir.x = zro ? 1.0 : dir.x;
 +	dir *= dirR;
@@ -1350,31 +1365,29 @@ index 0000000..6c10d29
 +
 +	vec3 aC = vec3(0.0);
 +	float aW = 0.0;
-+	EasuTap(aC, aW, vec2(0.0, -1.0) - pp, dir, len2, lob, clp, bC);
-+	EasuTap(aC, aW, vec2(1.0, -1.0) - pp, dir, len2, lob, clp, cC);
-+	EasuTap(aC, aW, vec2(-1.0, 1.0) - pp, dir, len2, lob, clp, iC);
-+	EasuTap(aC, aW, vec2(0.0, 1.0) - pp, dir, len2, lob, clp, jC);
-+	EasuTap(aC, aW, vec2(0.0, 0.0) - pp, dir, len2, lob, clp, fC);
-+	EasuTap(aC, aW, vec2(-1.0, 0.0) - pp, dir, len2, lob, clp, eC);
-+	EasuTap(aC, aW, vec2(1.0, 1.0) - pp, dir, len2, lob, clp, kC);
-+	EasuTap(aC, aW, vec2(2.0, 1.0) - pp, dir, len2, lob, clp, lC);
-+	EasuTap(aC, aW, vec2(2.0, 0.0) - pp, dir, len2, lob, clp, hC);
-+	EasuTap(aC, aW, vec2(1.0, 0.0) - pp, dir, len2, lob, clp, gC);
-+	EasuTap(aC, aW, vec2(1.0, 2.0) - pp, dir, len2, lob, clp, oC);
-+	EasuTap(aC, aW, vec2(0.0, 2.0) - pp, dir, len2, lob, clp, nC);
++	EasuTap(aC, aW, vec2(0.0, -1.0) - t, dir, len2, lob, clp, bC);
++	EasuTap(aC, aW, vec2(1.0, -1.0) - t, dir, len2, lob, clp, cC);
++	EasuTap(aC, aW, vec2(-1.0, 1.0) - t, dir, len2, lob, clp, iC);
++	EasuTap(aC, aW, vec2(0.0, 1.0) - t, dir, len2, lob, clp, jC);
++	EasuTap(aC, aW, vec2(0.0, 0.0) - t, dir, len2, lob, clp, fC);
++	EasuTap(aC, aW, vec2(-1.0, 0.0) - t, dir, len2, lob, clp, eC);
++	EasuTap(aC, aW, vec2(1.0, 1.0) - t, dir, len2, lob, clp, kC);
++	EasuTap(aC, aW, vec2(2.0, 1.0) - t, dir, len2, lob, clp, lC);
++	EasuTap(aC, aW, vec2(2.0, 0.0) - t, dir, len2, lob, clp, hC);
++	EasuTap(aC, aW, vec2(1.0, 0.0) - t, dir, len2, lob, clp, gC);
++	EasuTap(aC, aW, vec2(1.0, 2.0) - t, dir, len2, lob, clp, oC);
++	EasuTap(aC, aW, vec2(0.0, 2.0) - t, dir, len2, lob, clp, nC);
 +
 +	//No ringing: stay within the 2x2 around the sample
-+	vec3 min4 = min(min(fC, gC), min(jC, kC));
-+	vec3 max4 = max(max(fC, gC), max(jC, kC));
 +	fragColor = vec4(min(max4, max(min4, aC / aW)), 1.0);
 +}
 +)";
 +
 +	const char* g_fsrRcasShader = R"(
-+precision highp float;
++precision mediump float;
 +precision highp int;
 +uniform highp sampler2D g_source;
-+uniform vec4 g_viewport; //x, y, width, height of the picture on the screen
++uniform highp vec4 g_viewport; //x, y, width, height of the picture on the screen
 +uniform float g_sharpness; //exp2(-stops): 1 = sharpest
 +out vec4 fragColor;
 +
@@ -1403,8 +1416,8 @@ index 0000000..6c10d29
 +	//Largest negative lobe that keeps the result within [0, 1]
 +	const float peakX = 1.0;
 +	const float peakY = -4.0;
-+	vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1.0e-5));
-+	vec3 hitMax = (peakX - max(mx4, e)) / min(4.0 * mn4 + peakY, vec3(-1.0e-5));
++	vec3 hitMin = min(mn4, e) / max(4.0 * mx4, vec3(1.0e-4));
++	vec3 hitMax = (peakX - max(mx4, e)) / min(4.0 * mn4 + peakY, vec3(-1.0e-4));
 +	vec3 lobeRGB = max(-hitMin, hitMax);
 +	float lobe = max(-(0.25 - (1.0 / 16.0)), min(max(lobeRGB.r, max(lobeRGB.g, lobeRGB.b)), 0.0)) * g_sharpness;
 +	vec3 pix = (lobe * (b + d + h + f) + e) / (4.0 * lobe + 1.0);
@@ -1509,10 +1522,10 @@ index 0000000..6c10d29
 +}
 diff --git a/Source/gs/GSH_OpenGL/GSH_OpenGL_HdTextures.cpp b/Source/gs/GSH_OpenGL/GSH_OpenGL_HdTextures.cpp
 new file mode 100644
-index 0000000..5b71152
+index 0000000..da3718a
 --- /dev/null
 +++ b/Source/gs/GSH_OpenGL/GSH_OpenGL_HdTextures.cpp
-@@ -0,0 +1,466 @@
+@@ -0,0 +1,469 @@
 +//HD texture replacements in PCSX2's texture pack format.
 +//
 +//A pack file is named <texture hash>-<palette hash>-<bits>.png, where:
@@ -1652,6 +1665,9 @@ index 0000000..5b71152
 +		HD_TEXTURE texture;
 +		texture.name = line;
 +		m_hdIndex[std::make_tuple(uint64(hash), uint64(clutHash), bits, regionWidth | (regionHeight << 16))] = static_cast<uint32>(m_hdTextures.size());
++		//Quick rejections in HdLookup: most of the game's textures have no replacement
++		m_hdPackShapes.insert(uint64(bits) | (uint64(regionWidth | (regionHeight << 16)) << 32));
++		m_hdPackHashes.insert(uint64(hash));
 +		m_hdTextures.push_back(std::move(texture));
 +	}
 +	std::free(list);
@@ -1847,10 +1863,7 @@ index 0000000..5b71152
 +	if((tex0Reg == m_hdMemoTex0) && (clampReg == m_hdMemoClamp) && (m_hdGen == m_hdMemoGen) && (m_clutVersion == m_hdMemoClut))
 +	{
 +		if(m_hdMemoHandle != 0)
-+		{
-+			for(auto& texture : m_hdTextures)
-+				if(texture.handle == m_hdMemoHandle) texture.lastUse = m_hdFrame;
-+		}
++			m_hdTextures[m_hdMemoSlot].lastUse = m_hdFrame;
 +		return m_hdMemoHandle;
 +	}
 +	m_hdMemoTex0 = tex0Reg;
@@ -1894,15 +1907,8 @@ index 0000000..5b71152
 +	if(!hasX) x0 = 0, x1 = texW;
 +	if(!hasY) y0 = 0, y1 = texH;
 +	const uint32 regionName = (hasX ? (x1 - x0) : 0) | ((hasY ? (y1 - y0) : 0) << 16);
-+
-+	uint64 clutHash = 0;
-+	if(CGsPixelFormats::IsPsmIDTEX(tex0.nPsm))
-+	{
-+		if((tex0.nCPSM != PSMCT32) && (tex0.nCPSM != PSMCT24)) return 0;
-+		std::array<uint32, 256> clut;
-+		MakeLinearCLUT(tex0, clut);
-+		clutHash = XXH3_64bits(clut.data(), sizeof(uint32) * (CGsPixelFormats::IsPsmIDTEX4(tex0.nPsm) ? 16 : 256));
-+	}
++	const uint32 bits = tex0.nPsm | (tw << 6) | (th << 10);
++	if(!m_hdPackShapes.count(uint64(bits) | (uint64(regionName) << 32))) return 0; //no image of this format/size
 +
 +	//The texture's hash, again only when its memory changed. Whole blocks, unless the rectangle is
 +	//smaller than a block, cut horizontally or starts below the top (PCSX2 unswizzles those)
@@ -1928,8 +1934,17 @@ index 0000000..5b71152
 +			                            (y1 + (1 << layout.blockShiftY) - 1) >> layout.blockShiftY);
 +		cached.pageGenSum = HdPageGenSum(cached.firstPage, cached.pageCount);
 +	}
++	if(!m_hdPackHashes.count(cached.hash)) return 0; //not in the pack: no need for the palette's hash
 +
-+	const uint32 bits = tex0.nPsm | (tw << 6) | (th << 10);
++	uint64 clutHash = 0;
++	if(CGsPixelFormats::IsPsmIDTEX(tex0.nPsm))
++	{
++		if((tex0.nCPSM != PSMCT32) && (tex0.nCPSM != PSMCT24)) return 0;
++		std::array<uint32, 256> clut;
++		MakeLinearCLUT(tex0, clut);
++		clutHash = XXH3_64bits(clut.data(), sizeof(uint32) * (CGsPixelFormats::IsPsmIDTEX4(tex0.nPsm) ? 16 : 256));
++	}
++
 +	auto indexIterator = m_hdIndex.find(std::make_tuple(cached.hash, clutHash, bits, regionName));
 +	if(regionName != 0)
 +	{
@@ -1955,6 +1970,7 @@ index 0000000..5b71152
 +	{
 +		m_hdTexturesShown++;
 +		m_hdMemoHandle = texture.handle;
++		m_hdMemoSlot = slot;
 +		return texture.handle;
 +	}
 +#ifdef __EMSCRIPTEN__
