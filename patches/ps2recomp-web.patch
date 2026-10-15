@@ -3006,10 +3006,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..c09e4af
+index 0000000..0bcba7d
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,1240 @@
+@@ -0,0 +1,1246 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -3963,6 +3963,11 @@ index 0000000..c09e4af
 +					}
 +				}, list.c_str());
 +			}
++			std::printf("[webgs] image transfers: %u swizzled in the VU1 worker; on the GL thread: %u format, %u alignment, %u range, %u interrupted\n",
++			            gs.m_producerSwizzled, gs.m_producerDirect[0], gs.m_producerDirect[1], gs.m_producerDirect[2], gs.m_producerDirect[3]);
++			gs.m_producerSwizzled = 0;
++			for(uint32& count : gs.m_producerDirect)
++				count = 0;
 +			gs.m_slowestBatchMs = 0.0;
 +			for(double& slowest : gs.m_slowestMs)
 +				slowest = 0.0;
@@ -4128,6 +4133,7 @@ index 0000000..c09e4af
 +			h->gsWeb->EnableHdTextures("data/hd");
 +		h->gsWeb->SetHalfRateImage(g_halfRate);
 +		h->gsWeb->SetFsr(g_fsr);
++		h->gsWeb->SetProducerSwizzle(true); // texture uploads swizzled in the VIF1/VU1 worker, not here
 +		{
 +			// Shaders built ahead of time: the game's known variants, then the ones this browser
 +			// met in earlier sessions (IndexedDB). With KHR_parallel_shader_compile the driver

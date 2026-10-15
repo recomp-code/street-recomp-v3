@@ -201,6 +201,11 @@ nativo están dentro de `__EMSCRIPTEN__`.
   compilación y el enlace sin esperar su estado (las imágenes HD también se suben de dos en dos por
   cuadro, no todas a la vez); `FinishShader` asigna los uniforms cuando el
   programa ya está listo (`KHR_parallel_shader_compile`), o en el momento si un dibujo lo necesita.
+- Subidas de texturas (`GSHandler.cpp`, `SetProducerSwizzle`): las transferencias de PSMCT32/PSMT8/PSMT4 en
+  bloques completos se juntan en el hilo que alimenta al GS (VIF1/VU1), se reordenan ahí en bloques GS
+  de 256 bytes, y el hilo del GS solo compara y copia bloques, en el mismo orden que antes (cualquier
+  otra orden que llegue a mitad de una transferencia recibe antes los datos recibidos, como antes).
+  El hilo de GL pasó de ~40% a ~29% en un partido. Las líneas `[webgs] image transfers` cuentan ambos caminos.
 - Microprogramas de la VU (`ee/VuExecutor.cpp`): las particiones se recuerdan por (contenido de la
   micromemoria, inicio del bloque), así que al volver a cargar un microprograma se reutilizan sus
   bloques.

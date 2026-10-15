@@ -203,6 +203,11 @@ their own patches, and the few runtime changes shared with native code are behin
 - Shaders built ahead of time: `PrecompileShaders` / `PumpShaderPrecompile` start the compile and
   link without waiting for their status (HD images are also uploaded two per frame, not all at once); `FinishShader` binds uniforms once a program is built
   (`KHR_parallel_shader_compile`), or right away when a draw needs it.
+- Texture uploads (`GSHandler.cpp`, `SetProducerSwizzle`): host-to-local transfers of PSMCT32/PSMT8/PSMT4 in
+  whole blocks are gathered on the thread that feeds the GS (VIF1/VU1 worker), swizzled into 256-byte
+  GS blocks there, and the GS thread only compares and copies blocks, in the same order as before
+  (anything else sent to the GS thread mid-transfer first gets the data received so far, as before).
+  The GL thread's share in a match fell from ~40% to ~29%. `[webgs] image transfers` lines count both paths.
 - VU microprograms (`ee/VuExecutor.cpp`): partitions are remembered per (micro memory contents,
   block start), so swapping microprograms back in reuses their blocks.
 

@@ -2482,7 +2482,7 @@ index 01a1217..3d867f5 100644
  	return texInfo;
  }
 diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
-index 57e58ba..0c5bac6 100644
+index 57e58ba..55ebadf 100644
 --- a/Source/gs/GSHandler.cpp
 +++ b/Source/gs/GSHandler.cpp
 @@ -1,5 +1,6 @@
@@ -2508,7 +2508,16 @@ index 57e58ba..0c5bac6 100644
  	memset(&m_trxCtx, 0, sizeof(m_trxCtx));
  	m_nPMODE = 0;
  	m_nSMODE2 = 0x3; // Interlacing with fullframe
-@@ -285,6 +288,7 @@ void CGSHandler::SaveState(Framework::CZipArchiveWriter& archive)
+@@ -173,6 +176,8 @@ void CGSHandler::ResetBase()
+ #ifdef _DEBUG
+ 	m_transferCount = 0;
+ #endif
++	m_producerTransfer.active = false;
++	m_producerTransfer.data.clear();
+ 	m_framesInFlight = 0;
+ 	m_writeBufferSize = 0;
+ 	m_writeBufferProcessIndex = 0;
+@@ -285,6 +290,7 @@ void CGSHandler::SaveState(Framework::CZipArchiveWriter& archive)
  
  void CGSHandler::LoadState(Framework::CZipArchiveReader& archive)
  {
@@ -2516,7 +2525,53 @@ index 57e58ba..0c5bac6 100644
  	archive.BeginReadFile(STATE_RAM)->Read(GetRam(), RAMSIZE);
  	archive.BeginReadFile(STATE_REGS)->Read(m_nReg, sizeof(uint64) * CGSHandler::REGISTER_MAX);
  	archive.BeginReadFile(STATE_TRXCTX)->Read(&m_trxCtx, sizeof(TRXCONTEXT));
-@@ -978,30 +982,43 @@ bool CGSHandler::TransferWriteHandlerGeneric(const void* pData, uint32 nLength)
+@@ -622,6 +628,21 @@ void CGSHandler::FeedImageData(const void* data, uint32 length)
+ 	assert(m_writeBufferProcessIndex == m_writeBufferSize);
+ 	SubmitWriteBuffer();
+ 
++	if(m_producerTransfer.active)
++	{
++		//Gathered here, swizzled into GS blocks once complete (this thread), then the GS thread
++		//only compares and copies whole blocks (it did the per-pixel swizzling before)
++		auto& transfer = m_producerTransfer;
++		const uint32 take = std::min<uint32>(length, transfer.size - static_cast<uint32>(transfer.data.size()));
++		const uint8* bytes = reinterpret_cast<const uint8*>(data);
++		transfer.data.insert(transfer.data.end(), bytes, bytes + take);
++		if(transfer.data.size() == transfer.size)
++		{
++			ProducerFinishTransfer();
++		}
++		return;
++	}
++
+ #ifdef _DEBUG
+ 	m_transferCount++;
+ #endif
+@@ -693,6 +714,23 @@ void CGSHandler::ProcessWriteBuffer(const CGsPacketMetadata* metadata)
+ 			m_nCSR |= CSR_FINISH_EVENT;
+ 			NotifyEvent(CSR_FINISH_EVENT);
+ 			break;
++		case GS_REG_BITBLTBUF:
++			m_producerBitbltbuf = write.second;
++			break;
++		case GS_REG_TRXPOS:
++			m_producerTrxpos = write.second;
++			break;
++		case GS_REG_TRXREG:
++			m_producerTrxreg = write.second;
++			break;
++		case GS_REG_TRXDIR:
++			if(m_producerTransfer.active) ProducerFlushRaw();
++			if(m_producerSwizzle) ProducerBeginTransfer(write.second);
++			break;
++		case GS_REG_HWREG:
++			//Image data through a register: the GS thread takes it in order with the rest
++			if(m_producerTransfer.active) ProducerFlushRaw();
++			break;
+ 		case GS_REG_LABEL:
+ 		{
+ 			auto label = make_convertible<LABEL>(write.second);
+@@ -978,30 +1016,43 @@ bool CGSHandler::TransferWriteHandlerGeneric(const void* pData, uint32 nLength)
  
  	nLength /= sizeof(typename Storage::Unit);
  
@@ -2577,7 +2632,7 @@ index 57e58ba..0c5bac6 100644
  
  	return nDirty;
  }
-@@ -1037,44 +1054,80 @@ bool CGSHandler::TransferWriteHandlerPSMCT24(const void* pData, uint32 nLength)
+@@ -1037,44 +1088,80 @@ bool CGSHandler::TransferWriteHandlerPSMCT24(const void* pData, uint32 nLength)
  	return true;
  }
  
@@ -2682,7 +2737,7 @@ index 57e58ba..0c5bac6 100644
  
  	return dirty;
  }
-@@ -1484,19 +1537,34 @@ void CGSHandler::SyncCLUT(const TEX0& tex0)
+@@ -1484,19 +1571,34 @@ void CGSHandler::SyncCLUT(const TEX0& tex0)
  {
  	if(!ProcessCLD(tex0)) return;
  
@@ -2728,7 +2783,7 @@ index 57e58ba..0c5bac6 100644
  }
  
  bool CGSHandler::ProcessCLD(const TEX0& tex0)
-@@ -1584,7 +1652,7 @@ bool CGSHandler::ReadCLUT8_16(const TEX0& tex0)
+@@ -1584,7 +1686,7 @@ bool CGSHandler::ReadCLUT8_16(const TEX0& tex0)
  	return changed;
  }
  
@@ -2737,7 +2792,7 @@ index 57e58ba..0c5bac6 100644
  {
  	bool changed = false;
  
-@@ -1663,9 +1731,10 @@ void CGSHandler::ReadCLUT4(const TEX0& tex0)
+@@ -1663,9 +1765,10 @@ void CGSHandler::ReadCLUT4(const TEX0& tex0)
  	{
  		ProcessClutTransfer(tex0.nCSA, 0);
  	}
@@ -2749,7 +2804,7 @@ index 57e58ba..0c5bac6 100644
  {
  	assert(tex0.nCSA == 0);
  
-@@ -1742,6 +1811,7 @@ void CGSHandler::ReadCLUT8(const TEX0& tex0)
+@@ -1742,6 +1845,7 @@ void CGSHandler::ReadCLUT8(const TEX0& tex0)
  	{
  		ProcessClutTransfer(tex0.nCSA, 0);
  	}
@@ -2757,11 +2812,257 @@ index 57e58ba..0c5bac6 100644
  }
  
  bool CGSHandler::IsCompatibleFramebufferPSM(unsigned int psmFb, unsigned int psmTex)
+@@ -2185,6 +2289,12 @@ void CGSHandler::ThreadProc()
+ 
+ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitForCompletion, bool forceWaitForCompletion)
+ {
++	//Anything else that reaches the GS thread while a transfer is being gathered must find the
++	//data received so far already written, as before: send it as it came, the rest follows unswizzled
++	if(m_producerTransfer.active && !m_producerSending && !m_producerTransfer.data.empty())
++	{
++		ProducerFlushRaw();
++	}
+ 	if(!m_gsThreaded)
+ 	{
+ 		waitForCompletion = false;
+@@ -2195,9 +2305,216 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
+ 
+ void CGSHandler::SendGSCall(CMailBox::FunctionType&& function)
+ {
++	if(m_producerTransfer.active && !m_producerSending && !m_producerTransfer.data.empty())
++	{
++		ProducerFlushRaw();
++	}
+ 	m_mailBox.SendCall(std::move(function));
+ }
+ 
++//--- Host-to-local transfers swizzled by the producer -------------------------------------------
++//Only whole-block, in-range transfers of the formats games use for textures; the rest (and any
++//transfer interrupted by other GS work) takes the original path.
++
++void CGSHandler::ProducerBeginTransfer(uint64 trxDir)
++{
++	auto& transfer = m_producerTransfer;
++	transfer.active = false;
++	transfer.data.clear();
++	if((trxDir & 3) != 0)
++	{
++		m_producerDirect[4]++;
++		return;
++	}
++	auto bltBuf = make_convertible<BITBLTBUF>(m_producerBitbltbuf);
++	auto trxPos = make_convertible<TRXPOS>(m_producerTrxpos);
++	auto trxReg = make_convertible<TRXREG>(m_producerTrxreg);
++	uint32 blockWidth = 0, blockHeight = 0, bits = 0;
++	switch(bltBuf.nDstPsm)
++	{
++	case PSMCT32:
++		blockWidth = 8, blockHeight = 8, bits = 32;
++		break;
++	case PSMT8:
++		blockWidth = 16, blockHeight = 16, bits = 8;
++		break;
++	case PSMT4:
++		blockWidth = 32, blockHeight = 16, bits = 4;
++		break;
++	default:
++		m_producerDirect[0]++;
++		return;
++	}
++	const uint32 width = trxReg.nRRW, height = trxReg.nRRH;
++	if(((trxPos.nDSAX | width) % blockWidth) != 0 || ((trxPos.nDSAY | height) % blockHeight) != 0 || (width == 0) || (height == 0))
++	{
++		m_producerDirect[1]++;
++		return;
++	}
++	//(Odd buffer widths for PSMT8/PSMT4 use the same page arithmetic as the GS thread's handlers.)
++	if((bltBuf.nDstWidth == 0) || (trxPos.nDIR != 0) || (trxPos.nDSAX + width > 2048) || (trxPos.nDSAY + height > 2048))
++	{
++		m_producerDirect[2]++;
++		return;
++	}
++	transfer.psm = bltBuf.nDstPsm;
++	transfer.dstPtr = bltBuf.GetDstPtr();
++	transfer.dstWidth = bltBuf.nDstWidth;
++	transfer.x = trxPos.nDSAX;
++	transfer.y = trxPos.nDSAY;
++	transfer.width = width;
++	transfer.height = height;
++	transfer.size = (width * height * bits) / 8;
++	transfer.data.reserve(transfer.size);
++	transfer.active = true;
++}
++
++void CGSHandler::ProducerFlushRaw()
++{
++	auto& transfer = m_producerTransfer;
++	transfer.active = false;
++	if(transfer.data.empty()) return;
++	m_producerDirect[3]++;
++	const uint32 length = static_cast<uint32>(transfer.data.size());
++	uint8* imageData = new uint8[length + 0x10];
++	memcpy(imageData, transfer.data.data(), length);
++	memset(imageData + length, 0, 0x10);
++	transfer.data.clear();
++	m_producerSending = true;
++	SendGSCall(
++	    [this, imageData, length]() {
++		    FeedImageDataImpl(imageData, length);
++		    delete[] imageData;
++	    });
++	m_producerSending = false;
++}
++
++template <typename Storage>
++void CGSHandler::ProducerSwizzleBlocks(uint8* out, uint32 blockWidth, uint32 blockHeight)
++{
++	typedef typename Storage::Unit Unit;
++	const auto& transfer = m_producerTransfer;
++	const uint32* pageOffsets = CGsPixelFormats::CPixelIndexor<Storage>::GetPageOffsets();
++	const uint32 pagesPerRow = (transfer.dstWidth * 64) / Storage::PAGEWIDTH;
++	const Unit* src = reinterpret_cast<const Unit*>(transfer.data.data());
++	for(uint32 by = 0; by < transfer.height; by += blockHeight)
++	{
++		for(uint32 bx = 0; bx < transfer.width; bx += blockWidth)
++		{
++			uint32* blockAddress = reinterpret_cast<uint32*>(out);
++			uint8* block = out + 4;
++			for(uint32 py = 0; py < blockHeight; py++)
++			{
++				const uint32 y = transfer.y + by + py;
++				const uint32* rowOffsets = pageOffsets + (y % Storage::PAGEHEIGHT) * Storage::PAGEWIDTH;
++				const uint32 rowPage = (y / Storage::PAGEHEIGHT) * pagesPerRow;
++				const Unit* srcRow = src + (by + py) * transfer.width + bx;
++				for(uint32 px = 0; px < blockWidth; px++)
++				{
++					const uint32 x = transfer.x + bx + px;
++					const uint32 address = transfer.dstPtr + ((x / Storage::PAGEWIDTH) + rowPage) * CGsPixelFormats::PAGESIZE + rowOffsets[x % Storage::PAGEWIDTH];
++					if((py == 0) && (px == 0)) *blockAddress = (address & ~0xFFU) & (RAMSIZE - 1);
++					memcpy(block + (address & 0xFF), &srcRow[px], sizeof(Unit));
++				}
++			}
++			out += 4 + 256;
++		}
++	}
++}
++
++void CGSHandler::ProducerSwizzleBlocksPSMT4(uint8* out)
++{
++	typedef CGsPixelFormats::STORAGEPSMT4 Storage;
++	const auto& transfer = m_producerTransfer;
++	const uint32* places = GetPsmt4PagePlaces();
++	const uint32 pagesPerRow = (transfer.dstWidth * 64) / Storage::PAGEWIDTH;
++	const uint8* src = transfer.data.data();
++	for(uint32 by = 0; by < transfer.height; by += 16)
++	{
++		for(uint32 bx = 0; bx < transfer.width; bx += 32)
++		{
++			uint32* blockAddress = reinterpret_cast<uint32*>(out);
++			uint8* block = out + 4;
++			memset(block, 0, 256);
++			for(uint32 py = 0; py < 16; py++)
++			{
++				const uint32 y = transfer.y + by + py;
++				const uint32* rowPlaces = places + (y % Storage::PAGEHEIGHT) * Storage::PAGEWIDTH;
++				const uint32 rowPage = (y / Storage::PAGEHEIGHT) * pagesPerRow;
++				const uint32 rowStart = (by + py) * transfer.width + bx; //pixel index in the stream
++				for(uint32 px = 0; px < 32; px++)
++				{
++					const uint32 x = transfer.x + bx + px;
++					const uint32 place = rowPlaces[x % Storage::PAGEWIDTH];
++					const uint32 address = transfer.dstPtr + ((x / Storage::PAGEWIDTH) + rowPage) * CGsPixelFormats::PAGESIZE + (place >> 5);
++					if((py == 0) && (px == 0)) *blockAddress = (address & ~0xFFU) & (RAMSIZE - 1);
++					const uint32 i = rowStart + px;
++					const uint32 pixel = (src[i >> 1] >> ((i & 1) * 4)) & 0x0F;
++					const uint32 shift = place & 0x1F;
++					block[(address & 0xFF) + (shift >> 3)] |= static_cast<uint8>(pixel << (shift & 4));
++				}
++			}
++			out += 4 + 256;
++		}
++	}
++}
++
++void CGSHandler::ProducerFinishTransfer()
++{
++	auto& transfer = m_producerTransfer;
++	transfer.active = false;
++	m_producerSwizzled++;
++	uint32 blockWidth = 8, blockHeight = 8;
++	if(transfer.psm == PSMT8) blockWidth = 16, blockHeight = 16;
++	if(transfer.psm == PSMT4) blockWidth = 32, blockHeight = 16;
++	const uint32 blockCount = (transfer.width / blockWidth) * (transfer.height / blockHeight);
++	uint8* blocks = new uint8[blockCount * (4 + 256)];
++	switch(transfer.psm)
++	{
++	case PSMCT32:
++		ProducerSwizzleBlocks<CGsPixelFormats::STORAGEPSMCT32>(blocks, 8, 8);
++		break;
++	case PSMT8:
++		ProducerSwizzleBlocks<CGsPixelFormats::STORAGEPSMT8>(blocks, 16, 16);
++		break;
++	case PSMT4:
++		ProducerSwizzleBlocksPSMT4(blocks);
++		break;
++	}
++	const uint32 length = transfer.size;
++	transfer.data.clear();
++	m_producerSending = true;
++	SendGSCall(
++	    [this, blocks, blockCount, length]() {
++		    ApplyTransferBlocks(blocks, blockCount, length);
++		    delete[] blocks;
++	    });
++	m_producerSending = false;
++}
++
++//GS thread: the transfer's data, already in GS block order
++void CGSHandler::ApplyTransferBlocks(const uint8* blocks, uint32 blockCount, uint32 length)
++{
++	if(m_trxCtx.nSize == 0) return; //no transfer expected (as FeedImageDataImpl)
++	bool dirty = false;
++	for(uint32 i = 0; i < blockCount; i++, blocks += 4 + 256)
++	{
++		uint32 address = 0;
++		memcpy(&address, blocks, 4);
++		if(memcmp(m_pRAM + address, blocks + 4, 256) != 0)
++		{
++			memcpy(m_pRAM + address, blocks + 4, 256);
++			dirty = true;
++		}
++	}
++	m_trxCtx.nDirty |= dirty;
++	m_trxCtx.nSize -= std::min(length, m_trxCtx.nSize);
++	if(m_trxCtx.nSize == 0)
++	{
++		ProcessHostToLocalTransfer();
++	}
++}
++
+ void CGSHandler::ProcessSingleFrame()
+ {
+ 	assert(!m_gsThreaded);
 diff --git a/Source/gs/GSHandler.h b/Source/gs/GSHandler.h
-index 66bfe59..fd1330b 100644
+index 66bfe59..4f66bcc 100644
 --- a/Source/gs/GSHandler.h
 +++ b/Source/gs/GSHandler.h
-@@ -901,6 +901,14 @@ public:
+@@ -851,6 +851,15 @@ public:
+ 	void ResetVBlank();
+ 
+ 	void FeedImageData(const void*, uint32);
++	//Host-to-local image transfers swizzled on the thread that feeds the GS (the producer) instead of
++	//the GS thread: see FeedImageData. Off by default.
++	void SetProducerSwizzle(bool enabled)
++	{
++		m_producerSwizzle = enabled;
++	}
++	//Statistics (producer thread): transfers swizzled ahead / left to the GS thread, by reason
++	uint32 m_producerSwizzled = 0;
++	uint32 m_producerDirect[5] = {}; //format, alignment, range/width, interrupted, other direction
+ 	void ReadImageData(void*, uint32);
+ 
+ 	inline void WriteRegister(const RegisterWrite& write)
+@@ -901,6 +910,14 @@ public:
  	void SendGSCall(const CMailBox::FunctionType&, bool = false, bool = false);
  
  	void ProcessSingleFrame();
@@ -2776,12 +3077,35 @@ index 66bfe59..fd1330b 100644
  
  	FlipCompleteEvent OnFlipComplete;
  	NewFrameEvent OnNewFrame;
-@@ -1080,8 +1088,10 @@ protected:
+@@ -1080,8 +1097,33 @@ protected:
  	bool ReadCLUT4_16(const TEX0&);
  	template <typename Indexor>
  	bool ReadCLUT8_16(const TEX0&);
 -	void ReadCLUT4(const TEX0&);
 -	void ReadCLUT8(const TEX0&);
++	struct PRODUCER_TRANSFER
++	{
++		bool active = false;
++		uint32 psm = 0;
++		uint32 dstPtr = 0;
++		uint32 dstWidth = 0; //BITBLTBUF.DBW
++		uint32 x = 0, y = 0, width = 0, height = 0;
++		uint32 size = 0; //bytes the transfer takes
++		std::vector<uint8> data;
++	};
++	void ProducerBeginTransfer(uint64 trxDir);
++	void ProducerFlushRaw();
++	void ProducerFinishTransfer();
++	template <typename Storage>
++	void ProducerSwizzleBlocks(uint8*, uint32 blockWidth, uint32 blockHeight);
++	void ProducerSwizzleBlocksPSMT4(uint8*);
++	void ApplyTransferBlocks(const uint8*, uint32 blockCount, uint32 length);
++	bool m_producerSwizzle = false;
++	bool m_producerSending = false;
++	PRODUCER_TRANSFER m_producerTransfer;
++	uint64 m_producerBitbltbuf = 0;
++	uint64 m_producerTrxpos = 0;
++	uint64 m_producerTrxreg = 0;
 +	bool ReadCLUT4(const TEX0&);
 +	bool ReadCLUT8(const TEX0&);
 +	uint64 m_lastClutLoadKey = ~0ULL;
@@ -2789,7 +3113,7 @@ index 66bfe59..fd1330b 100644
  
  	static bool IsCompatibleFramebufferPSM(unsigned int, unsigned int);
  
-@@ -1107,6 +1117,10 @@ protected:
+@@ -1107,6 +1149,10 @@ protected:
  	uint8* m_pRAM = nullptr;
  
  	uint16* m_pCLUT = nullptr;
