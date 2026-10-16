@@ -119,10 +119,11 @@ nbastreet-v3-recomp/tools/web/serve.sh      # después abre http://localhost:808
   distintas (camisetas, objetos de las canchas, algunos textos de menú), así que la mayor parte de
   la imagen queda con el detalle original del juego.
 - **Sonido limpio:**
-  - SPU2 con la interpolación gaussiana del hardware, barridos de volumen y limitación suave de picos;
+  - el SPU2 (procesador de sonido) de PCSX2: reverberación, ruido, modulación de tono, los tiempos
+    de DMA del hardware e interpolación gaussiana, con un limitador de picos a la salida;
   - sale por un AudioWorklet con búfer adaptativo;
-  - el tiempo emulado avanza de forma continua, así que la música y los comentarios en streaming
-    nunca se repiten ni chasquean.
+  - el tiempo emulado avanza de forma continua y el IOP va al paso del EE, así que la música, los
+    comentarios y el sonido de los vídeos nunca se repiten, zumban ni chasquean.
 - **Online:** el mismo servidor de la comunidad que la versión de PC. El adaptador de red del juego
   habla por un solo WebSocket con un pequeño relay (`tools/web/net_relay.py`) que solo puede llegar al
   servidor del juego.
