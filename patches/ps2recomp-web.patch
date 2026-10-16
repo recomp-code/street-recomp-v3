@@ -1756,7 +1756,7 @@ index 31a296b..f3532df 100644
      std::vector<ScheduledEvent> m_deadlines;
      std::deque<GuestInvocation> m_pendingInvocations;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index f09ec48..b868392 100644
+index f09ec48..3f282c3 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -10,6 +10,7 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
@@ -1824,7 +1824,7 @@ index f09ec48..b868392 100644
  bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
  {
      accountCycles(cycles);
-@@ -541,6 +585,71 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -541,6 +585,77 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return true;
      }
  
@@ -1839,7 +1839,7 @@ index f09ec48..b868392 100644
 +    // bursts (choppy sound, uneven frames). Sleeping is dropped for good if wake-ups are late.
 +    static bool s_sleepUnreliable = false;
 +    static uint32_t s_sleeps = 0u, s_lateSleeps = 0u;
-+    static double s_maxLateMs = 0.0;
++    static double s_maxLateMs = 0.0, s_sleptMs = 0.0;
 +    static auto s_sleepReport = std::chrono::steady_clock::now();
 +    if (running != nullptr && hostDeadline != INT64_MAX && !s_sleepUnreliable && eeIdleLoopAt(running->activeContext().pc))
 +    {
@@ -1864,7 +1864,12 @@ index f09ec48..b868392 100644
 +            s_maxLateMs = std::max(s_maxLateMs, lateMs);
 +            if (now - s_sleepReport >= std::chrono::seconds(5))
 +            {
-+                std::printf("[sched] idle sleeps %u, %u woke >4 ms late (max %.0f ms)\n", s_sleeps, s_lateSleeps, s_maxLateMs);
++                // Time asleep in the game's frame waits: the rest is the game thread's load (game
++                // code, IOP, sound); near 100% it can't keep up with the frame rate
++                const double windowMs = std::chrono::duration<double, std::milli>(now - s_sleepReport).count();
++                std::printf("[sched] idle sleeps %u, %u woke >4 ms late (max %.0f ms); game thread %.0f%% busy\n", s_sleeps, s_lateSleeps,
++                            s_maxLateMs, windowMs > 0.0 ? 100.0 * (1.0 - s_sleptMs / windowMs) : 0.0);
++                s_sleptMs = 0.0;
 +                if (s_sleeps >= 200u && s_lateSleeps * 20u > s_sleeps)
 +                {
 +                    s_sleepUnreliable = true;
@@ -1875,6 +1880,7 @@ index f09ec48..b868392 100644
 +                s_sleepReport = now;
 +            }
 +            const uint64_t ns = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count());
++            s_sleptMs += static_cast<double>(ns) / 1e6;
 +            last = now;
 +            // Up to (not past) the deadline's cycle: reaching it stays with the logic above
 +            const uint64_t limit = m_nextHostDeadlineCycle.load(std::memory_order_acquire);
@@ -1896,7 +1902,7 @@ index f09ec48..b868392 100644
      renewTimeSlice();
      return false;
  }
-@@ -1946,9 +2055,9 @@ void EeScheduler::makeRunning(GuestThread &item)
+@@ -1946,9 +2061,9 @@ void EeScheduler::makeRunning(GuestThread &item)
          struct Slot { uint64_t ticks = 0; uint32_t entry = 0; int priority = 0; uint32_t switches = 0; };
          static Slot s_slots[256];
          static int s_lastId = -1;
@@ -1908,7 +1914,7 @@ index f09ec48..b868392 100644
          if (s_lastId >= 0)
              s_slots[s_lastId & 255].ticks += tsc - s_lastTsc;
          s_lastTsc = tsc;
-@@ -2206,11 +2315,17 @@ void EeScheduler::processDueDeadlines()
+@@ -2206,11 +2321,17 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -1928,7 +1934,7 @@ index f09ec48..b868392 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -2293,6 +2408,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -2293,6 +2414,22 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }
@@ -3006,10 +3012,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..0bcba7d
+index 0000000..3839525
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,1246 @@
+@@ -0,0 +1,1533 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -3051,11 +3057,15 @@ index 0000000..0bcba7d
 +#include <pthread.h>
 +#include <unistd.h>
 +
++#include <algorithm>
 +#include <array>
 +#include <map>
 +#include <atomic>
 +#include <cstdio>
++#include <condition_variable>
 +#include <cstdlib>
++#include <deque>
++#include <mutex>
 +#include <cstring>
 +#include <iterator>
 +#include <memory>
@@ -3207,6 +3217,28 @@ index 0000000..0bcba7d
 +		std::map<uint32_t, uint32_t> vifRegLast;
 +		CVpu::VuStateChangedEvent::Connection vuStateConnection;
 +		CGSHandler::NewFrameEvent::Connection newFrameConnection;
++
++		// The GIF thread (GifThread): the VIF1/VU1 worker queues everything for the GIF and the
++		// GS here, in order, and goes on with the next microprogram meanwhile
++		struct GifItem
++		{
++			uint8_t kind = 0;
++			uint8_t path = 0;
++			uint32_t value = 0;
++			std::vector<uint8_t> data;
++			void* ptr = nullptr;
++			bool* done = nullptr;
++		};
++		std::mutex gifMutex;
++		std::condition_variable gifHasWork, gifHasRoom, gifDone;
++		std::deque<GifItem> gifQueue;
++		size_t gifQueuedBytes = 0;
++		size_t gifUnsignalledBytes = 0; // queued since the GIF thread was last woken
++		bool gifWaiting = false;        // the GIF thread sleeps on gifHasWork
++		bool gifProducerWaiting = false;
++		std::deque<std::pair<uint32_t, std::vector<uint8_t>>> gifDeferred; // waiting for another path's packet
++		double gifIdleMs = 0.0, gifQueueWaitMs = 0.0;
++		std::unique_ptr<CGIF::IAsyncSink> gifSink;
 +	};
 +
 +	Host* g_host = nullptr;
@@ -3419,6 +3451,275 @@ index 0000000..0bcba7d
 +		}
 +	}
 +
++	enum : uint8_t
++	{
++		kGifPackets = 1,
++		kGifVSync,
++		kGifReadFifo2,
++		kGifPrivRegs,
++		kGifPath3Mask,
++		kGifReadImage,
++	};
++	constexpr size_t kGifQueueLimit = 16u << 20; // the VU1 worker waits beyond this (a few frames' worth)
++
++	// Waking another thread is expensive in WebAssembly (it cost the VU1 worker ~16% when done for
++	// each of the hundreds of packets per frame): the GIF thread is woken at frame ends, for work
++	// someone waits for, and when enough has piled up; it drains everything queued each time.
++	constexpr size_t kGifWakeBytes = 256u << 10;
++
++	void GifEnqueue(Host& h, Host::GifItem&& item)
++	{
++		const bool urgent = (item.kind == kGifVSync) || (item.kind == kGifReadImage) || (item.kind == kGifReadFifo2);
++		std::unique_lock<std::mutex> lock(h.gifMutex);
++		if(h.gifQueuedBytes > kGifQueueLimit)
++		{
++			const double waitStart = emscripten_get_now();
++			if(h.gifWaiting)
++			{
++				h.gifWaiting = false;
++				h.gifHasWork.notify_one();
++			}
++			h.gifProducerWaiting = true;
++			h.gifHasRoom.wait(lock, [&]() { return h.gifQueuedBytes <= kGifQueueLimit / 2; });
++			h.gifProducerWaiting = false;
++			h.gifQueueWaitMs += emscripten_get_now() - waitStart;
++		}
++		const size_t bytes = item.data.size() + 64;
++		h.gifQueuedBytes += bytes;
++		h.gifUnsignalledBytes += bytes;
++		h.gifQueue.push_back(std::move(item));
++		const bool wake = h.gifWaiting && (urgent || (h.gifUnsignalledBytes >= kGifWakeBytes));
++		if(wake)
++		{
++			h.gifWaiting = false;
++			h.gifUnsignalledBytes = 0;
++		}
++		lock.unlock();
++		if(wake) h.gifHasWork.notify_one();
++	}
++
++	void GifEnqueuePackets(Host& h, uint32_t pathIndex, const uint8_t* data, uint32_t size)
++	{
++		Host::GifItem item;
++		item.kind = kGifPackets;
++		item.path = static_cast<uint8_t>(pathIndex);
++		item.data.assign(data, data + size);
++		GifEnqueue(h, std::move(item));
++	}
++
++	// Bytes of the GIF packet (tags up to the one with EOP, and their data) at `start` in VU1 data
++	// memory, which it may wrap around. XGKICK hands the GIF a packet the VU program may overwrite
++	// right after, so the worker copies exactly that much.
++	uint32_t GifPacketLength(const uint8_t* memory, uint32_t memorySize, uint32_t start)
++	{
++		uint32_t offset = 0;
++		while(offset < memorySize)
++		{
++			uint64_t tag;
++			std::memcpy(&tag, memory + ((start + offset) % memorySize), sizeof(tag));
++			const uint32_t loops = static_cast<uint32_t>(tag & 0x7FFF);
++			const bool eop = ((tag >> 15) & 1) != 0;
++			const uint32_t flag = static_cast<uint32_t>((tag >> 58) & 3);
++			uint32_t regs = static_cast<uint32_t>(tag >> 60);
++			if(regs == 0) regs = 16;
++			offset += 16;
++			if(flag == 0)
++				offset += loops * regs * 16; // PACKED
++			else if(flag == 1)
++				offset += ((loops * regs + 1) / 2) * 16; // REGLIST
++			else
++				offset += loops * 16; // IMAGE
++			if(eop) break;
++		}
++		return std::min(offset, memorySize);
++	}
++
++	void GifKick(Host& h, uint32_t value)
++	{
++		const uint32_t start = (value & 0x3FF) * 16;
++		const uint32_t length = GifPacketLength(h.vuMem1, static_cast<uint32_t>(PS2::VUMEM1SIZE), start);
++		Host::GifItem item;
++		item.kind = kGifPackets;
++		item.path = 1;
++		item.data.resize(length);
++		const uint32_t first = std::min<uint32_t>(length, static_cast<uint32_t>(PS2::VUMEM1SIZE) - start);
++		std::memcpy(item.data.data(), h.vuMem1 + start, first);
++		std::memcpy(item.data.data() + first, h.vuMem1, length - first);
++		GifEnqueue(h, std::move(item));
++	}
++
++	// GIF thread: packets of one path; if another path is in the middle of a packet the GIF won't
++	// take them yet, so they wait (in order) until that packet's end arrives
++	bool GifTryPackets(Host& h, uint32_t pathIndex, std::vector<uint8_t>& data, uint32_t& done)
++	{
++		while(done < data.size())
++		{
++			const uint32_t size = static_cast<uint32_t>(data.size());
++			const uint32_t n = h.gif->ProcessMultiplePackets(data.data(), size, done, size, CGsPacketMetadata(pathIndex));
++			if(n == 0) return false;
++			done += n;
++		}
++		return true;
++	}
++
++	void GifRunItem(Host& h, Host::GifItem& item)
++	{
++		switch(item.kind)
++		{
++		case kGifPackets:
++			h.gifDeferred.emplace_back(item.path, std::move(item.data));
++			break;
++		case kGifVSync:
++		{
++			if(g_traceState == 2)
++			{
++				h.gsWeb->traceOn = false;
++				g_traceState = 0;
++				std::printf("[trace] end\n");
++			}
++			else if(g_traceState == 1)
++			{
++				g_traceState = 2;
++				h.gsWeb->traceOn = true;
++				h.gsWeb->traceLines = 0;
++				std::printf("[trace] begin\n");
++			}
++			// Queues the frame's end and the flip for the GL thread. With two frames already
++			// queued (Play!'s MAX_INFLIGHT_FRAMES) this waits: the picture never lags far behind.
++			const double waitStart = emscripten_get_now();
++			h.gs->SetVBlank();
++			h.gs->ResetVBlank();
++			h.vblankWaitMs += emscripten_get_now() - waitStart;
++			break;
++		}
++		case kGifReadFifo2:
++		{
++			std::vector<uint8_t> discard((static_cast<size_t>(item.value) + 1) * 16);
++			h.gs->ReadImageData(discard.data(), item.value * 16);
++			h.gs->SendGSCall([]() {}, true, true); // the GL thread has read it: the buffer can go
++			break;
++		}
++		case kGifPrivRegs:
++			std::memcpy(h.privRegs.data(), item.data.data(), std::min(item.data.size(), h.privRegs.size()));
++			ApplyPrivRegisters(h);
++			break;
++		case kGifPath3Mask:
++			h.gif->SetPath3Masked(item.value != 0);
++			break;
++		case kGifReadImage:
++		{
++			h.gs->ReadImageData(item.ptr, item.value);
++			{
++				std::lock_guard<std::mutex> lock(h.gifMutex);
++				*item.done = true;
++			}
++			h.gifDone.notify_all();
++			break;
++		}
++		}
++		// Packets in arrival order, except that while a path is in the middle of a packet the GIF
++		// only takes that path's data (its continuation may come after other paths' packets)
++		while(!h.gifDeferred.empty())
++		{
++			auto next = h.gifDeferred.begin();
++			const uint32_t activePath = h.gif->GetActivePath();
++			if(activePath != 0)
++			{
++				next = std::find_if(h.gifDeferred.begin(), h.gifDeferred.end(),
++				                    [activePath](const auto& packets) { return packets.first == activePath; });
++				if(next == h.gifDeferred.end())
++					break; // the rest of that packet hasn't arrived yet
++			}
++			uint32_t done = 0;
++			if(GifTryPackets(h, next->first, next->second, done))
++			{
++				h.gifDeferred.erase(next);
++			}
++			else
++			{
++				next->second.erase(next->second.begin(), next->second.begin() + done);
++				if(done == 0)
++				{
++					std::printf("[webgs] GIF path %u refused while path %u is active\n", next->first, activePath);
++					h.gifDeferred.erase(next); // can't happen; don't wedge the GIF
++				}
++			}
++		}
++	}
++
++	void* GifThread(void* arg)
++	{
++		Host& h = *static_cast<Host*>(arg);
++		std::deque<Host::GifItem> batch;
++		for(;;)
++		{
++			{
++				std::unique_lock<std::mutex> lock(h.gifMutex);
++				if(h.gifQueue.empty())
++				{
++					const double waitStart = emscripten_get_now();
++					h.gifWaiting = true;
++					h.gifHasWork.wait(lock, [&]() { return !h.gifWaiting; });
++					h.gifIdleMs += emscripten_get_now() - waitStart;
++				}
++				h.gifWaiting = false;
++				h.gifUnsignalledBytes = 0;
++				batch.swap(h.gifQueue);
++			}
++			size_t bytes = 0;
++			for(auto& item : batch)
++			{
++				bytes += item.data.size() + 64; // before: GifRunItem may move the data away
++				GifRunItem(h, item);
++			}
++			batch.clear();
++			bool producerWaiting;
++			{
++				std::lock_guard<std::mutex> lock(h.gifMutex);
++				h.gifQueuedBytes -= bytes;
++				producerWaiting = h.gifProducerWaiting;
++			}
++			if(producerWaiting) h.gifHasRoom.notify_all();
++		}
++		return nullptr;
++	}
++
++	// What Play!'s VIF1 sends to the GIF (DIRECT, MSKPATH3, image read-backs), through the queue
++	class GifSink : public CGIF::IAsyncSink
++	{
++	public:
++		explicit GifSink(Host& host)
++		    : m_host(host)
++		{
++		}
++		void QueuePackets(const uint8* data, uint32 size, uint32 pathIndex) override
++		{
++			GifEnqueuePackets(m_host, pathIndex, data, size);
++		}
++		void QueuePath3Mask(bool masked) override
++		{
++			Host::GifItem item;
++			item.kind = kGifPath3Mask;
++			item.value = masked ? 1 : 0;
++			GifEnqueue(m_host, std::move(item));
++		}
++		void ReadImageData(void* data, uint32 size) override
++		{
++			bool done = false;
++			Host::GifItem item;
++			item.kind = kGifReadImage;
++			item.ptr = data;
++			item.value = size;
++			item.done = &done;
++			GifEnqueue(m_host, std::move(item));
++			std::unique_lock<std::mutex> lock(m_host.gifMutex);
++			m_host.gifDone.wait(lock, [&]() { return done; });
++		}
++
++	private:
++		Host& m_host;
++	};
++
 +	void RunVu1(Host& h)
 +	{
 +		const double start = emscripten_get_now();
@@ -3584,24 +3885,7 @@ index 0000000..0bcba7d
 +		if(!pathIndex || !size)
 +			return;
 +		h.pathBytes[pathIndex] += size;
-+		uint32_t done = 0;
-+		int stalls = 0;
-+		while(done < size)
-+		{
-+			const uint32_t n = h.gif->ProcessMultiplePackets(data, size, done, size, CGsPacketMetadata(pathIndex));
-+			if(n == 0)
-+			{
-+				// Another path has the GIF: let the VU finish its XGKICK first.
-+				RunVu1(h);
-+				if(++stalls > 64)
-+				{
-+					std::printf("[webgs] GIF path %u busy, dropping %u bytes\n", pathIndex, size - done);
-+					break;
-+				}
-+				continue;
-+			}
-+			done += n;
-+		}
++		GifEnqueuePackets(h, pathIndex, data, size); // the GIF thread arbitrates the paths
 +	}
 +
 +	// Processes whole packets until a vsync (drawn) or the data runs out. True if a frame was drawn.
@@ -3629,9 +3913,12 @@ index 0000000..0bcba7d
 +			const uint64_t total = 8 + headerBytes + stateSize + kPrivRegsSize;
 +			if(Available(h) < total)
 +				return false;
-+			Peek(h, 8 + headerBytes + stateSize, h.privRegs.data(), kPrivRegsSize);
++			Host::GifItem regs;
++			regs.kind = kGifPrivRegs;
++			regs.data.resize(kPrivRegsSize);
++			Peek(h, 8 + headerBytes + stateSize, regs.data.data(), kPrivRegsSize);
 +			Consume(h, total);
-+			ApplyPrivRegisters(h);
++			GifEnqueue(h, std::move(regs));
 +			h.headerDone = true;
 +			std::printf("[webgs] live GS stream connected\n");
 +		}
@@ -3693,25 +3980,9 @@ index 0000000..0bcba7d
 +				Consume(h, 2);
 +				h.nVsync++;
 +				h.totalVsyncs++;
-+				if(g_traceState == 2)
-+				{
-+					h.gsWeb->traceOn = false;
-+					g_traceState = 0;
-+					std::printf("[trace] end\n");
-+				}
-+				else if(g_traceState == 1)
-+				{
-+					g_traceState = 2;
-+					h.gsWeb->traceOn = true;
-+					h.gsWeb->traceLines = 0;
-+					std::printf("[trace] begin\n");
-+				}
-+				// Queues the frame's end and the flip for the page thread. With two frames already
-+				// queued (Play!'s MAX_INFLIGHT_FRAMES) this waits: the picture never lags far behind.
-+				const double waitStart = emscripten_get_now();
-+				h.gs->SetVBlank();
-+				h.gs->ResetVBlank();
-+				h.vblankWaitMs += emscripten_get_now() - waitStart;
++				Host::GifItem item;
++				item.kind = kGifVSync;
++				GifEnqueue(h, std::move(item));
 +				return true;
 +			}
 +			case kTypeReadFifo2:
@@ -3721,19 +3992,23 @@ index 0000000..0bcba7d
 +				const uint32_t qwc = PeekValue<uint32_t>(h, 1);
 +				Consume(h, 5);
 +				h.nFifo++;
-+				std::vector<uint8_t> discard((static_cast<size_t>(qwc) + 1) * 16);
-+				h.gs->ReadImageData(discard.data(), qwc * 16);
-+				h.gs->SendGSCall([]() {}, true, true); // the page thread has read it: the buffer can go
++				Host::GifItem item;
++				item.kind = kGifReadFifo2;
++				item.value = qwc;
++				GifEnqueue(h, std::move(item));
 +				break;
 +			}
 +			case kTypeRegisters:
 +			{
 +				if(avail < 1 + kPrivRegsSize)
 +					return false;
-+				Peek(h, 1, h.privRegs.data(), kPrivRegsSize);
++				Host::GifItem item;
++				item.kind = kGifPrivRegs;
++				item.data.resize(kPrivRegsSize);
++				Peek(h, 1, item.data.data(), kPrivRegsSize);
 +				Consume(h, 1 + kPrivRegsSize);
 +				h.nRegs++;
-+				ApplyPrivRegisters(h);
++				GifEnqueue(h, std::move(item));
 +				break;
 +			}
 +			default:
@@ -3963,6 +4238,17 @@ index 0000000..0bcba7d
 +					}
 +				}, list.c_str());
 +			}
++			// VIF1/VU1 worker load: what it didn't spend waiting for the game's data or for the GL
++			// thread (two frames queued); near 100% it holds the picture (and the game) back
++			{
++				const double windowMs = time - h.statsStart;
++				std::printf("[webgs] VU1 worker %.0f%% busy (waited %.0f ms for data, %.0f ms for the GIF thread); "
++				            "GIF thread %.0f%% busy (waited %.0f ms for work, %.0f ms for the GL thread)\n",
++				            windowMs > 0.0 ? 100.0 * (1.0 - (h.idleMs + h.gifQueueWaitMs) / windowMs) : 0.0, h.idleMs, h.gifQueueWaitMs,
++				            windowMs > 0.0 ? std::clamp(100.0 * (1.0 - (h.gifIdleMs + h.vblankWaitMs) / windowMs), 0.0, 100.0) : 0.0, h.gifIdleMs, h.vblankWaitMs);
++				if(!g_debug)
++					h.idleMs = h.vblankWaitMs = h.gifIdleMs = h.gifQueueWaitMs = 0.0;
++			}
 +			std::printf("[webgs] image transfers: %u swizzled in the VU1 worker; on the GL thread: %u format, %u alignment, %u range, %u interrupted\n",
 +			            gs.m_producerSwizzled, gs.m_producerDirect[0], gs.m_producerDirect[1], gs.m_producerDirect[2], gs.m_producerDirect[3]);
 +			gs.m_producerSwizzled = 0;
@@ -4010,7 +4296,7 @@ index 0000000..0bcba7d
 +			if(address == CVpu::VU_ADDR_XGKICK)
 +			{
 +				h->xgkicks++;
-+				h->vpu1->ProcessXgKick(value);
++				GifKick(*h, value);
 +			}
 +			return 0;
 +		}, 0x01);
@@ -4032,6 +4318,13 @@ index 0000000..0bcba7d
 +		Host& h = *static_cast<Host*>(arg);
 +		RegisterJitFunctions();
 +		SetupEmulation(&h);
++		h.gifSink = std::make_unique<GifSink>(h);
++		h.gif->SetAsyncSink(h.gifSink.get());
++		{
++			pthread_t gifThread;
++			pthread_create(&gifThread, nullptr, &GifThread, &h);
++			pthread_detach(gifThread);
++		}
 +		for(;;)
 +		{
 +			bool drew = false;

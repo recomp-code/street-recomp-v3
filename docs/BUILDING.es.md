@@ -205,7 +205,13 @@ nativo están dentro de `__EMSCRIPTEN__`.
   bloques completos se juntan en el hilo que alimenta al GS (VIF1/VU1), se reordenan ahí en bloques GS
   de 256 bytes, y el hilo del GS solo compara y copia bloques, en el mismo orden que antes (cualquier
   otra orden que llegue a mitad de una transferencia recibe antes los datos recibidos, como antes).
-  El hilo de GL pasó de ~40% a ~29% en un partido. Las líneas `[webgs] image transfers` cuentan ambos caminos.
+- El GIF corre en su propio hilo (`play_gs_host.cpp`, `GifThread`; `CGIF::IAsyncSink` de Play! permite al VIF1
+  encolar paquetes DIRECT, MSKPATH3 y lecturas de vuelta): el hilo VIF1/VU1 encola en orden los paquetes de
+  XGKICK (copiados de la memoria de la VU1, con el tamaño sacado de las cabeceras GIF), transferencias, vsyncs
+  y registros, y sigue. El hilo GIF se despierta por lotes (despertarlo por paquete costaba ~16% al hilo VU1)
+  y es el que reordena las texturas descritas arriba.
+  El hilo de GL pasó de ~40% a ~29% en un partido. Las líneas `[webgs] image transfers` cuentan ambos
+  caminos; `[webgs] VU1 worker N% busy` y `[sched] ... game thread N% busy` muestran la carga de cada hilo.
 - Microprogramas de la VU (`ee/VuExecutor.cpp`): las particiones se recuerdan por (contenido de la
   micromemoria, inicio del bloque), así que al volver a cargar un microprograma se reutilizan sus
   bloques.

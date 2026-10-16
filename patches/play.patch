@@ -1,3 +1,108 @@
+diff --git a/Source/ee/GIF.h b/Source/ee/GIF.h
+index 2713062..8d60e31 100644
+--- a/Source/ee/GIF.h
++++ b/Source/ee/GIF.h
+@@ -63,6 +63,26 @@ public:
+ 
+ 	CGSHandler* GetGsHandler();
+ 
++	//Optional: a host that runs the GIF in a thread of its own gives the VIF this sink, and the VIF
++	//queues its GIF work there (in order) instead of processing it in the VIF/VU thread
++	class IAsyncSink
++	{
++	public:
++		virtual ~IAsyncSink() = default;
++		virtual void QueuePackets(const uint8* data, uint32 size, uint32 pathIndex) = 0;
++		virtual void QueuePath3Mask(bool masked) = 0;
++		//Waits for the queued work, then reads (local to host transfers)
++		virtual void ReadImageData(void* data, uint32 size) = 0;
++	};
++	void SetAsyncSink(IAsyncSink* sink)
++	{
++		m_asyncSink = sink;
++	}
++	IAsyncSink* GetAsyncSink() const
++	{
++		return m_asyncSink;
++	}
++
+ 	uint32 GetActivePath() const;
+ 	void SetPath3Masked(bool);
+ 
+@@ -70,6 +90,7 @@ public:
+ 	void SaveState(Framework::CZipArchiveWriter&);
+ 
+ private:
++	IAsyncSink* m_asyncSink = nullptr;
+ 	enum
+ 	{
+ 		FIFO_QWC = 0x10,
+diff --git a/Source/ee/Vif1.cpp b/Source/ee/Vif1.cpp
+index 6ad8461..8f1249d 100644
+--- a/Source/ee/Vif1.cpp
++++ b/Source/ee/Vif1.cpp
+@@ -85,8 +85,15 @@ uint32 CVif1::ReceiveDMA(uint32 address, uint32 qwc, uint32 direction, bool tagI
+ 			address &= (PS2::EE_RAM_SIZE - 1);
+ 			assert((address + size) <= PS2::EE_RAM_SIZE);
+ 		}
+-		auto gs = m_gif.GetGsHandler();
+-		gs->ReadImageData(source + address, size);
++		if(auto sink = m_gif.GetAsyncSink())
++		{
++			sink->ReadImageData(source + address, size);
++		}
++		else
++		{
++			auto gs = m_gif.GetGsHandler();
++			gs->ReadImageData(source + address, size);
++		}
+ 		return qwc;
+ 	}
+ 	else
+@@ -111,7 +118,10 @@ void CVif1::ExecuteCommand(StreamType& stream, CODE nCommand)
+ 		m_BASE = nCommand.nIMM;
+ 		break;
+ 	case CODE_CMD_MSKPATH3:
+-		m_gif.SetPath3Masked((nCommand.nIMM & 0x8000) != 0);
++		if(auto sink = m_gif.GetAsyncSink())
++			sink->QueuePath3Mask((nCommand.nIMM & 0x8000) != 0);
++		else
++			m_gif.SetPath3Masked((nCommand.nIMM & 0x8000) != 0);
+ 		break;
+ 	case CODE_CMD_FLUSH:
+ 		if(!m_vpu.IsVuReady())
+@@ -181,8 +191,12 @@ void CVif1::Cmd_DIRECT(StreamType& stream, CODE nCommand)
+ 			if(m_directQwordBufferIndex == QWORD_SIZE)
+ 			{
+ 				assert(m_CODE.nIMM != 0);
+-				uint32 processed = m_gif.ProcessMultiplePackets(m_directQwordBuffer,
+-				                                                QWORD_SIZE, 0, QWORD_SIZE, CGsPacketMetadata(2));
++				uint32 processed = QWORD_SIZE;
++				if(auto sink = m_gif.GetAsyncSink())
++					sink->QueuePackets(m_directQwordBuffer, QWORD_SIZE, 2);
++				else
++					processed = m_gif.ProcessMultiplePackets(m_directQwordBuffer,
++					                                         QWORD_SIZE, 0, QWORD_SIZE, CGsPacketMetadata(2));
+ 				if(processed != 0)
+ 				{
+ 					assert(processed == QWORD_SIZE);
+@@ -198,7 +212,15 @@ void CVif1::Cmd_DIRECT(StreamType& stream, CODE nCommand)
+ 			nSize = std::min<uint32>(m_CODE.nIMM * 0x10, nSize & ~0xF);
+ 
+ 			auto packet = stream.GetDirectPointer();
+-			uint32 processed = m_gif.ProcessMultiplePackets(packet, nSize, 0, nSize, CGsPacketMetadata(2));
++			uint32 processed = nSize;
++			if(auto sink = m_gif.GetAsyncSink())
++			{
++				if(nSize != 0) sink->QueuePackets(packet, nSize, 2);
++			}
++			else
++			{
++				processed = m_gif.ProcessMultiplePackets(packet, nSize, 0, nSize, CGsPacketMetadata(2));
++			}
+ 			assert(processed <= nSize);
+ 			stream.Advance(processed);
+ 			//Adjust size in case not everything was processed by GIF
 diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
 index 72e80fc..adf8702 100644
 --- a/Source/ee/VuExecutor.cpp
@@ -2482,7 +2587,7 @@ index 01a1217..3d867f5 100644
  	return texInfo;
  }
 diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
-index 57e58ba..55ebadf 100644
+index 57e58ba..d1e67a9 100644
 --- a/Source/gs/GSHandler.cpp
 +++ b/Source/gs/GSHandler.cpp
 @@ -1,5 +1,6 @@
@@ -2825,7 +2930,7 @@ index 57e58ba..55ebadf 100644
  	if(!m_gsThreaded)
  	{
  		waitForCompletion = false;
-@@ -2195,9 +2305,216 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
+@@ -2195,9 +2305,227 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
  
  void CGSHandler::SendGSCall(CMailBox::FunctionType&& function)
  {
@@ -2914,10 +3019,9 @@ index 57e58ba..55ebadf 100644
 +}
 +
 +template <typename Storage>
-+void CGSHandler::ProducerSwizzleBlocks(uint8* out, uint32 blockWidth, uint32 blockHeight)
++void CGSHandler::ProducerSwizzleBlocks(const PRODUCER_TRANSFER& transfer, uint8* out, uint32 blockWidth, uint32 blockHeight)
 +{
 +	typedef typename Storage::Unit Unit;
-+	const auto& transfer = m_producerTransfer;
 +	const uint32* pageOffsets = CGsPixelFormats::CPixelIndexor<Storage>::GetPageOffsets();
 +	const uint32 pagesPerRow = (transfer.dstWidth * 64) / Storage::PAGEWIDTH;
 +	const Unit* src = reinterpret_cast<const Unit*>(transfer.data.data());
@@ -2946,10 +3050,9 @@ index 57e58ba..55ebadf 100644
 +	}
 +}
 +
-+void CGSHandler::ProducerSwizzleBlocksPSMT4(uint8* out)
++void CGSHandler::ProducerSwizzleBlocksPSMT4(const PRODUCER_TRANSFER& transfer, uint8* out)
 +{
 +	typedef CGsPixelFormats::STORAGEPSMT4 Storage;
-+	const auto& transfer = m_producerTransfer;
 +	const uint32* places = GetPsmt4PagePlaces();
 +	const uint32 pagesPerRow = (transfer.dstWidth * 64) / Storage::PAGEWIDTH;
 +	const uint8* src = transfer.data.data();
@@ -2985,28 +3088,18 @@ index 57e58ba..55ebadf 100644
 +
 +void CGSHandler::ProducerFinishTransfer()
 +{
-+	auto& transfer = m_producerTransfer;
-+	transfer.active = false;
++	//Swizzled right here, in the thread that feeds the GS (the web host runs the GIF in a thread of
++	//its own with room to spare; waking a helper thread for each of the thousands of transfers per
++	//second cost more than the swizzling)
++	m_producerTransfer.active = false;
 +	m_producerSwizzled++;
-+	uint32 blockWidth = 8, blockHeight = 8;
-+	if(transfer.psm == PSMT8) blockWidth = 16, blockHeight = 16;
-+	if(transfer.psm == PSMT4) blockWidth = 32, blockHeight = 16;
-+	const uint32 blockCount = (transfer.width / blockWidth) * (transfer.height / blockHeight);
-+	uint8* blocks = new uint8[blockCount * (4 + 256)];
-+	switch(transfer.psm)
-+	{
-+	case PSMCT32:
-+		ProducerSwizzleBlocks<CGsPixelFormats::STORAGEPSMCT32>(blocks, 8, 8);
-+		break;
-+	case PSMT8:
-+		ProducerSwizzleBlocks<CGsPixelFormats::STORAGEPSMT8>(blocks, 16, 16);
-+		break;
-+	case PSMT4:
-+		ProducerSwizzleBlocksPSMT4(blocks);
-+		break;
-+	}
-+	const uint32 length = transfer.size;
-+	transfer.data.clear();
++	SWIZZLE_JOB job;
++	job.transfer = std::move(m_producerTransfer);
++	m_producerTransfer = PRODUCER_TRANSFER();
++	SwizzleJob(job);
++	uint8* blocks = job.blocks;
++	const uint32 blockCount = job.blockCount;
++	const uint32 length = job.transfer.size;
 +	m_producerSending = true;
 +	SendGSCall(
 +	    [this, blocks, blockCount, length]() {
@@ -3014,6 +3107,29 @@ index 57e58ba..55ebadf 100644
 +		    delete[] blocks;
 +	    });
 +	m_producerSending = false;
++}
++
++void CGSHandler::SwizzleJob(SWIZZLE_JOB& job)
++{
++	const auto& transfer = job.transfer;
++	uint32 blockWidth = 8, blockHeight = 8;
++	if(transfer.psm == PSMT8) blockWidth = 16, blockHeight = 16;
++	if(transfer.psm == PSMT4) blockWidth = 32, blockHeight = 16;
++	job.blockCount = (transfer.width / blockWidth) * (transfer.height / blockHeight);
++	job.blocks = new uint8[job.blockCount * (4 + 256)];
++	switch(transfer.psm)
++	{
++	case PSMCT32:
++		ProducerSwizzleBlocks<CGsPixelFormats::STORAGEPSMCT32>(transfer, job.blocks, 8, 8);
++		break;
++	case PSMT8:
++		ProducerSwizzleBlocks<CGsPixelFormats::STORAGEPSMT8>(transfer, job.blocks, 16, 16);
++		break;
++	case PSMT4:
++		ProducerSwizzleBlocksPSMT4(transfer, job.blocks);
++		break;
++	}
++	job.transfer.data = std::vector<uint8>(); //the GS thread only needs the blocks
 +}
 +
 +//GS thread: the transfer's data, already in GS block order
@@ -3043,10 +3159,21 @@ index 57e58ba..55ebadf 100644
  {
  	assert(!m_gsThreaded);
 diff --git a/Source/gs/GSHandler.h b/Source/gs/GSHandler.h
-index 66bfe59..4f66bcc 100644
+index 66bfe59..95e5269 100644
 --- a/Source/gs/GSHandler.h
 +++ b/Source/gs/GSHandler.h
-@@ -851,6 +851,15 @@ public:
+@@ -2,6 +2,10 @@
+ 
+ #include <thread>
+ #include <vector>
++#include <memory>
++#include <condition_variable>
++#include <mutex>
++#include <deque>
+ #include <functional>
+ #include <atomic>
+ #include <array>
+@@ -851,6 +855,15 @@ public:
  	void ResetVBlank();
  
  	void FeedImageData(const void*, uint32);
@@ -3062,7 +3189,7 @@ index 66bfe59..4f66bcc 100644
  	void ReadImageData(void*, uint32);
  
  	inline void WriteRegister(const RegisterWrite& write)
-@@ -901,6 +910,14 @@ public:
+@@ -901,6 +914,14 @@ public:
  	void SendGSCall(const CMailBox::FunctionType&, bool = false, bool = false);
  
  	void ProcessSingleFrame();
@@ -3077,7 +3204,7 @@ index 66bfe59..4f66bcc 100644
  
  	FlipCompleteEvent OnFlipComplete;
  	NewFrameEvent OnNewFrame;
-@@ -1080,8 +1097,33 @@ protected:
+@@ -1080,8 +1101,41 @@ protected:
  	bool ReadCLUT4_16(const TEX0&);
  	template <typename Indexor>
  	bool ReadCLUT8_16(const TEX0&);
@@ -3093,12 +3220,20 @@ index 66bfe59..4f66bcc 100644
 +		uint32 size = 0; //bytes the transfer takes
 +		std::vector<uint8> data;
 +	};
++	//A finished transfer and its swizzled GS blocks
++	struct SWIZZLE_JOB
++	{
++		PRODUCER_TRANSFER transfer;
++		uint8* blocks = nullptr;
++		uint32 blockCount = 0;
++	};
 +	void ProducerBeginTransfer(uint64 trxDir);
 +	void ProducerFlushRaw();
 +	void ProducerFinishTransfer();
++	static void SwizzleJob(SWIZZLE_JOB&);
 +	template <typename Storage>
-+	void ProducerSwizzleBlocks(uint8*, uint32 blockWidth, uint32 blockHeight);
-+	void ProducerSwizzleBlocksPSMT4(uint8*);
++	static void ProducerSwizzleBlocks(const PRODUCER_TRANSFER&, uint8*, uint32 blockWidth, uint32 blockHeight);
++	static void ProducerSwizzleBlocksPSMT4(const PRODUCER_TRANSFER&, uint8*);
 +	void ApplyTransferBlocks(const uint8*, uint32 blockCount, uint32 length);
 +	bool m_producerSwizzle = false;
 +	bool m_producerSending = false;
@@ -3113,7 +3248,7 @@ index 66bfe59..4f66bcc 100644
  
  	static bool IsCompatibleFramebufferPSM(unsigned int, unsigned int);
  
-@@ -1107,6 +1149,10 @@ protected:
+@@ -1107,6 +1161,10 @@ protected:
  	uint8* m_pRAM = nullptr;
  
  	uint16* m_pCLUT = nullptr;
