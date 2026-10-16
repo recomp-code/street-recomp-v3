@@ -213,6 +213,12 @@ their own patches, and the few runtime changes shared with native code are behin
   woken in batches (one wake per packet cost the worker ~16%) and swizzles the texture transfers above.
   The GL thread's share in a match fell from ~40% to ~29%. `[webgs] image transfers` lines count both paths;
   `[webgs] VU1 worker N% busy` and `[sched] ... game thread N% busy` show each thread's load.
+- VU1 block chaining (`BasicBlock.cpp` `CompileChain`, `GenericMipsExecutor.h`, CodeGen `Emit_ExternJmpDyn`): the
+  VU1 runs ~7 million blocks a second of ~6 instructions. At a block's end the next block is looked up from
+  the guest pc in a per-executor table and entered with a wasm tail call (`return_call_indirect`, Chrome 112+,
+  Firefox 121+, Safari 18.2+); browsers without tail calls get a dispatcher hand-off (`nextBlockFunction`).
+  The chaining code sits in its own conditional block so the Jitter writes nPC back first. VU1 worker
+  ~51% -> ~42% on a Mac with tail calls. `?chain=0` turns it off, `?chain=dispatch` forces the hand-off.
 - VU microprograms (`ee/VuExecutor.cpp`): partitions are remembered per (micro memory contents,
   block start), so swapping microprograms back in reuses their blocks.
 
