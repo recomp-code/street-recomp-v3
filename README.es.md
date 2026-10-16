@@ -119,7 +119,8 @@ nbastreet-v3-recomp/tools/web/serve.sh      # después abre http://localhost:808
   distintas (camisetas, objetos de las canchas, algunos textos de menú), así que la mayor parte de
   la imagen queda con el detalle original del juego.
 - **Sonido limpio:**
-  - SPU2 con la interpolación gaussiana del hardware, barridos de volumen y limitación suave de picos;
+  - el SPU2 (procesador de sonido) de PCSX2: reverberación, ruido, modulación de tono, los tiempos
+    de DMA del hardware e interpolación gaussiana, con un limitador de picos a la salida;
   - sale por un AudioWorklet con búfer adaptativo;
   - el tiempo emulado avanza de forma continua, así que la música y los comentarios en streaming
     nunca se repiten ni chasquean.

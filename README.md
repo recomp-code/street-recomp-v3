@@ -115,7 +115,8 @@ nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in
   hash. The pack covers ~240 distinct textures (jerseys, court props, some menu text), so most of
   the picture stays at the game's own detail.
 - **Clean sound:**
-  - SPU2 with the hardware's Gaussian interpolation, volume sweeps and soft peak limiting;
+  - PCSX2's SPU2 (sound processor): reverb, noise, pitch modulation, the hardware's DMA timing and
+    Gaussian interpolation, with a peak limiter on the output;
   - played through an AudioWorklet with adaptive buffering;
   - emulated time keeps flowing smoothly, so streamed music and commentary never repeat or click.
 - **Online:** the same community server as the PC version. The game's network adapter talks over one

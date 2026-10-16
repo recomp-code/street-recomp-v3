@@ -176,7 +176,12 @@ nativo están dentro de `__EMSCRIPTEN__`.
   - `site/index.html`: pantalla de inicio, AudioWorklet, mandos, diagnóstico;
   - `known_shaders.inc`: las variantes de shaders del juego (`SHADERCAPS` de Play!), compiladas al
     arrancar junto con las que el navegador recuerda en IndexedDB.
-- IOP / SPU2: interpolación gaussiana, barridos de volumen, AutoDMA a ritmo, limitador de salida.
+- IOP / SPU2: el SPU2 de PCSX2 (GPL-3.0+) en `ps2xIOP/src/emulator/spu2` (archivos de PCSX2 casi sin
+  cambios en `SPU2/`, sustitutos pequeños de sus cabeceras en `shim/`, `spu2_glue.cpp` en lugar de su
+  `spu2.cpp`) detrás de la clase `Spu2` del IOP. Los datos de DMA 4/7 se leen de la RAM del IOP a medida
+  que el SPU2 los consume y CHCR sigue ocupado hasta que termina; el IOP avanza el SPU2 cada 768 ciclos,
+  también dentro de ejecuciones largas (el driver de sonido de EA espera en un manejador RPC la
+  interrupción de fin de DMA).
 - Planificador del EE: espera dormida con el tiempo avanzando en pasos de 1 ms, rebase del vblank
   tras atascos.
 - Sockets del DEV9 por un WebSocket (online).

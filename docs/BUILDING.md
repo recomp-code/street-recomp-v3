@@ -182,7 +182,11 @@ their own patches, and the few runtime changes shared with native code are behin
   - `site/index.html`: start screen, AudioWorklet, gamepads, diagnostics;
   - `known_shaders.inc`: the game's shader variants (Play!'s `SHADERCAPS`), built at start-up
     together with the ones the browser remembers in IndexedDB.
-- IOP / SPU2: Gaussian interpolation, volume sweeps, paced AutoDMA, output limiter.
+- IOP / SPU2: PCSX2's SPU2 (GPL-3.0+) in `ps2xIOP/src/emulator/spu2` (PCSX2 files nearly unmodified
+  in `SPU2/`, small stand-ins for the PCSX2 headers in `shim/`, `spu2_glue.cpp` in place of PCSX2's
+  `spu2.cpp`) behind the IOP's `Spu2` class. DMA 4/7 data is read from IOP RAM as the SPU2 consumes
+  it and CHCR stays busy until it finishes; the IOP advances the SPU2 every 768 cycles, also inside
+  long runs (EA's sound driver busy-waits in an RPC handler for the DMA-completion interrupt).
 - EE scheduler: idle-loop sleep with time flowing in 1 ms steps, vblank rebase after stalls.
 - DEV9 sockets over a WebSocket (online).
 - WebAssembly-only fast paths in the recompiled code's runtime:
