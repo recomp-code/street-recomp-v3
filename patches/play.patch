@@ -1,3 +1,539 @@
+diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
+index 4c460e6..80e26bd 100644
+--- a/Source/BasicBlock.cpp
++++ b/Source/BasicBlock.cpp
+@@ -306,6 +306,7 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+ 			}
+ 			jitter->EndIf();
+ #endif
++			CompileChain(jitter);
+ 		}
+ 	}
+ 	jitter->Else();
+@@ -324,10 +325,44 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+ 		}
+ 		jitter->EndIf();
+ #endif
++		CompileChain(jitter);
+ 	}
+ 	jitter->EndIf();
+ }
+ 
++//WebAssembly: the next block from the guest pc, entered directly (see Jitter::WASM_BLOCK_CHAIN)
++void CBasicBlock::CompileChain(CMipsJitter* jitter)
++{
++#ifdef __EMSCRIPTEN__
++	if(!m_context.m_executor || !CanChain()) return;
++	if(auto chain = m_context.m_executor->GetBlockChain())
++	{
++		//Inside its own conditional block, as the native trampolines: the Jitter writes the registers
++		//it holds (nPC among them) back to the context at block boundaries, and the chaining code
++		//reads nPC from the context
++		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
++		jitter->PushCst(0);
++		jitter->BeginIf(Jitter::CONDITION_EQ);
++		{
++			jitter->JumpToDynamic(const_cast<void*>(chain));
++		}
++		jitter->EndIf();
++	}
++#endif
++}
++
++#ifdef __EMSCRIPTEN__
++uint32 CBasicBlock::GetWasmChainIndex() const
++{
++	return m_function.GetWasmChainIndex();
++}
++
++uint32 CBasicBlock::GetWasmFunctionPointer() const
++{
++	return static_cast<uint32>(reinterpret_cast<uintptr_t>(m_function.GetCode()));
++}
++#endif
++
+ void CBasicBlock::Execute()
+ {
+ 	m_function(&m_context);
+diff --git a/Source/BasicBlock.h b/Source/BasicBlock.h
+index 56ef0ad..6ebb10b 100644
+--- a/Source/BasicBlock.h
++++ b/Source/BasicBlock.h
+@@ -1,138 +1,148 @@
+-#pragma once
+-
+-#include "MIPS.h"
+-#include "MemoryFunction.h"
+-#ifdef AOT_BUILD_CACHE
+-#include "StdStream.h"
+-#include <mutex>
+-#endif
+-
+-enum BLOCK_CATEGORY : uint32
+-{
+-	BLOCK_CATEGORY_UNKNOWN = 0,
+-	BLOCK_CATEGORY_PS2_EE = 0x65650000,
+-	BLOCK_CATEGORY_PS2_IOP = 0x696F7000,
+-	BLOCK_CATEGORY_PS2_VU = 0x76750000,
+-	BLOCK_CATEGORY_PSP = 0x50535000,
+-};
+-
+-#pragma pack(push, 1)
+-struct AOT_BLOCK_KEY
+-{
+-	BLOCK_CATEGORY category;
+-	uint128 hash;
+-	uint32 size;
+-
+-	bool operator<(const AOT_BLOCK_KEY& k2) const
+-	{
+-		const auto& k1 = (*this);
+-		return std::tie(k1.category, k1.hash, k1.size) <
+-		       std::tie(k2.category, k2.hash, k2.size);
+-	}
+-};
+-#pragma pack(pop)
+-static_assert(sizeof(AOT_BLOCK_KEY) == 0x18, "AOT_BLOCK_KEY must be 24 bytes long.");
+-
+-namespace Jitter
+-{
+-	class CJitter;
+-};
+-
+-extern "C"
+-{
+-	void EmptyBlockHandler(CMIPS*);
+-	void NextBlockTrampoline(CMIPS*);
+-	void BranchBlockTrampoline(CMIPS*);
+-}
+-
+-enum LINK_SLOT
+-{
+-	LINK_SLOT_NEXT,
+-	LINK_SLOT_BRANCH,
+-	LINK_SLOT_MAX,
+-};
+-
+-//Block outgoing link
+-struct BLOCK_OUT_LINK
+-{
+-	LINK_SLOT slot;    //slot used in the source block
+-	uint32 srcAddress; //address of source block
+-	bool live;         //live if linked to another block, otherwise, link is pending
+-};
+-
+-//Block outgoing links map (key: target link address, value: struct describing link status)
+-typedef std::multimap<uint32, BLOCK_OUT_LINK> BlockOutLinkMap;
+-
+-//When block linking is used, each basic block will maintain pointers
+-//to their outgoing link definitions inside the map
+-typedef BlockOutLinkMap::iterator BlockOutLinkPointer;
+-
+-class CBasicBlock : public std::enable_shared_from_this<CBasicBlock>
+-{
+-public:
+-	CBasicBlock(CMIPS&, uint32 = MIPS_INVALID_PC, uint32 = MIPS_INVALID_PC, BLOCK_CATEGORY = BLOCK_CATEGORY_UNKNOWN);
+-	virtual ~CBasicBlock() = default;
+-	void Execute();
+-	void Compile();
+-	virtual void CompileRange(CMipsJitter*);
+-
+-	void AddBlockCompileHints(uint32);
+-
+-	uint32 GetBeginAddress() const;
+-	uint32 GetEndAddress() const;
+-	bool IsCompiled() const;
+-	bool IsEmpty() const;
+-
+-	uint32 GetRecycleCount() const;
+-	void SetRecycleCount(uint32);
+-
+-	bool HasLinkSlot(LINK_SLOT) const;
+-	BlockOutLinkPointer GetOutLink(LINK_SLOT) const;
+-	void SetOutLink(LINK_SLOT, BlockOutLinkPointer);
+-
+-	void LinkBlock(LINK_SLOT, CBasicBlock*);
+-	void UnlinkBlock(LINK_SLOT);
+-
+-#ifdef AOT_BUILD_CACHE
+-	static void SetAotBlockOutputStream(Framework::CStdStream*);
+-#endif
+-
+-	void CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& basicBlock);
+-
+-protected:
+-	uint32 m_begin;
+-	uint32 m_end;
+-	BLOCK_CATEGORY m_category;
+-	CMIPS& m_context;
+-
+-	uint32 m_blockCompileHints = 0;
+-
+-	virtual void CompileProlog(CMipsJitter*);
+-	virtual void CompileEpilog(CMipsJitter*, bool);
+-
+-private:
+-	void HandleExternalFunctionReference(uintptr_t, uint32, Jitter::CCodeGen::SYMBOL_REF_TYPE);
+-
+-#ifdef DEBUGGER_INCLUDED
+-	bool HasBreakpoint() const;
+-	static uint32 BreakpointFilter(CMIPS*);
+-	static void BreakpointHandler(CMIPS*);
+-#endif
+-
+-#ifdef AOT_BUILD_CACHE
+-	static Framework::CStdStream* m_aotBlockOutputStream;
+-	static std::mutex m_aotBlockOutputStreamMutex;
+-#endif
+-
+-#ifndef AOT_USE_CACHE
+-	CMemoryFunction m_function;
+-#else
+-	void (*m_function)(void*);
+-#endif
+-	uint32 m_recycleCount = 0;
+-	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
+-	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];
+-#ifdef _DEBUG
+-	CBasicBlock* m_linkBlock[LINK_SLOT_MAX];
+-#endif
+-};
++#pragma once
++
++#include "MIPS.h"
++#include "MemoryFunction.h"
++#ifdef AOT_BUILD_CACHE
++#include "StdStream.h"
++#include <mutex>
++#endif
++
++enum BLOCK_CATEGORY : uint32
++{
++	BLOCK_CATEGORY_UNKNOWN = 0,
++	BLOCK_CATEGORY_PS2_EE = 0x65650000,
++	BLOCK_CATEGORY_PS2_IOP = 0x696F7000,
++	BLOCK_CATEGORY_PS2_VU = 0x76750000,
++	BLOCK_CATEGORY_PSP = 0x50535000,
++};
++
++#pragma pack(push, 1)
++struct AOT_BLOCK_KEY
++{
++	BLOCK_CATEGORY category;
++	uint128 hash;
++	uint32 size;
++
++	bool operator<(const AOT_BLOCK_KEY& k2) const
++	{
++		const auto& k1 = (*this);
++		return std::tie(k1.category, k1.hash, k1.size) <
++		       std::tie(k2.category, k2.hash, k2.size);
++	}
++};
++#pragma pack(pop)
++static_assert(sizeof(AOT_BLOCK_KEY) == 0x18, "AOT_BLOCK_KEY must be 24 bytes long.");
++
++namespace Jitter
++{
++	class CJitter;
++};
++
++extern "C"
++{
++	void EmptyBlockHandler(CMIPS*);
++	void NextBlockTrampoline(CMIPS*);
++	void BranchBlockTrampoline(CMIPS*);
++}
++
++enum LINK_SLOT
++{
++	LINK_SLOT_NEXT,
++	LINK_SLOT_BRANCH,
++	LINK_SLOT_MAX,
++};
++
++//Block outgoing link
++struct BLOCK_OUT_LINK
++{
++	LINK_SLOT slot;    //slot used in the source block
++	uint32 srcAddress; //address of source block
++	bool live;         //live if linked to another block, otherwise, link is pending
++};
++
++//Block outgoing links map (key: target link address, value: struct describing link status)
++typedef std::multimap<uint32, BLOCK_OUT_LINK> BlockOutLinkMap;
++
++//When block linking is used, each basic block will maintain pointers
++//to their outgoing link definitions inside the map
++typedef BlockOutLinkMap::iterator BlockOutLinkPointer;
++
++class CBasicBlock : public std::enable_shared_from_this<CBasicBlock>
++{
++public:
++	CBasicBlock(CMIPS&, uint32 = MIPS_INVALID_PC, uint32 = MIPS_INVALID_PC, BLOCK_CATEGORY = BLOCK_CATEGORY_UNKNOWN);
++	virtual ~CBasicBlock() = default;
++	void Execute();
++	void Compile();
++	virtual void CompileRange(CMipsJitter*);
++
++	void AddBlockCompileHints(uint32);
++
++	uint32 GetBeginAddress() const;
++	uint32 GetEndAddress() const;
++	bool IsCompiled() const;
++	bool IsEmpty() const;
++
++	uint32 GetRecycleCount() const;
++	void SetRecycleCount(uint32);
++
++	bool HasLinkSlot(LINK_SLOT) const;
++	BlockOutLinkPointer GetOutLink(LINK_SLOT) const;
++	void SetOutLink(LINK_SLOT, BlockOutLinkPointer);
++
++	void LinkBlock(LINK_SLOT, CBasicBlock*);
++#ifdef __EMSCRIPTEN__
++	uint32 GetWasmChainIndex() const;
++	uint32 GetWasmFunctionPointer() const;
++#endif
++	void UnlinkBlock(LINK_SLOT);
++
++#ifdef AOT_BUILD_CACHE
++	static void SetAotBlockOutputStream(Framework::CStdStream*);
++#endif
++
++	void CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& basicBlock);
++
++protected:
++	uint32 m_begin;
++	uint32 m_end;
++	BLOCK_CATEGORY m_category;
++	CMIPS& m_context;
++
++	uint32 m_blockCompileHints = 0;
++
++	virtual void CompileProlog(CMipsJitter*);
++	virtual void CompileEpilog(CMipsJitter*, bool);
++	//Whether the end of this block may jump straight to the next one (WebAssembly chaining)
++	virtual bool CanChain() const
++	{
++		return true;
++	}
++	void CompileChain(CMipsJitter*);
++
++private:
++	void HandleExternalFunctionReference(uintptr_t, uint32, Jitter::CCodeGen::SYMBOL_REF_TYPE);
++
++#ifdef DEBUGGER_INCLUDED
++	bool HasBreakpoint() const;
++	static uint32 BreakpointFilter(CMIPS*);
++	static void BreakpointHandler(CMIPS*);
++#endif
++
++#ifdef AOT_BUILD_CACHE
++	static Framework::CStdStream* m_aotBlockOutputStream;
++	static std::mutex m_aotBlockOutputStreamMutex;
++#endif
++
++#ifndef AOT_USE_CACHE
++	CMemoryFunction m_function;
++#else
++	void (*m_function)(void*);
++#endif
++	uint32 m_recycleCount = 0;
++	BlockOutLinkPointer m_outLinks[LINK_SLOT_MAX];
++	uint32 m_linkBlockTrampolineOffset[LINK_SLOT_MAX];
++#ifdef _DEBUG
++	CBasicBlock* m_linkBlock[LINK_SLOT_MAX];
++#endif
++};
+diff --git a/Source/GenericMipsExecutor.h b/Source/GenericMipsExecutor.h
+index 2fb630f..e1fa5ed 100644
+--- a/Source/GenericMipsExecutor.h
++++ b/Source/GenericMipsExecutor.h
+@@ -3,6 +3,11 @@
+ #include <unordered_set>
+ #include "MIPS.h"
+ #include "BasicBlock.h"
++#ifdef __EMSCRIPTEN__
++#include "Jitter_CodeGen_Wasm.h"
++#include <algorithm>
++#include <cstddef>
++#endif
+ 
+ #include "BlockLookupOneWay.h"
+ #include "BlockLookupTwoWay.h"
+@@ -56,6 +61,28 @@ public:
+ 
+ 	virtual ~CGenericMipsExecutor() = default;
+ 
++#ifdef __EMSCRIPTEN__
++	//WebAssembly block chaining (see Jitter::WASM_BLOCK_CHAIN): blocks compiled after this jump
++	//straight to the next block instead of returning here. With tail calls the table holds import
++	//table indices; without, function pointers for the dispatcher above.
++	void EnableBlockChaining(bool tailCalls)
++	{
++		m_chainFunctions.assign(m_maxAddress / instructionSize, 0);
++		m_chain.functionTable = static_cast<uint32>(reinterpret_cast<uintptr_t>(m_chainFunctions.data()));
++		m_chain.pcMask = m_addressMask;
++		m_chain.pcShift = (instructionSize == 8) ? 3 : 2;
++		m_chain.pcOffset = offsetof(CMIPS, m_State.nPC);
++		m_chain.exceptionOffset = offsetof(CMIPS, m_State.nHasException);
++		m_chain.nextFunctionOffset = offsetof(CMIPS, m_State.nextBlockFunction);
++		m_chain.tailCalls = tailCalls;
++		m_chainEnabled = true;
++	}
++	const void* GetBlockChain() const override
++	{
++		return m_chainEnabled ? &m_chain : nullptr;
++	}
++#endif
++
+ 	int Execute(int cycles) override
+ 	{
+ 		m_context.m_State.cycleQuota = cycles;
+@@ -65,10 +92,22 @@ public:
+ #endif
+ 		while(m_context.m_State.nHasException == 0)
+ 		{
++#ifdef __EMSCRIPTEN__
++			//Chained without tail calls: the last block already found the next one
++			if(uint32 next = m_context.m_State.nextBlockFunction)
++			{
++				m_context.m_State.nextBlockFunction = 0;
++				reinterpret_cast<void (*)(void*)>(static_cast<uintptr_t>(next))(&m_context);
++				continue;
++			}
++#endif
+ 			uint32 address = m_context.m_State.nPC & m_addressMask;
+ 			auto block = m_blockLookup.FindBlockAt(address);
+ 			block->Execute();
+ 		}
++#ifdef __EMSCRIPTEN__
++		m_context.m_State.nextBlockFunction = 0;
++#endif
+ 		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
+ #ifdef DEBUGGER_INCLUDED
+ 		if(m_context.m_State.nHasException == MIPS_EXCEPTION_BREAKPOINT)
+@@ -88,6 +127,9 @@ public:
+ 
+ 	void Reset() override
+ 	{
++#ifdef __EMSCRIPTEN__
++		std::fill(m_chainFunctions.begin(), m_chainFunctions.end(), 0);
++#endif
+ 		m_blockLookup.Clear();
+ 		m_blocks.clear();
+ 		m_blockOutLinks.clear();
+@@ -139,9 +181,27 @@ protected:
+ 		auto block = BlockFactory(m_context, start, end);
+ 		ResetBlockOutLinks(block.get());
+ 		m_blockLookup.AddBlock(block.get());
++		ChainBlockAdded(block.get());
+ 		m_blocks.insert(std::move(block));
+ 	}
+ 
++	//Keeps the chaining table in step with the block lookup
++	void ChainBlockAdded(CBasicBlock* block)
++	{
++#ifdef __EMSCRIPTEN__
++		if(!m_chainEnabled || block->IsEmpty()) return;
++		uint32 value = m_chain.tailCalls ? block->GetWasmChainIndex() : block->GetWasmFunctionPointer();
++		m_chainFunctions[(block->GetBeginAddress() & m_addressMask) / instructionSize] = value;
++#endif
++	}
++	void ChainBlockRemoved(CBasicBlock* block)
++	{
++#ifdef __EMSCRIPTEN__
++		if(!m_chainEnabled) return;
++		m_chainFunctions[(block->GetBeginAddress() & m_addressMask) / instructionSize] = 0;
++#endif
++	}
++
+ 	void ResetBlockOutLinks(CBasicBlock* block)
+ 	{
+ 		for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
+@@ -286,6 +346,7 @@ protected:
+ 			if(block == protectedBlock) continue;
+ 			if(!RangesOverlap(block->GetBeginAddress(), block->GetEndAddress(), start, end)) continue;
+ 			clearedBlocks.insert(block);
++			ChainBlockRemoved(block);
+ 			m_blockLookup.DeleteBlock(block);
+ 		}
+ 
+@@ -327,6 +388,12 @@ protected:
+ 
+ 	BlockLookupType m_blockLookup;
+ 
++#ifdef __EMSCRIPTEN__
++	Jitter::WASM_BLOCK_CHAIN m_chain;
++	std::vector<uint32> m_chainFunctions;
++	bool m_chainEnabled = false;
++#endif
++
+ #ifdef DEBUGGER_INCLUDED
+ 	bool m_mustBreak = false;
+ 	bool m_breakpointsDisabledOnce = false;
+diff --git a/Source/MIPS.h b/Source/MIPS.h
+index fc28a8f..e9a1289 100644
+--- a/Source/MIPS.h
++++ b/Source/MIPS.h
+@@ -131,6 +131,10 @@ struct MIPSSTATE
+ 
+ 	uint32 xgkickAddress;
+ 
++	//Block chaining without tail calls (WebAssembly): the block that just ran leaves the next one's
++	//function here for the dispatcher (see CGenericMipsExecutor::Execute)
++	uint32 nextBlockFunction;
++
+ 	enum
+ 	{
+ 		TLB_ENTRY_MAX = 48,
+diff --git a/Source/MipsExecutor.h b/Source/MipsExecutor.h
+index 2347e7c..07bedf8 100644
+--- a/Source/MipsExecutor.h
++++ b/Source/MipsExecutor.h
+@@ -1,18 +1,23 @@
+-#pragma once
+-
+-#include "Types.h"
+-
+-class CMipsExecutor
+-{
+-public:
+-	virtual ~CMipsExecutor() = default;
+-	virtual void Reset() = 0;
+-	virtual int Execute(int) = 0;
+-	virtual void ClearActiveBlocksInRange(uint32 start, uint32 end, bool executing) = 0;
+-
+-#ifdef DEBUGGER_INCLUDED
+-	virtual bool MustBreak() const = 0;
+-	virtual void DisableBreakpointsOnce() = 0;
+-	virtual bool FilterBreakpoint() = 0;
+-#endif
+-};
++#pragma once
++
++#include "Types.h"
++
++class CMipsExecutor
++{
++public:
++	virtual ~CMipsExecutor() = default;
++	virtual void Reset() = 0;
++	virtual int Execute(int) = 0;
++	virtual void ClearActiveBlocksInRange(uint32 start, uint32 end, bool executing) = 0;
++	//WebAssembly block chaining description for the blocks this executor compiles (null: off)
++	virtual const void* GetBlockChain() const
++	{
++		return nullptr;
++	}
++
++#ifdef DEBUGGER_INCLUDED
++	virtual bool MustBreak() const = 0;
++	virtual void DisableBreakpointsOnce() = 0;
++	virtual bool FilterBreakpoint() = 0;
++#endif
++};
 diff --git a/Source/ee/GIF.h b/Source/ee/GIF.h
 index 2713062..8d60e31 100644
 --- a/Source/ee/GIF.h
@@ -103,8 +639,23 @@ index 6ad8461..8f1249d 100644
  			assert(processed <= nSize);
  			stream.Advance(processed);
  			//Adjust size in case not everything was processed by GIF
+diff --git a/Source/ee/VuBasicBlock.h b/Source/ee/VuBasicBlock.h
+index 052b681..ce7a83d 100644
+--- a/Source/ee/VuBasicBlock.h
++++ b/Source/ee/VuBasicBlock.h
+@@ -9,6 +9,10 @@ public:
+ 	virtual ~CVuBasicBlock() = default;
+ 
+ 	bool IsLinkable() const;
++	bool CanChain() const override
++	{
++		return m_isLinkable;
++	}
+ 
+ protected:
+ 	void CompileRange(CMipsJitter*) override;
 diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
-index 72e80fc..adf8702 100644
+index 72e80fc..1912a41 100644
 --- a/Source/ee/VuExecutor.cpp
 +++ b/Source/ee/VuExecutor.cpp
 @@ -23,6 +23,8 @@ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
@@ -116,7 +667,7 @@ index 72e80fc..adf8702 100644
  	m_cachedBlocks.clear();
  	m_blockNoClamping.clear();
  	CGenericMipsExecutor::Reset();
-@@ -92,7 +94,42 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+@@ -92,7 +94,43 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
  	return result;
  }
  
@@ -144,6 +695,7 @@ index 72e80fc..adf8702 100644
 +		{
 +			ResetBlockOutLinks(known.block.get());
 +			m_blockLookup.AddBlock(known.block.get());
++			ChainBlockAdded(known.block.get());
 +			m_blocks.insert(known.block);
 +			if(static_cast<CVuBasicBlock*>(known.block.get())->IsLinkable())
 +			{
@@ -159,7 +711,7 @@ index 72e80fc..adf8702 100644
  {
  	uint32 endAddress = std::min<uint32>(startAddress + MAX_BLOCK_SIZE - 4, m_maxAddress - 4);
  	uint32 branchAddress = MIPS_INVALID_PC;
-@@ -132,4 +169,10 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+@@ -132,4 +170,10 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  	{
  		SetupBlockLinks(startAddress, endAddress, branchAddress);
  	}

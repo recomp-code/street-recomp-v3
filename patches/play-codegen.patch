@@ -1,8 +1,38 @@
 diff --git a/include/Jitter_CodeGen_Wasm.h b/include/Jitter_CodeGen_Wasm.h
-index e2f1fbe..5ada6f3 100644
+index e2f1fbe..cc430a9 100644
 --- a/include/Jitter_CodeGen_Wasm.h
 +++ b/include/Jitter_CodeGen_Wasm.h
-@@ -75,6 +75,7 @@ namespace Jitter
+@@ -24,11 +24,29 @@ namespace Jitter
+ 		static std::map<uintptr_t, WASM_FUNCTION_INFO> m_functions;
+ 	};
+ 
++	//Block chaining (OP_EXTERNJMP_DYN on WebAssembly): at the end of a block, the next block is looked
++	//up from the guest pc in `functionTable` (one uint32 per instruction slot, 0 = no compiled block)
++	//and, if no exception is pending, entered with a tail call (return_call_indirect into the import
++	//table) or, without tail call support, handed to the dispatcher in the context's nextFunction field.
++	struct WASM_BLOCK_CHAIN
++	{
++		uint32 functionTable = 0;
++		uint32 pcMask = 0;
++		uint32 pcShift = 0;
++		uint32 pcOffset = 0;
++		uint32 exceptionOffset = 0;
++		uint32 nextFunctionOffset = 0;
++		bool tailCalls = false;
++	};
++
+ 	class CCodeGen_Wasm : public CCodeGen
+ 	{
+ 	public:
+ 		CCodeGen_Wasm();
+ 
++		//Whether this browser runs return_call_indirect (checked once)
++		static bool HasTailCalls();
++
+ 		void GenerateCode(const StatementList&, unsigned int) override;
+ 		void SetStream(Framework::CStream*) override;
+ 		void RegisterExternalSymbols(CObjectFile*) const override;
+@@ -75,6 +93,7 @@ namespace Jitter
  		void PrepareSignatures(CWasmModuleBuilder&, const StatementList&);
  		void RegisterSignature(CWasmModuleBuilder&, std::string);
  		void PrepareLocalVars(const StatementList&);
@@ -10,7 +40,7 @@ index e2f1fbe..5ada6f3 100644
  
  		uint32 GetTemporaryLocation(CSymbol*) const;
  
-@@ -119,6 +120,7 @@ namespace Jitter
+@@ -119,6 +138,7 @@ namespace Jitter
  		void Emit_Break(const STATEMENT&);
  
  		void Emit_Mov_VarAny(const STATEMENT&);
@@ -18,7 +48,16 @@ index e2f1fbe..5ada6f3 100644
  
  		void Emit_RelToRef_VarCst(const STATEMENT&);
  
-@@ -197,6 +199,7 @@ namespace Jitter
+@@ -153,6 +173,8 @@ namespace Jitter
+ 		void Emit_RetVal_Tmp(const STATEMENT&);
+ 
+ 		void Emit_ExternJmp(const STATEMENT&);
++		void Emit_ExternJmpDyn(const STATEMENT&);
++		void EmitChainIndex(const WASM_BLOCK_CHAIN&);
+ 
+ 		void Emit_Jmp(const STATEMENT&);
+ 		void Emit_CondJmp_AnyAny(const STATEMENT&);
+@@ -197,6 +219,7 @@ namespace Jitter
  		void Emit_Fp_Clamp_MemMem(const STATEMENT&);
  		void Emit_Fp_ToSingleI32_MemMem(const STATEMENT&);
  		void Emit_Fp_ToInt32TruncS_MemMem(const STATEMENT&);
@@ -26,7 +65,7 @@ index e2f1fbe..5ada6f3 100644
  		void Emit_Fp_LdCst_TmpCst(const STATEMENT&);
  		void Emit_Fp_SetRoundingMode_Cst(const STATEMENT&);
  
-@@ -238,6 +241,8 @@ namespace Jitter
+@@ -238,6 +261,8 @@ namespace Jitter
  		std::map<uint32, LABEL_FLOW> m_labelFlows;
  		std::map<std::string, uint32> m_signatures;
  		std::map<TemporaryInstance, uint32> m_temporaryLocations;
@@ -35,11 +74,34 @@ index e2f1fbe..5ada6f3 100644
  		uint32 m_localI32Count = 0;
  		uint32 m_localI64Count = 0;
  		uint32 m_localF32Count = 0;
+diff --git a/include/MemoryFunction.h b/include/MemoryFunction.h
+index fca4a0f..354fa97 100644
+--- a/include/MemoryFunction.h
++++ b/include/MemoryFunction.h
+@@ -24,6 +24,10 @@ public:
+ 	void operator()(void*);
+ 
+ 	void* GetCode() const;
++#ifdef __EMSCRIPTEN__
++	//Index of this function in the generated code's import table (block chaining), 0 if none
++	uint32 GetWasmChainIndex() const;
++#endif
+ 	size_t GetSize() const;
+ 
+ 	void BeginModify();
 diff --git a/include/WasmDefs.h b/include/WasmDefs.h
-index 0036a51..345cc70 100644
+index 0036a51..1268726 100644
 --- a/include/WasmDefs.h
 +++ b/include/WasmDefs.h
-@@ -157,6 +157,8 @@ namespace Wasm
+@@ -56,6 +56,7 @@ namespace Wasm
+ 		INST_BR_IF = 0x0D,
+ 		INST_BR_TABLE = 0x0E,
+ 		INST_CALL_INDIRECT = 0x11,
++		INST_RETURN_CALL_INDIRECT = 0x13, //tail call (wasm tail-call proposal)
+ 		INST_SELECT = 0x1B,
+ 		INST_LOCAL_GET = 0x20,
+ 		INST_LOCAL_SET = 0x21,
+@@ -157,6 +158,8 @@ namespace Wasm
  		INST_F32_DEMOTE_F64 = 0xB6,
  		INST_F64_CONVERT_I64_S = 0xB9,
  		INST_F64_PROMOTE_F32 = 0xBB,
@@ -49,7 +111,7 @@ index 0036a51..345cc70 100644
  		INST_F32x4_CONVERT_I32x4_S = 0xFA
  	};
 diff --git a/src/Jitter_CodeGen_Wasm.cpp b/src/Jitter_CodeGen_Wasm.cpp
-index 3f86e4a..16daa63 100644
+index 3f86e4a..46d406c 100644
 --- a/src/Jitter_CodeGen_Wasm.cpp
 +++ b/src/Jitter_CodeGen_Wasm.cpp
 @@ -93,6 +93,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
@@ -60,7 +122,15 @@ index 3f86e4a..16daa63 100644
  
  	{ OP_RELTOREF,       MATCH_VAR_REF,        MATCH_CONSTANT,       MATCH_ANY,           MATCH_NIL,      &CCodeGen_Wasm::Emit_RelToRef_VarCst                        },
  
-@@ -254,7 +255,7 @@ CCodeGen_Wasm::CCodeGen_Wasm()
+@@ -127,6 +128,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
+ 	{ OP_RETVAL,         MATCH_TEMPORARY,      MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_RetVal_Tmp                             },
+ 
+ 	{ OP_EXTERNJMP,      MATCH_NIL,            MATCH_CONSTANTPTR,    MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_ExternJmp                              },
++	{ OP_EXTERNJMP_DYN,  MATCH_NIL,            MATCH_CONSTANTPTR,    MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_ExternJmpDyn                           },
+ 
+ 	{ OP_JMP,            MATCH_NIL,            MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Jmp                                    },
+ 
+@@ -254,7 +256,7 @@ CCodeGen_Wasm::CCodeGen_Wasm()
  	copyMatchers(g_mdConstMatchers);
  }
  
@@ -69,7 +139,7 @@ index 3f86e4a..16daa63 100644
  {
  	CWasmModuleBuilder moduleBuilder;
  
-@@ -273,6 +274,9 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
+@@ -273,6 +275,9 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
  	m_currentBlockDepth = 0;
  	m_loopBlock = -1;
  
@@ -79,7 +149,7 @@ index 3f86e4a..16daa63 100644
  	BuildLabelFlows(statements);
  	PrepareSignatures(moduleBuilder, statements);
  	PrepareLocalVars(statements);
-@@ -322,6 +326,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
+@@ -322,6 +327,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
  
  	moduleBuilder.AddFunction(std::move(function));
  	moduleBuilder.WriteModule(*m_stream);
@@ -87,7 +157,7 @@ index 3f86e4a..16daa63 100644
  
  	assert(m_params.empty());
  }
-@@ -335,14 +340,16 @@ void CCodeGen_Wasm::RegisterExternalSymbols(CObjectFile*) const
+@@ -335,14 +341,16 @@ void CCodeGen_Wasm::RegisterExternalSymbols(CObjectFile*) const
  {
  }
  
@@ -106,7 +176,7 @@ index 3f86e4a..16daa63 100644
  }
  
  bool CCodeGen_Wasm::Has128BitsCallOperands() const
-@@ -587,6 +594,51 @@ void CCodeGen_Wasm::RegisterSignature(CWasmModuleBuilder& moduleBuilder, std::st
+@@ -587,6 +595,51 @@ void CCodeGen_Wasm::RegisterSignature(CWasmModuleBuilder& moduleBuilder, std::st
  	m_signatures.insert(std::make_pair(signature, static_cast<uint32>(m_signatures.size())));
  }
  
@@ -158,7 +228,7 @@ index 3f86e4a..16daa63 100644
  void CCodeGen_Wasm::PrepareLocalVars(const StatementList& statements)
  {
  	for(const auto& statement : statements)
-@@ -806,6 +858,9 @@ void CCodeGen_Wasm::PrepareSymbolDef(CSymbol* symbol)
+@@ -806,6 +859,9 @@ void CCodeGen_Wasm::PrepareSymbolDef(CSymbol* symbol)
  {
  	switch(symbol->m_type)
  	{
@@ -168,7 +238,7 @@ index 3f86e4a..16daa63 100644
  	case SYM_RELATIVE:
  	case SYM_RELATIVE64:
  	case SYM_RELATIVE128:
-@@ -828,6 +883,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
+@@ -828,6 +884,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
  {
  	switch(symbol->m_type)
  	{
@@ -176,7 +246,103 @@ index 3f86e4a..16daa63 100644
  	case SYM_RELATIVE:
  		m_functionStream.Write8(Wasm::INST_I32_STORE);
  		m_functionStream.Write8(0x02);
-@@ -1393,3 +1449,13 @@ void CCodeGen_Wasm::Emit_ExtHigh64VarMem64(const STATEMENT& statement)
+@@ -1156,6 +1213,95 @@ void CCodeGen_Wasm::Emit_ExternJmp(const STATEMENT& statement)
+ 	m_functionStream.Write8(0x00);   //Table index
+ }
+ 
++#ifdef __EMSCRIPTEN__
++EM_JS(int, WasmValidateTailCall, (), {
++	//(module (type (func)) (table 1 funcref) (func (return_call_indirect (type 0) (i32.const 0))))
++	try
++	{
++		return WebAssembly.validate(new Uint8Array([
++		    0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
++		    0x01, 0x00, 0x04, 0x04, 0x01, 0x70, 0x00, 0x01, 0x0a, 0x09, 0x01, 0x07, 0x00, 0x41, 0x00, 0x13,
++		    0x00, 0x00, 0x0b])) ? 1 : 0;
++	}
++	catch(e)
++	{
++		return 0;
++	}
++});
++#endif
++
++bool CCodeGen_Wasm::HasTailCalls()
++{
++#ifdef __EMSCRIPTEN__
++	static const bool hasTailCalls = WasmValidateTailCall() != 0;
++	return hasTailCalls;
++#else
++	return false;
++#endif
++}
++
++//Pushes the next block's table value: table[(ctx->pc & mask) >> shift]
++void CCodeGen_Wasm::EmitChainIndex(const WASM_BLOCK_CHAIN& chain)
++{
++	PushContext();
++	m_functionStream.Write8(Wasm::INST_I32_LOAD);
++	m_functionStream.Write8(0x02);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, chain.pcOffset);
++	m_functionStream.Write8(Wasm::INST_I32_CONST);
++	CWasmModuleBuilder::WriteSLeb128(m_functionStream, static_cast<int32>(chain.pcMask));
++	m_functionStream.Write8(Wasm::INST_I32_AND);
++	m_functionStream.Write8(Wasm::INST_I32_CONST);
++	CWasmModuleBuilder::WriteSLeb128(m_functionStream, static_cast<int32>(chain.pcShift));
++	m_functionStream.Write8(Wasm::INST_I32_SHR_U);
++	m_functionStream.Write8(Wasm::INST_I32_CONST);
++	CWasmModuleBuilder::WriteSLeb128(m_functionStream, 2);
++	m_functionStream.Write8(Wasm::INST_I32_SHL);
++	m_functionStream.Write8(Wasm::INST_I32_LOAD);
++	m_functionStream.Write8(0x02);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, chain.functionTable);
++}
++
++void CCodeGen_Wasm::Emit_ExternJmpDyn(const STATEMENT& statement)
++{
++	auto src1 = statement.src1->GetSymbol().get();
++	assert(src1->m_type == SYM_CONSTANTPTR);
++	const auto& chain = *reinterpret_cast<const WASM_BLOCK_CHAIN*>(src1->m_valueLow);
++
++	//if(ctx->exception == 0)
++	PushContext();
++	m_functionStream.Write8(Wasm::INST_I32_LOAD);
++	m_functionStream.Write8(0x02);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, chain.exceptionOffset);
++	m_functionStream.Write8(Wasm::INST_I32_EQZ);
++	m_functionStream.Write8(Wasm::INST_IF);
++	m_functionStream.Write8(0x40);
++	if(chain.tailCalls)
++	{
++		//if(next != 0) return_call_indirect(next)(ctx)
++		EmitChainIndex(chain);
++		m_functionStream.Write8(Wasm::INST_IF);
++		m_functionStream.Write8(0x40);
++		PushContext();
++		EmitChainIndex(chain);
++		auto sigIdxIterator = m_signatures.find("vi");
++		assert(sigIdxIterator != std::end(m_signatures));
++		m_functionStream.Write8(Wasm::INST_RETURN_CALL_INDIRECT);
++		CWasmModuleBuilder::WriteULeb128(m_functionStream, sigIdxIterator->second);
++		m_functionStream.Write8(0x00); //Table index
++		m_functionStream.Write8(Wasm::INST_END);
++	}
++	else
++	{
++		//ctx->nextFunction = next (the dispatcher calls it without looking the block up)
++		PushContext();
++		EmitChainIndex(chain);
++		m_functionStream.Write8(Wasm::INST_I32_STORE);
++		m_functionStream.Write8(0x02);
++		CWasmModuleBuilder::WriteULeb128(m_functionStream, chain.nextFunctionOffset);
++	}
++	m_functionStream.Write8(Wasm::INST_END);
++}
++
+ void CCodeGen_Wasm::Emit_Jmp(const STATEMENT& statement)
+ {
+ 	auto labelFlowIterator = m_labelFlows.find(statement.jmpBlock);
+@@ -1393,3 +1539,13 @@ void CCodeGen_Wasm::Emit_ExtHigh64VarMem64(const STATEMENT& statement)
  
  	CommitSymbol(dst);
  }
@@ -282,3 +448,53 @@ index 60e1b6b..d486caf 100644
 +	PrepareSymbolUse(src1);
 +	CommitSymbol(dst);
 +}
+diff --git a/src/MemoryFunction.cpp b/src/MemoryFunction.cpp
+index 73a3dab..d820143 100644
+--- a/src/MemoryFunction.cpp
++++ b/src/MemoryFunction.cpp
+@@ -56,12 +56,31 @@ EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
+ 	});
+ 	let fct = moduleInstance.exports.codeGenFunc;
+ 	let fctId = addFunction(fct, 'vi');
++	//Also in the table generated code calls through (block chaining tail-calls into it)
++	let table = Module.codeGenImportTable;
++	if(!Module.codeGenChainFree) Module.codeGenChainFree = [];
++	if(!Module.codeGenChainIds) Module.codeGenChainIds = new Map();
++	let chainId = Module.codeGenChainFree.length ? Module.codeGenChainFree.pop() : table.grow(1);
++	table.set(chainId, fct);
++	Module.codeGenChainIds.set(fctId, chainId);
+ 	return fctId;
+ });
+ EM_JS(void, WasmDeleteFunction, (int fctId),
+ {
++	let chainId = Module.codeGenChainIds ? Module.codeGenChainIds.get(fctId) : undefined;
++	if(chainId !== undefined)
++	{
++		Module.codeGenImportTable.set(chainId, null);
++		Module.codeGenChainFree.push(chainId);
++		Module.codeGenChainIds.delete(fctId);
++	}
+ 	removeFunction(fctId);
+ });
++EM_JS(int, WasmChainId, (int fctId),
++{
++	let chainId = Module.codeGenChainIds ? Module.codeGenChainIds.get(fctId) : undefined;
++	return chainId === undefined ? 0 : chainId;
++});
+ EM_JS(emscripten::EM_VAL, WasmCreateModule, (uintptr_t code, uintptr_t size),
+ {
+ 	//var fs = require('fs');
+@@ -199,6 +218,13 @@ void CMemoryFunction::operator()(void* context)
+ 	fct(context);
+ }
+ 
++#ifdef MEMFUNC_USE_WASM
++uint32 CMemoryFunction::GetWasmChainIndex() const
++{
++	return m_code ? static_cast<uint32>(WasmChainId(static_cast<int>(reinterpret_cast<uintptr_t>(m_code)))) : 0;
++}
++#endif
++
+ void* CMemoryFunction::GetCode() const
+ {
+ 	return m_code;

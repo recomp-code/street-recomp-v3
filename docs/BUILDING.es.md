@@ -212,6 +212,13 @@ nativo están dentro de `__EMSCRIPTEN__`.
   y es el que reordena las texturas descritas arriba.
   El hilo de GL pasó de ~40% a ~29% en un partido. Las líneas `[webgs] image transfers` cuentan ambos
   caminos; `[webgs] VU1 worker N% busy` y `[sched] ... game thread N% busy` muestran la carga de cada hilo.
+- Encadenamiento de bloques de la VU1 (`BasicBlock.cpp` `CompileChain`, `GenericMipsExecutor.h`, CodeGen
+  `Emit_ExternJmpDyn`): la VU1 ejecuta ~7 millones de bloques por segundo de ~6 instrucciones. Al final de
+  cada bloque el siguiente se busca por el pc en una tabla del ejecutor y se entra con una llamada de cola de
+  wasm (`return_call_indirect`, Chrome 112+, Firefox 121+, Safari 18.2+); los navegadores sin llamadas de cola
+  usan un trampolín (`nextBlockFunction`). El código va en su propio bloque condicional para que el Jitter
+  escriba antes nPC en memoria. Hilo VU1 ~51% -> ~42% en un Mac con llamadas de cola. `?chain=0` lo desactiva,
+  `?chain=dispatch` fuerza el trampolín.
 - Microprogramas de la VU (`ee/VuExecutor.cpp`): las particiones se recuerdan por (contenido de la
   micromemoria, inicio del bloque), así que al volver a cargar un microprograma se reutilizan sus
   bloques.
