@@ -207,8 +207,10 @@ their own patches, and the few runtime changes shared with native code are behin
   whole blocks are gathered on the thread that feeds the GS (VIF1/VU1 worker), swizzled into 256-byte
   GS blocks there, and the GS thread only compares and copies blocks, in the same order as before
   (anything else sent to the GS thread mid-transfer first gets the data received so far, as before).
-  The swizzling itself runs on a helper thread (`SwizzleThreadProc`); the GS thread waits for a transfer's
-  blocks when it reaches it, so the VIF1/VU1 worker (the busiest thread on phones) only gathers the data.
+- The GIF runs in a thread of its own (`play_gs_host.cpp`, `GifThread`; Play!'s `CGIF::IAsyncSink` lets the VIF1
+  queue DIRECT packets, MSKPATH3 and read-backs): the VIF1/VU1 worker queues XGKICK packets (copied from VU1
+  memory, length from the GIF tags), transfers, vsyncs and registers in order and goes on. The GIF thread is
+  woken in batches (one wake per packet cost the worker ~16%) and swizzles the texture transfers above.
   The GL thread's share in a match fell from ~40% to ~29%. `[webgs] image transfers` lines count both paths;
   `[webgs] VU1 worker N% busy` and `[sched] ... game thread N% busy` show each thread's load.
 - VU microprograms (`ee/VuExecutor.cpp`): partitions are remembered per (micro memory contents,

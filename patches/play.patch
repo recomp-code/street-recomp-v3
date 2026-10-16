@@ -1,3 +1,108 @@
+diff --git a/Source/ee/GIF.h b/Source/ee/GIF.h
+index 2713062..8d60e31 100644
+--- a/Source/ee/GIF.h
++++ b/Source/ee/GIF.h
+@@ -63,6 +63,26 @@ public:
+ 
+ 	CGSHandler* GetGsHandler();
+ 
++	//Optional: a host that runs the GIF in a thread of its own gives the VIF this sink, and the VIF
++	//queues its GIF work there (in order) instead of processing it in the VIF/VU thread
++	class IAsyncSink
++	{
++	public:
++		virtual ~IAsyncSink() = default;
++		virtual void QueuePackets(const uint8* data, uint32 size, uint32 pathIndex) = 0;
++		virtual void QueuePath3Mask(bool masked) = 0;
++		//Waits for the queued work, then reads (local to host transfers)
++		virtual void ReadImageData(void* data, uint32 size) = 0;
++	};
++	void SetAsyncSink(IAsyncSink* sink)
++	{
++		m_asyncSink = sink;
++	}
++	IAsyncSink* GetAsyncSink() const
++	{
++		return m_asyncSink;
++	}
++
+ 	uint32 GetActivePath() const;
+ 	void SetPath3Masked(bool);
+ 
+@@ -70,6 +90,7 @@ public:
+ 	void SaveState(Framework::CZipArchiveWriter&);
+ 
+ private:
++	IAsyncSink* m_asyncSink = nullptr;
+ 	enum
+ 	{
+ 		FIFO_QWC = 0x10,
+diff --git a/Source/ee/Vif1.cpp b/Source/ee/Vif1.cpp
+index 6ad8461..8f1249d 100644
+--- a/Source/ee/Vif1.cpp
++++ b/Source/ee/Vif1.cpp
+@@ -85,8 +85,15 @@ uint32 CVif1::ReceiveDMA(uint32 address, uint32 qwc, uint32 direction, bool tagI
+ 			address &= (PS2::EE_RAM_SIZE - 1);
+ 			assert((address + size) <= PS2::EE_RAM_SIZE);
+ 		}
+-		auto gs = m_gif.GetGsHandler();
+-		gs->ReadImageData(source + address, size);
++		if(auto sink = m_gif.GetAsyncSink())
++		{
++			sink->ReadImageData(source + address, size);
++		}
++		else
++		{
++			auto gs = m_gif.GetGsHandler();
++			gs->ReadImageData(source + address, size);
++		}
+ 		return qwc;
+ 	}
+ 	else
+@@ -111,7 +118,10 @@ void CVif1::ExecuteCommand(StreamType& stream, CODE nCommand)
+ 		m_BASE = nCommand.nIMM;
+ 		break;
+ 	case CODE_CMD_MSKPATH3:
+-		m_gif.SetPath3Masked((nCommand.nIMM & 0x8000) != 0);
++		if(auto sink = m_gif.GetAsyncSink())
++			sink->QueuePath3Mask((nCommand.nIMM & 0x8000) != 0);
++		else
++			m_gif.SetPath3Masked((nCommand.nIMM & 0x8000) != 0);
+ 		break;
+ 	case CODE_CMD_FLUSH:
+ 		if(!m_vpu.IsVuReady())
+@@ -181,8 +191,12 @@ void CVif1::Cmd_DIRECT(StreamType& stream, CODE nCommand)
+ 			if(m_directQwordBufferIndex == QWORD_SIZE)
+ 			{
+ 				assert(m_CODE.nIMM != 0);
+-				uint32 processed = m_gif.ProcessMultiplePackets(m_directQwordBuffer,
+-				                                                QWORD_SIZE, 0, QWORD_SIZE, CGsPacketMetadata(2));
++				uint32 processed = QWORD_SIZE;
++				if(auto sink = m_gif.GetAsyncSink())
++					sink->QueuePackets(m_directQwordBuffer, QWORD_SIZE, 2);
++				else
++					processed = m_gif.ProcessMultiplePackets(m_directQwordBuffer,
++					                                         QWORD_SIZE, 0, QWORD_SIZE, CGsPacketMetadata(2));
+ 				if(processed != 0)
+ 				{
+ 					assert(processed == QWORD_SIZE);
+@@ -198,7 +212,15 @@ void CVif1::Cmd_DIRECT(StreamType& stream, CODE nCommand)
+ 			nSize = std::min<uint32>(m_CODE.nIMM * 0x10, nSize & ~0xF);
+ 
+ 			auto packet = stream.GetDirectPointer();
+-			uint32 processed = m_gif.ProcessMultiplePackets(packet, nSize, 0, nSize, CGsPacketMetadata(2));
++			uint32 processed = nSize;
++			if(auto sink = m_gif.GetAsyncSink())
++			{
++				if(nSize != 0) sink->QueuePackets(packet, nSize, 2);
++			}
++			else
++			{
++				processed = m_gif.ProcessMultiplePackets(packet, nSize, 0, nSize, CGsPacketMetadata(2));
++			}
+ 			assert(processed <= nSize);
+ 			stream.Advance(processed);
+ 			//Adjust size in case not everything was processed by GIF
 diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
 index 72e80fc..adf8702 100644
 --- a/Source/ee/VuExecutor.cpp
@@ -2482,7 +2587,7 @@ index 01a1217..3d867f5 100644
  	return texInfo;
  }
 diff --git a/Source/gs/GSHandler.cpp b/Source/gs/GSHandler.cpp
-index 57e58ba..e49600f 100644
+index 57e58ba..d1e67a9 100644
 --- a/Source/gs/GSHandler.cpp
 +++ b/Source/gs/GSHandler.cpp
 @@ -1,5 +1,6 @@
@@ -2500,24 +2605,7 @@ index 57e58ba..e49600f 100644
  #include "GsPixelFormats.h"
  #include "string_format.h"
  #include "ThreadUtils.h"
-@@ -111,6 +113,16 @@ CGSHandler::CGSHandler(bool gsThreaded)
- 
- CGSHandler::~CGSHandler()
- {
-+	if(m_swizzleThread.joinable())
-+	{
-+		//Queued transfers are finished first: the GS thread may be waiting for one
-+		{
-+			std::lock_guard<std::mutex> lock(m_swizzleQueueMutex);
-+			m_swizzleQuit = true;
-+		}
-+		m_swizzleQueueCondition.notify_all();
-+		m_swizzleThread.join();
-+	}
- 	if(m_gsThreaded)
- 	{
- 		SendGSCall([this]() { m_threadDone = true; });
-@@ -152,6 +164,7 @@ void CGSHandler::ResetBase()
+@@ -152,6 +154,7 @@ void CGSHandler::ResetBase()
  	memset(m_nReg, 0, sizeof(uint64) * 0x80);
  	memset(m_pRAM, 0, RAMSIZE);
  	memset(m_pCLUT, 0, CLUTSIZE);
@@ -2525,7 +2613,7 @@ index 57e58ba..e49600f 100644
  	memset(&m_trxCtx, 0, sizeof(m_trxCtx));
  	m_nPMODE = 0;
  	m_nSMODE2 = 0x3; // Interlacing with fullframe
-@@ -173,6 +186,8 @@ void CGSHandler::ResetBase()
+@@ -173,6 +176,8 @@ void CGSHandler::ResetBase()
  #ifdef _DEBUG
  	m_transferCount = 0;
  #endif
@@ -2534,7 +2622,7 @@ index 57e58ba..e49600f 100644
  	m_framesInFlight = 0;
  	m_writeBufferSize = 0;
  	m_writeBufferProcessIndex = 0;
-@@ -285,6 +300,7 @@ void CGSHandler::SaveState(Framework::CZipArchiveWriter& archive)
+@@ -285,6 +290,7 @@ void CGSHandler::SaveState(Framework::CZipArchiveWriter& archive)
  
  void CGSHandler::LoadState(Framework::CZipArchiveReader& archive)
  {
@@ -2542,7 +2630,7 @@ index 57e58ba..e49600f 100644
  	archive.BeginReadFile(STATE_RAM)->Read(GetRam(), RAMSIZE);
  	archive.BeginReadFile(STATE_REGS)->Read(m_nReg, sizeof(uint64) * CGSHandler::REGISTER_MAX);
  	archive.BeginReadFile(STATE_TRXCTX)->Read(&m_trxCtx, sizeof(TRXCONTEXT));
-@@ -622,6 +638,21 @@ void CGSHandler::FeedImageData(const void* data, uint32 length)
+@@ -622,6 +628,21 @@ void CGSHandler::FeedImageData(const void* data, uint32 length)
  	assert(m_writeBufferProcessIndex == m_writeBufferSize);
  	SubmitWriteBuffer();
  
@@ -2564,7 +2652,7 @@ index 57e58ba..e49600f 100644
  #ifdef _DEBUG
  	m_transferCount++;
  #endif
-@@ -693,6 +724,23 @@ void CGSHandler::ProcessWriteBuffer(const CGsPacketMetadata* metadata)
+@@ -693,6 +714,23 @@ void CGSHandler::ProcessWriteBuffer(const CGsPacketMetadata* metadata)
  			m_nCSR |= CSR_FINISH_EVENT;
  			NotifyEvent(CSR_FINISH_EVENT);
  			break;
@@ -2588,7 +2676,7 @@ index 57e58ba..e49600f 100644
  		case GS_REG_LABEL:
  		{
  			auto label = make_convertible<LABEL>(write.second);
-@@ -978,30 +1026,43 @@ bool CGSHandler::TransferWriteHandlerGeneric(const void* pData, uint32 nLength)
+@@ -978,30 +1016,43 @@ bool CGSHandler::TransferWriteHandlerGeneric(const void* pData, uint32 nLength)
  
  	nLength /= sizeof(typename Storage::Unit);
  
@@ -2649,7 +2737,7 @@ index 57e58ba..e49600f 100644
  
  	return nDirty;
  }
-@@ -1037,44 +1098,80 @@ bool CGSHandler::TransferWriteHandlerPSMCT24(const void* pData, uint32 nLength)
+@@ -1037,44 +1088,80 @@ bool CGSHandler::TransferWriteHandlerPSMCT24(const void* pData, uint32 nLength)
  	return true;
  }
  
@@ -2754,7 +2842,7 @@ index 57e58ba..e49600f 100644
  
  	return dirty;
  }
-@@ -1484,19 +1581,34 @@ void CGSHandler::SyncCLUT(const TEX0& tex0)
+@@ -1484,19 +1571,34 @@ void CGSHandler::SyncCLUT(const TEX0& tex0)
  {
  	if(!ProcessCLD(tex0)) return;
  
@@ -2800,7 +2888,7 @@ index 57e58ba..e49600f 100644
  }
  
  bool CGSHandler::ProcessCLD(const TEX0& tex0)
-@@ -1584,7 +1696,7 @@ bool CGSHandler::ReadCLUT8_16(const TEX0& tex0)
+@@ -1584,7 +1686,7 @@ bool CGSHandler::ReadCLUT8_16(const TEX0& tex0)
  	return changed;
  }
  
@@ -2809,7 +2897,7 @@ index 57e58ba..e49600f 100644
  {
  	bool changed = false;
  
-@@ -1663,9 +1775,10 @@ void CGSHandler::ReadCLUT4(const TEX0& tex0)
+@@ -1663,9 +1765,10 @@ void CGSHandler::ReadCLUT4(const TEX0& tex0)
  	{
  		ProcessClutTransfer(tex0.nCSA, 0);
  	}
@@ -2821,7 +2909,7 @@ index 57e58ba..e49600f 100644
  {
  	assert(tex0.nCSA == 0);
  
-@@ -1742,6 +1855,7 @@ void CGSHandler::ReadCLUT8(const TEX0& tex0)
+@@ -1742,6 +1845,7 @@ void CGSHandler::ReadCLUT8(const TEX0& tex0)
  	{
  		ProcessClutTransfer(tex0.nCSA, 0);
  	}
@@ -2829,7 +2917,7 @@ index 57e58ba..e49600f 100644
  }
  
  bool CGSHandler::IsCompatibleFramebufferPSM(unsigned int psmFb, unsigned int psmTex)
-@@ -2185,6 +2299,12 @@ void CGSHandler::ThreadProc()
+@@ -2185,6 +2289,12 @@ void CGSHandler::ThreadProc()
  
  void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitForCompletion, bool forceWaitForCompletion)
  {
@@ -2842,7 +2930,7 @@ index 57e58ba..e49600f 100644
  	if(!m_gsThreaded)
  	{
  		waitForCompletion = false;
-@@ -2195,9 +2315,255 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
+@@ -2195,9 +2305,227 @@ void CGSHandler::SendGSCall(const CMailBox::FunctionType& function, bool waitFor
  
  void CGSHandler::SendGSCall(CMailBox::FunctionType&& function)
  {
@@ -3000,53 +3088,25 @@ index 57e58ba..e49600f 100644
 +
 +void CGSHandler::ProducerFinishTransfer()
 +{
++	//Swizzled right here, in the thread that feeds the GS (the web host runs the GIF in a thread of
++	//its own with room to spare; waking a helper thread for each of the thousands of transfers per
++	//second cost more than the swizzling)
 +	m_producerTransfer.active = false;
 +	m_producerSwizzled++;
-+	auto job = std::make_shared<SWIZZLE_JOB>();
-+	job->transfer = std::move(m_producerTransfer);
++	SWIZZLE_JOB job;
++	job.transfer = std::move(m_producerTransfer);
 +	m_producerTransfer = PRODUCER_TRANSFER();
-+	{
-+		std::lock_guard<std::mutex> lock(m_swizzleQueueMutex);
-+		if(!m_swizzleThread.joinable())
-+		{
-+			m_swizzleThread = std::thread([this]() { SwizzleThreadProc(); });
-+		}
-+		m_swizzleQueue.push_back(job);
-+	}
-+	m_swizzleQueueCondition.notify_one();
++	SwizzleJob(job);
++	uint8* blocks = job.blocks;
++	const uint32 blockCount = job.blockCount;
++	const uint32 length = job.transfer.size;
 +	m_producerSending = true;
 +	SendGSCall(
-+	    [this, job]() {
-+		    {
-+			    std::unique_lock<std::mutex> lock(job->mutex);
-+			    job->doneCondition.wait(lock, [&]() { return job->done; });
-+		    }
-+		    ApplyTransferBlocks(job->blocks, job->blockCount, job->transfer.size);
-+		    delete[] job->blocks;
-+		    job->blocks = nullptr;
++	    [this, blocks, blockCount, length]() {
++		    ApplyTransferBlocks(blocks, blockCount, length);
++		    delete[] blocks;
 +	    });
 +	m_producerSending = false;
-+}
-+
-+void CGSHandler::SwizzleThreadProc()
-+{
-+	for(;;)
-+	{
-+		std::shared_ptr<SWIZZLE_JOB> job;
-+		{
-+			std::unique_lock<std::mutex> lock(m_swizzleQueueMutex);
-+			m_swizzleQueueCondition.wait(lock, [this]() { return m_swizzleQuit || !m_swizzleQueue.empty(); });
-+			if(m_swizzleQueue.empty()) return;
-+			job = std::move(m_swizzleQueue.front());
-+			m_swizzleQueue.pop_front();
-+		}
-+		SwizzleJob(*job);
-+		{
-+			std::lock_guard<std::mutex> lock(job->mutex);
-+			job->done = true;
-+		}
-+		job->doneCondition.notify_all();
-+	}
 +}
 +
 +void CGSHandler::SwizzleJob(SWIZZLE_JOB& job)
@@ -3099,7 +3159,7 @@ index 57e58ba..e49600f 100644
  {
  	assert(!m_gsThreaded);
 diff --git a/Source/gs/GSHandler.h b/Source/gs/GSHandler.h
-index 66bfe59..503a8b6 100644
+index 66bfe59..95e5269 100644
 --- a/Source/gs/GSHandler.h
 +++ b/Source/gs/GSHandler.h
 @@ -2,6 +2,10 @@
@@ -3144,7 +3204,7 @@ index 66bfe59..503a8b6 100644
  
  	FlipCompleteEvent OnFlipComplete;
  	NewFrameEvent OnNewFrame;
-@@ -1080,8 +1101,51 @@ protected:
+@@ -1080,8 +1101,41 @@ protected:
  	bool ReadCLUT4_16(const TEX0&);
  	template <typename Indexor>
  	bool ReadCLUT8_16(const TEX0&);
@@ -3160,30 +3220,20 @@ index 66bfe59..503a8b6 100644
 +		uint32 size = 0; //bytes the transfer takes
 +		std::vector<uint8> data;
 +	};
-+	//A finished transfer, swizzled by m_swizzleThread while the producer goes on; the GS thread waits
-+	//for it (if needed) when it reaches the transfer's place in its queue
++	//A finished transfer and its swizzled GS blocks
 +	struct SWIZZLE_JOB
 +	{
 +		PRODUCER_TRANSFER transfer;
 +		uint8* blocks = nullptr;
 +		uint32 blockCount = 0;
-+		std::mutex mutex;
-+		std::condition_variable doneCondition;
-+		bool done = false;
 +	};
 +	void ProducerBeginTransfer(uint64 trxDir);
 +	void ProducerFlushRaw();
 +	void ProducerFinishTransfer();
-+	void SwizzleThreadProc();
 +	static void SwizzleJob(SWIZZLE_JOB&);
 +	template <typename Storage>
 +	static void ProducerSwizzleBlocks(const PRODUCER_TRANSFER&, uint8*, uint32 blockWidth, uint32 blockHeight);
 +	static void ProducerSwizzleBlocksPSMT4(const PRODUCER_TRANSFER&, uint8*);
-+	std::thread m_swizzleThread;
-+	std::mutex m_swizzleQueueMutex;
-+	std::condition_variable m_swizzleQueueCondition;
-+	std::deque<std::shared_ptr<SWIZZLE_JOB>> m_swizzleQueue;
-+	bool m_swizzleQuit = false;
 +	void ApplyTransferBlocks(const uint8*, uint32 blockCount, uint32 length);
 +	bool m_producerSwizzle = false;
 +	bool m_producerSending = false;
@@ -3198,7 +3248,7 @@ index 66bfe59..503a8b6 100644
  
  	static bool IsCompatibleFramebufferPSM(unsigned int, unsigned int);
  
-@@ -1107,6 +1171,10 @@ protected:
+@@ -1107,6 +1161,10 @@ protected:
  	uint8* m_pRAM = nullptr;
  
  	uint16* m_pCLUT = nullptr;
