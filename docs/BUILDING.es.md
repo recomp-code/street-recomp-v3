@@ -182,6 +182,12 @@ nativo están dentro de `__EMSCRIPTEN__`.
   que el SPU2 los consume y CHCR sigue ocupado hasta que termina; el IOP avanza el SPU2 cada 768 ciclos,
   también dentro de ejecuciones largas (el driver de sonido de EA espera en un manejador RPC la
   interrupción de fin de DMA).
+- El tiempo del IOP sigue un objetivo absoluto calculado a partir del tiempo del EE: el mezclador
+  nativo de EA suma ~11,5k ciclos de golpe, y empezar cada tramo donde acabó el anterior adelantaba
+  el IOP ~3%, así que el sonido de los vídeos se consumía más rápido de lo que llegaba y el driver
+  repetía bloques (un zumbido de ~94 Hz).
+- Diagnóstico: `?vustats=1&chain=0` (estadísticas de bloques de la VU1), `?env=NOMBRE=valor`
+  (variables de entorno), `Module._ps2xSpu2Dump()` (últimos 8 s de entradas y salida del SPU2).
 - Planificador del EE: espera dormida con el tiempo avanzando en pasos de 1 ms, rebase del vblank
   tras atascos.
 - Sockets del DEV9 por un WebSocket (online).

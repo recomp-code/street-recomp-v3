@@ -118,7 +118,8 @@ nbastreet-v3-recomp/tools/web/serve.sh      # then open http://localhost:8088 in
   - PCSX2's SPU2 (sound processor): reverb, noise, pitch modulation, the hardware's DMA timing and
     Gaussian interpolation, with a peak limiter on the output;
   - played through an AudioWorklet with adaptive buffering;
-  - emulated time keeps flowing smoothly, so streamed music and commentary never repeat or click.
+  - emulated time keeps flowing smoothly, and the IOP stays in step with the EE, so streamed music,
+    commentary and video sound never repeat, buzz or click.
 - **Online:** the same community server as the PC version. The game's network adapter talks over one
   WebSocket to a small relay (`tools/web/net_relay.py`) that can only reach the game server.
 - **Controllers and keyboard:** any browser gamepad (standard or not) and keyboard.

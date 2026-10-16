@@ -187,6 +187,11 @@ their own patches, and the few runtime changes shared with native code are behin
   `spu2.cpp`) behind the IOP's `Spu2` class. DMA 4/7 data is read from IOP RAM as the SPU2 consumes
   it and CHCR stays busy until it finishes; the IOP advances the SPU2 every 768 cycles, also inside
   long runs (EA's sound driver busy-waits in an RPC handler for the DMA-completion interrupt).
+- IOP time runs to an absolute target derived from EE time: the native EA mixer charges ~11.5k
+  cycles at once, and taking each slice from wherever the last one ended let the IOP run ~3% ahead,
+  so FMV sound was consumed faster than it arrived and the driver repeated blocks (a ~94 Hz buzz).
+- Diagnostics: `?vustats=1&chain=0` (VU1 block statistics), `?env=NAME=value` (environment
+  variables), `Module._ps2xSpu2Dump()` (last 8 s of SPU2 inputs and output).
 - EE scheduler: idle-loop sleep with time flowing in 1 ms steps, vblank rebase after stalls.
 - DEV9 sockets over a WebSocket (online).
 - WebAssembly-only fast paths in the recompiled code's runtime:

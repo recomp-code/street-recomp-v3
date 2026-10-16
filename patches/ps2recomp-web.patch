@@ -18,7 +18,7 @@ index c7c7af5..97c9613 100644
  if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64|ARM64")
      set(PS2X_IS_ARM_TARGET ON)
 diff --git a/ps2xIOP/CMakeLists.txt b/ps2xIOP/CMakeLists.txt
-index a2d29cb..cb5ed1c 100644
+index a2d29cb..61ee984 100644
 --- a/ps2xIOP/CMakeLists.txt
 +++ b/ps2xIOP/CMakeLists.txt
 @@ -69,6 +69,34 @@ set(PS2X_DEV9_SOURCES
@@ -56,6 +56,18 @@ index a2d29cb..cb5ed1c 100644
  if(MSVC)
      set_source_files_properties(${PS2X_DEV9_SOURCES} src/emulator/core/iop_dev9.cpp
          PROPERTIES COMPILE_OPTIONS "/W0;/wd4996;/utf-8")
+@@ -85,6 +113,11 @@ endif()
+ 
+ target_compile_features(ps2_iop PUBLIC cxx_std_20)
+ 
++if(EMSCRIPTEN)
++    # Same ThinLTO as the runtime, so the IOP interpreter and the SPU2 mixer inline across files.
++    target_compile_options(ps2_iop PRIVATE -flto=thin)
++endif()
++
+ target_include_directories(ps2_iop
+     PUBLIC
+         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 diff --git a/ps2xIOP/include/ps2x/host_intrin.h b/ps2xIOP/include/ps2x/host_intrin.h
 index 43bc85f..ea93884 100644
 --- a/ps2xIOP/include/ps2x/host_intrin.h
@@ -1973,18 +1985,19 @@ index 0000000..2f99b0d
 +
 +#endif
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index 423e0f0..33d6cfb 100644
+index 423e0f0..f6fe2b8 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
-@@ -148,6 +148,7 @@ namespace ps2x::iop::detail
+@@ -148,6 +148,8 @@ namespace ps2x::iop::detail
              nextModuleId = 1;
              moduleCursor = kModuleLoadBase;
              totalCycles = 0;
 +            lastSpu2Service = 0;
++            iopTargetCycles = 0;
              totalInstructions = 0;
              eeCycleCarry = 0;
              activeCpu = nullptr;
-@@ -713,9 +714,9 @@ namespace ps2x::iop::detail
+@@ -713,9 +715,9 @@ namespace ps2x::iop::detail
                  }();
                  const uint32_t traceArgs[4] = {cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]};
                  const uint32_t traceRa = cpu.gpr[31];
@@ -1996,7 +2009,7 @@ index 423e0f0..33d6cfb 100644
                  // PS2X_IOP_IMPORT_TRACE_SKIP="thbase,thevent": libraries left out of the trace.
                  static const std::string s_traceSkip = []
                  {
-@@ -802,6 +803,10 @@ namespace ps2x::iop::detail
+@@ -802,6 +804,10 @@ namespace ps2x::iop::detail
                  }
                  if (!step(cpu))
                      break;
@@ -2007,7 +2020,7 @@ index 423e0f0..33d6cfb 100644
                  if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                      servicePendingDmaInterrupts();
                  if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
-@@ -976,10 +981,19 @@ namespace ps2x::iop::detail
+@@ -976,10 +982,19 @@ namespace ps2x::iop::detail
          // interrupt (line 9), delivered through the same path as the SPU2 DMA interrupts.
          void serviceSpu2()
          {
@@ -2027,7 +2040,21 @@ index 423e0f0..33d6cfb 100644
          }
  
          // DEV9 (network adapter): received frames and register writes raise the SPEED interrupt
-@@ -1035,9 +1049,9 @@ namespace ps2x::iop::detail
+@@ -1029,15 +1044,22 @@ namespace ps2x::iop::detail
+         {
+             try
+             {
+-                const uint64_t target = totalCycles + cycles;
++                // Absolute target: work that overshoots a slice (the native EA mixer charges its
++                // ~11.5k cycles at once) is taken off the next slices. Relative targets let the IOP
++                // run ~3% ahead of the EE during FMVs, so the SPU2 played the video's sound faster
++                // than the game delivered it and the sound driver repeated blocks (a buzz).
++                iopTargetCycles += cycles;
++                if (iopTargetCycles + kMaxIopLeadCycles < totalCycles || totalCycles + kMaxIopLeadCycles < iopTargetCycles)
++                    iopTargetCycles = totalCycles + cycles; // far apart (reset, long stall): resync
++                const uint64_t target = iopTargetCycles;
+                 while (totalCycles < target)
+                 {
                      serviceDev9();
                      serviceAlarms();
                      {
@@ -2039,7 +2066,7 @@ index 423e0f0..33d6cfb 100644
                      }
                      servicePendingDmaInterrupts();
                      servicePendingGuestCallbacks();
-@@ -1059,9 +1073,9 @@ namespace ps2x::iop::detail
+@@ -1059,9 +1081,9 @@ namespace ps2x::iop::detail
                          continue;
                      }
                      const uint64_t before = totalCycles;
@@ -2051,15 +2078,17 @@ index 423e0f0..33d6cfb 100644
                      kernel.endTimeslice(*next, kThreadReturnSentinel);
                      if (totalCycles == before)
                          ++totalCycles;
-@@ -1221,6 +1235,7 @@ namespace ps2x::iop::detail
+@@ -1221,6 +1243,9 @@ namespace ps2x::iop::detail
          uint32_t nextModuleId = 1;
          uint32_t moduleCursor = kModuleLoadBase;
          uint64_t totalCycles = 0;
 +        uint64_t lastSpu2Service = 0;
++        uint64_t iopTargetCycles = 0;                                  // where EE time says the IOP should be
++        static constexpr uint64_t kMaxIopLeadCycles = 36864000u / 10u; // 100 ms
          uint64_t totalInstructions = 0;
          uint64_t eeCycleCarry = 0;
          CpuState *activeCpu = nullptr;
-@@ -1296,9 +1311,9 @@ namespace ps2x::iop::detail
+@@ -1296,9 +1321,9 @@ namespace ps2x::iop::detail
          const uint64_t iopCycles = total / 8u;
          m_impl->eeCycleCarry = total % 8u;
          ++g_iopStatRunCalls;
@@ -2914,10 +2943,10 @@ index 0000000..833873d
 \ No newline at end of file
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/Mixer.cpp b/ps2xIOP/src/emulator/spu2/SPU2/Mixer.cpp
 new file mode 100644
-index 0000000..6e3dabc
+index 0000000..eeb6883
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/Mixer.cpp
-@@ -0,0 +1,616 @@
+@@ -0,0 +1,620 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -2948,6 +2977,8 @@ index 0000000..6e3dabc
 +int g_counter_cache_misses = 0;
 +int g_counter_cache_ignores = 0;
 +#endif
++
++void ps2xSpu2DebugInput(const StereoOut32& core0, const StereoOut32& core1);
 +
 +MULTI_ISA_UNSHARED_START
 +
@@ -3453,6 +3484,8 @@ index 0000000..6e3dabc
 +			// CDDA is on Core 1:
 +			(PlayMode & 8) ? StereoOut32::Empty : ApplyVolume(Cores[1].ReadInput(), Cores[1].InpVol)};
 +
++	ps2xSpu2DebugInput(InputData[0], InputData[1]); // ps2recomp: debug capture (spu2_glue.cpp)
++
 +#ifdef PCSX2_DEVBUILD
 +	WaveDump::WriteCore(0, CoreSrc_Input, InputData[0]);
 +	WaveDump::WriteCore(1, CoreSrc_Input, InputData[1]);
@@ -3536,10 +3569,10 @@ index 0000000..6e3dabc
 +MULTI_ISA_UNSHARED_END
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/ReadInput.cpp b/ps2xIOP/src/emulator/spu2/SPU2/ReadInput.cpp
 new file mode 100644
-index 0000000..58e111f
+index 0000000..dad247e
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/ReadInput.cpp
-@@ -0,0 +1,160 @@
+@@ -0,0 +1,168 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -3549,6 +3582,8 @@ index 0000000..58e111f
 +#include "SPU2/Debug.h"
 +#include "SPU2/defs.h"
 +#include "SPU2/spu2.h"
++
++extern u32 g_spu2StaleHalves;
 +
 +// Core 0 Input is "SPDIF mode" - Source audio is AC3 compressed.
 +
@@ -3621,7 +3656,10 @@ index 0000000..58e111f
 +			}
 +		}
 +		else if ((AutoDMACtrl & (Index + 1)))
++		{
 +			AutoDMACtrl |= ~3;
++			g_spu2StaleHalves++; // ps2recomp: diagnostics, no data for this half
++		}
 +	}
 +	return retval;
 +}
@@ -3696,7 +3734,10 @@ index 0000000..58e111f
 +			}
 +		}
 +		else if ((AutoDMACtrl & (Index + 1)))
++		{
 +			AutoDMACtrl |= ~3;
++			g_spu2StaleHalves++; // ps2recomp: diagnostics, no data for this half
++		}
 +	}
 +	return retval;
 +}
@@ -5546,10 +5587,10 @@ index 0000000..d7e963a
 +
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/spu2_glue.cpp b/ps2xIOP/src/emulator/spu2/SPU2/spu2_glue.cpp
 new file mode 100644
-index 0000000..f2881b9
+index 0000000..521df42
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/spu2_glue.cpp
-@@ -0,0 +1,328 @@
+@@ -0,0 +1,388 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -5568,6 +5609,12 @@ index 0000000..f2881b9
 +
 +#include "spu2_bridge.h"
 +
++#ifdef __EMSCRIPTEN__
++#include <emscripten.h>
++#else
++#define EMSCRIPTEN_KEEPALIVE
++#endif
++
 +#include <cmath>
 +#include <cstdio>
 +#include <string>
@@ -5580,6 +5627,7 @@ index 0000000..f2881b9
 +s32 psxNextDeltaCounter = 0;
 +u32 psxNextStartCounter = 0;
 +
++u32 g_spu2StaleHalves = 0; // ReadInput.cpp
 +u32 HW_DMA4_MADR = 0;
 +u32 HW_DMA4_TADR = 0;
 +u32 HW_DMA7_MADR = 0;
@@ -5588,6 +5636,11 @@ index 0000000..f2881b9
 +namespace
 +{
 +	u8* s_iopRam = nullptr;
++	// AutoDMA timing (core 0): IRQ -> next transfer start, in samples; halves replayed because no data had come
++	u32 s_admaIrqCycles[2] = {0, 0};
++	bool s_admaIrqPending[2] = {false, false};
++	u32 s_admaLatencyHist[8] = {};
++	u32 s_admaLatencyMax = 0;
 +	bool s_irq = false;
 +	bool s_dmaDone[2] = {false, false};
 +	std::vector<int16_t> s_output;
@@ -5622,6 +5675,8 @@ index 0000000..f2881b9
 +{
 +	SPU2interruptDMA4();
 +	s_dmaDone[0] = true;
++	s_admaIrqCycles[0] = psxRegs.cycle;
++	s_admaIrqPending[0] = Cores[0].AutoDMACtrl & 1;
 +}
 +
 +void spu2DMA7Irq()
@@ -5726,6 +5781,35 @@ index 0000000..f2881b9
 +		SPU2_FastWrite(rmem, value);
 +}
 +
++// Debug capture of the last 8 s: per sample core 0 input, core 1 input and the final output (L, R each),
++// plus per-sample core 0 AutoDMA state; Module._ps2xSpu2Dump() returns them oldest first.
++namespace
++{
++	constexpr u32 kDumpFrames = 48000 * 8;
++	constexpr u32 kDumpWords = 8;
++	s16 s_dump[kDumpFrames * kDumpWords];
++	s16 s_dumpOut[kDumpFrames * kDumpWords];
++	u32 s_dumpPos = 0;
++} // namespace
++
++void ps2xSpu2DebugInput(const StereoOut32& core0, const StereoOut32& core1)
++{
++	s16* d = &s_dump[(s_dumpPos % kDumpFrames) * kDumpWords];
++	d[0] = static_cast<s16>(clamp_mix(core0.Left));
++	d[1] = static_cast<s16>(clamp_mix(core0.Right));
++	d[2] = static_cast<s16>(clamp_mix(core1.Left));
++	d[3] = static_cast<s16>(clamp_mix(core1.Right));
++	d[6] = static_cast<s16>(OutPos);
++	d[7] = static_cast<s16>((Cores[0].InputDataLeft & 0x7FFF) | (Cores[0].AdmaInProgress ? 0x8000 : 0));
++}
++
++extern "C" EMSCRIPTEN_KEEPALIVE s16* ps2xSpu2Dump()
++{
++	for (u32 i = 0; i < kDumpFrames; i++)
++		std::memcpy(&s_dumpOut[i * kDumpWords], &s_dump[((s_dumpPos + i) % kDumpFrames) * kDumpWords], kDumpWords * sizeof(s16));
++	return s_dumpOut;
++}
++
 +// A simple DC blocking high-pass filter (some games leave paused voices with their volume up).
 +// From http://peabody.sapp.org/class/dmp2/lab/dcblock/, as in PCSX2.
 +__forceinline void spu2Output(StereoOut32 out)
@@ -5749,11 +5833,14 @@ index 0000000..f2881b9
 +		s_limiterGain = kCeiling / peak;
 +	else if (s_limiterGain < 1.0f)
 +		s_limiterGain = std::min(1.0f, s_limiterGain + (1.0f - s_limiterGain) * 0.0001f + 0.000001f);
++	s16* d = &s_dump[(s_dumpPos % kDumpFrames) * kDumpWords];
 +	for (int c = 0; c < 2; c++)
 +	{
 +		const float scaled = filtered[c] * s_limiterGain * INT16_MAX;
 +		s_output.push_back(static_cast<int16_t>(std::clamp(scaled, -32768.0f, 32767.0f)));
++		d[4 + c] = s_output.back();
 +	}
++	s_dumpPos++;
 +}
 +
 +namespace ps2x::spu2
@@ -5802,6 +5889,13 @@ index 0000000..f2881b9
 +	void dmaWrite(uint32_t cycle, int core, uint32_t madr, uint32_t halfwords)
 +	{
 +		psxRegs.cycle = cycle;
++		if (core == 0 && s_admaIrqPending[0])
++		{
++			s_admaIrqPending[0] = false;
++			const u32 samples = (cycle - s_admaIrqCycles[0]) / 768;
++			s_admaLatencyMax = std::max(s_admaLatencyMax, samples);
++			s_admaLatencyHist[std::min<u32>(7, samples / 32)]++;
++		}
 +		setDmaMadr(core, madr);
 +		u16* data = reinterpret_cast<u16*>(iopPhysMem(madr));
 +		if (core == 0)
@@ -5868,6 +5962,13 @@ index 0000000..f2881b9
 +		}
 +		std::snprintf(line, sizeof(line), " playmode=%x outpos=%x madr=%x/%x", PlayMode, OutPos, HW_DMA4_MADR, HW_DMA7_MADR);
 +		text += line;
++		std::snprintf(line, sizeof(line), " adma irq->next start (samples, /32): %u %u %u %u %u %u %u %u max %u stale halves %u",
++			s_admaLatencyHist[0], s_admaLatencyHist[1], s_admaLatencyHist[2], s_admaLatencyHist[3], s_admaLatencyHist[4],
++			s_admaLatencyHist[5], s_admaLatencyHist[6], s_admaLatencyHist[7], s_admaLatencyMax, g_spu2StaleHalves);
++		text += line;
++		std::fill(std::begin(s_admaLatencyHist), std::end(s_admaLatencyHist), 0u);
++		s_admaLatencyMax = 0;
++		g_spu2StaleHalves = 0;
 +		return text;
 +	}
 +
@@ -9184,10 +9285,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..fdaf16c
+index 0000000..f869469
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,1549 @@
+@@ -0,0 +1,1576 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -9451,6 +9552,7 @@ index 0000000..fdaf16c
 +	bool g_hd = true;     // HD texture pack (data/hd/): on unless <page>?hd=0 (start screen setting)
 +	bool g_halfRate = false; // picture at 30 fps (the game at 60): <page>?fps=30
 +	bool g_fsr = true;       // FSR 1 upscaling to the window: on unless <page>?fsr=0 (start screen setting)
++	bool g_vuStats = false;  // ?vustats=1: VU1 block transition statistics (use with ?chain=0)
 +	int g_vuChainParam = 1;  // VU1 block chaining: 1 = tail calls if available, else dispatcher; 0 = off (?chain=0); 2 = dispatcher (?chain=dispatch)
 +	ps2live::RingHeader* g_ring = nullptr;
 +	// Canvas size in device pixels, measured on the page thread (the GL thread can't read CSS)
@@ -9902,6 +10004,24 @@ index 0000000..fdaf16c
 +			h.vuSlices++;
 +		}
 +		h.vuMs += emscripten_get_now() - start;
++		if(g_vuStats)
++		{
++			// ?vustats=1 (with ?chain=0): how VU1 blocks follow each other, for superblocks.
++			static double s_last = 0.0;
++			const double now = emscripten_get_now();
++			if(s_last == 0.0)
++				s_last = now;
++			else if(now - s_last >= 5000.0)
++			{
++				const auto stats = static_cast<CVuExecutor*>(h.vu1.m_executor.get())->TakeBlockStats();
++				const double n = static_cast<double>(std::max<uint64_t>(stats.entries, 1));
++				std::printf("[webgs] VU1 blocks: %.0f entries/s, %.1f instructions each, next block: fall-through %.0f%%, same block %.0f%%, "
++				            "most frequent successor %.0f%% (%u blocks)\n",
++				            stats.entries * 1000.0 / (now - s_last), stats.instructions / n, 100.0 * stats.fallThrough / n,
++				            100.0 * stats.sameBlock / n, 100.0 * stats.dominantSuccessor / n, stats.blocks);
++				s_last = now;
++			}
++		}
 +	}
 +
 +	void DebugStats(Host& h)
@@ -10422,6 +10542,12 @@ index 0000000..fdaf16c
 +				if(!g_debug)
 +					h.idleMs = h.vblankWaitMs = h.gifIdleMs = h.gifQueueWaitMs = 0.0;
 +			}
++			{
++				const auto& slow = gs.m_slowestFrameTimes;
++				std::printf("[webgs] slowest frame %.0f ms on the GL thread: draw batches %.0f ms (largest %.0f), transfers %.0f ms, "
++				            "flip %.0f ms (present %.0f)\n", slow.total, slow.batches, slow.largestBatch, slow.transfers, slow.flip, slow.present);
++				gs.m_slowestFrameTimes = CGSHandler::FRAME_TIMES();
++			}
 +			std::printf("[webgs] image transfers: %u swizzled in the VU1 worker; on the GL thread: %u format, %u alignment, %u range, %u interrupted\n",
 +			            gs.m_producerSwizzled, gs.m_producerDirect[0], gs.m_producerDirect[1], gs.m_producerDirect[2], gs.m_producerDirect[3]);
 +			gs.m_producerSwizzled = 0;
@@ -10465,6 +10591,7 @@ index 0000000..fdaf16c
 +			const bool tailCalls = (chainParam == 1) && Jitter::CCodeGen_Wasm::HasTailCalls();
 +			if(chainParam != 0)
 +				static_cast<CVuExecutor*>(vu1.m_executor.get())->EnableBlockChaining(tailCalls);
++			static_cast<CVuExecutor*>(vu1.m_executor.get())->EnableBlockStats(g_vuStats);
 +			std::printf("[webgs] VU1 block chaining %s\n", (chainParam == 0) ? "off" : tailCalls ? "with tail calls" : "through the dispatcher");
 +		}
 +		vu1.m_pMemoryMap->InsertReadMap(0x00000000, 0x00003FFF, h->vuMem1, 0x00);
@@ -10687,6 +10814,7 @@ index 0000000..fdaf16c
 +		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
 +		g_hd = EM_ASM_INT({ return new URLSearchParams(location.search).get('hd') === '0' ? 0 : 1; }) != 0;
 +		g_fsr = EM_ASM_INT({ return new URLSearchParams(location.search).get('fsr') === '0' ? 0 : 1; }) != 0;
++		g_vuStats = EM_ASM_INT({ return new URLSearchParams(location.search).has('vustats') ? 1 : 0; }) != 0;
 +		g_vuChainParam = EM_ASM_INT({
 +			const chain = new URLSearchParams(location.search).get('chain');
 +			return chain === '0' ? 0 : chain === 'dispatch' ? 2 : 1;
@@ -10867,10 +10995,10 @@ index 0000000..ac06b4b
 +void SetSoundPitch(Sound, float) {}
 diff --git a/ps2xRuntime/web/site/index.html b/ps2xRuntime/web/site/index.html
 new file mode 100644
-index 0000000..9f04f73
+index 0000000..73d92b7
 --- /dev/null
 +++ b/ps2xRuntime/web/site/index.html
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,301 @@
 +<!doctype html>
 +<html lang="es">
 +<head>
@@ -11014,7 +11142,13 @@ index 0000000..9f04f73
 +    monitorRunDependencies: (left) => { if (!left) { statusText.textContent = 'Arrancando el juego…'; bar.style.width = '100%'; } },
 +    // The game starts on the "Jugar" click: browsers only allow sound after one, and this way the
 +    // sound is there from the first video. The download goes on meanwhile.
-+    preRun: [() => Module.addRunDependency('play-click')],
++    preRun: [() => Module.addRunDependency('play-click'), () => {
++      // Diagnostics: ?env=NAME=value sets an environment variable of the game code
++      for (const kv of new URLSearchParams(location.search).getAll('env')) {
++        const i = kv.indexOf('=');
++        if (i > 0 && typeof ENV == 'object') ENV[kv.slice(0, i)] = kv.slice(i + 1);
++      }
++    }],
 +  };
 +  // Settings on the start screen: kept in this browser, handed to the game as page parameters
 +  // (?scale, ?fsr, ?hd, ?audio, ?online), which a link can also set.
