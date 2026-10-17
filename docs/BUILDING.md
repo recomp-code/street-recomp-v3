@@ -228,6 +228,21 @@ their own patches, and the few runtime changes shared with native code are behin
   Firefox 121+, Safari 18.2+); browsers without tail calls get a dispatcher hand-off (`nextBlockFunction`).
   The chaining code sits in its own conditional block so the Jitter writes nPC back first. VU1 worker
   ~51% -> ~42% on a Mac with tail calls. `?chain=0` turns it off, `?chain=dispatch` forces the hand-off.
+- VU1 superblocks (`ee/VuExecutor.cpp` `FindBlockExtent`/`PartitionNewFunction`, `ee/VuBasicBlock.cpp`
+  `CompileSubBlocks`): a block also takes the VU basic blocks reached when its conditional branches aren't
+  taken (up to 16, no self-loops). Each part is compiled as before (pipeline state, cycle quota, integer
+  branch delays); not-taken branches go straight on, taken ones leave through block chaining. ~45% of
+  block transitions in a match were fall-throughs: 7.6M -> 4.6M block entries/s, VU1 worker ~52% -> ~49.5%
+  with tail calls (58% -> 42% without chaining). `?superblocks=0` turns them off.
+- VU1 flags (`ee/VuExecutor.cpp` `ComputeFlagHints`, `ee/VUShared.cpp`): after every FMAC/CLIP instruction
+  the code kept MAC, status and clip flag pipelines (~60 wasm operations each) for the few instructions
+  that read them. Micro memory is scanned when it changes; flags that nothing in it reads aren't maintained
+  (NBA's microprograms read only clip flags), and cached blocks are keyed by that. VU1 worker in a match
+  ~37% -> ~29%; with a simulated phone, repeated sound blocks 8-44 -> 0-1 per 5 s. `?vuflags=0` keeps them.
+- Context accesses in the wasm Jitter use the load/store offset immediate instead of an `i32.add`
+  (`Jitter_CodeGen_Wasm*.cpp`).
+- VU1 diagnostics: `?vudump=1&chain=0&vustats=1` + `Module._ps2xVuDump()` (hottest blocks' wasm modules,
+  read them with binaryen's `wasm-dis`); `?vuslow=N` makes VIF1/VU1 work N% slower (phone simulation).
 - VU microprograms (`ee/VuExecutor.cpp`): partitions are remembered per (micro memory contents,
   block start), so swapping microprograms back in reuses their blocks.
 
