@@ -182,7 +182,16 @@ their own patches, and the few runtime changes shared with native code are behin
   - `site/index.html`: start screen, AudioWorklet, gamepads, diagnostics;
   - `known_shaders.inc`: the game's shader variants (Play!'s `SHADERCAPS`), built at start-up
     together with the ones the browser remembers in IndexedDB.
-- IOP / SPU2: Gaussian interpolation, volume sweeps, paced AutoDMA, output limiter.
+- IOP / SPU2: PCSX2's SPU2 (GPL-3.0+) in `ps2xIOP/src/emulator/spu2` (PCSX2 files nearly unmodified
+  in `SPU2/`, small stand-ins for the PCSX2 headers in `shim/`, `spu2_glue.cpp` in place of PCSX2's
+  `spu2.cpp`) behind the IOP's `Spu2` class. DMA 4/7 data is read from IOP RAM as the SPU2 consumes
+  it and CHCR stays busy until it finishes; the IOP advances the SPU2 every 768 cycles, also inside
+  long runs (EA's sound driver busy-waits in an RPC handler for the DMA-completion interrupt).
+- IOP time runs to an absolute target derived from EE time: the native EA mixer charges ~11.5k
+  cycles at once, and taking each slice from wherever the last one ended let the IOP run ~3% ahead,
+  so FMV sound was consumed faster than it arrived and the driver repeated blocks (a ~94 Hz buzz).
+- Diagnostics: `?vustats=1&chain=0` (VU1 block statistics), `?env=NAME=value` (environment
+  variables), `Module._ps2xSpu2Dump()` (last 8 s of SPU2 inputs and output).
 - EE scheduler: idle-loop sleep with time flowing in 1 ms steps, vblank rebase after stalls.
 - DEV9 sockets over a WebSocket (online).
 - WebAssembly-only fast paths in the recompiled code's runtime:
@@ -219,6 +228,12 @@ their own patches, and the few runtime changes shared with native code are behin
   Firefox 121+, Safari 18.2+); browsers without tail calls get a dispatcher hand-off (`nextBlockFunction`).
   The chaining code sits in its own conditional block so the Jitter writes nPC back first. VU1 worker
   ~51% -> ~42% on a Mac with tail calls. `?chain=0` turns it off, `?chain=dispatch` forces the hand-off.
+- VU1 superblocks (`ee/VuExecutor.cpp` `FindBlockExtent`/`PartitionNewFunction`, `ee/VuBasicBlock.cpp`
+  `CompileSubBlocks`): a block also takes the VU basic blocks reached when its conditional branches aren't
+  taken (up to 16, no self-loops). Each part is compiled as before (pipeline state, cycle quota, integer
+  branch delays); not-taken branches go straight on, taken ones leave through block chaining. ~45% of
+  block transitions in a match were fall-throughs: 7.6M -> 4.6M block entries/s, VU1 worker ~52% -> ~49.5%
+  with tail calls (58% -> 42% without chaining). `?superblocks=0` turns them off.
 - VU microprograms (`ee/VuExecutor.cpp`): partitions are remembered per (micro memory contents,
   block start), so swapping microprograms back in reuses their blocks.
 

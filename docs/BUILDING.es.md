@@ -176,7 +176,18 @@ nativo están dentro de `__EMSCRIPTEN__`.
   - `site/index.html`: pantalla de inicio, AudioWorklet, mandos, diagnóstico;
   - `known_shaders.inc`: las variantes de shaders del juego (`SHADERCAPS` de Play!), compiladas al
     arrancar junto con las que el navegador recuerda en IndexedDB.
-- IOP / SPU2: interpolación gaussiana, barridos de volumen, AutoDMA a ritmo, limitador de salida.
+- IOP / SPU2: el SPU2 de PCSX2 (GPL-3.0+) en `ps2xIOP/src/emulator/spu2` (archivos de PCSX2 casi sin
+  cambios en `SPU2/`, sustitutos pequeños de sus cabeceras en `shim/`, `spu2_glue.cpp` en lugar de su
+  `spu2.cpp`) detrás de la clase `Spu2` del IOP. Los datos de DMA 4/7 se leen de la RAM del IOP a medida
+  que el SPU2 los consume y CHCR sigue ocupado hasta que termina; el IOP avanza el SPU2 cada 768 ciclos,
+  también dentro de ejecuciones largas (el driver de sonido de EA espera en un manejador RPC la
+  interrupción de fin de DMA).
+- El tiempo del IOP sigue un objetivo absoluto calculado a partir del tiempo del EE: el mezclador
+  nativo de EA suma ~11,5k ciclos de golpe, y empezar cada tramo donde acabó el anterior adelantaba
+  el IOP ~3%, así que el sonido de los vídeos se consumía más rápido de lo que llegaba y el driver
+  repetía bloques (un zumbido de ~94 Hz).
+- Diagnóstico: `?vustats=1&chain=0` (estadísticas de bloques de la VU1), `?env=NOMBRE=valor`
+  (variables de entorno), `Module._ps2xSpu2Dump()` (últimos 8 s de entradas y salida del SPU2).
 - Planificador del EE: espera dormida con el tiempo avanzando en pasos de 1 ms, rebase del vblank
   tras atascos.
 - Sockets del DEV9 por un WebSocket (online).
@@ -219,6 +230,13 @@ nativo están dentro de `__EMSCRIPTEN__`.
   usan un trampolín (`nextBlockFunction`). El código va en su propio bloque condicional para que el Jitter
   escriba antes nPC en memoria. Hilo VU1 ~51% -> ~42% en un Mac con llamadas de cola. `?chain=0` lo desactiva,
   `?chain=dispatch` fuerza el trampolín.
+- Superbloques de la VU1 (`ee/VuExecutor.cpp` `FindBlockExtent`/`PartitionNewFunction`,
+  `ee/VuBasicBlock.cpp` `CompileSubBlocks`): un bloque incluye también los bloques básicos de la VU a los
+  que se llega cuando sus ramas condicionales no se toman (hasta 16, sin bucles sobre sí mismos). Cada
+  parte se compila igual que antes (estado del pipeline, cuota de ciclos, retardos de ramas enteras); las
+  ramas no tomadas siguen de largo y las tomadas salen por el encadenado de bloques. ~45% de los saltos
+  entre bloques en un partido eran caídas: 7,6M -> 4,6M entradas a bloques/s, hilo de la VU1 ~52% -> ~49,5%
+  con llamadas de cola (58% -> 42% sin encadenado). `?superblocks=0` los desactiva.
 - Microprogramas de la VU (`ee/VuExecutor.cpp`): las particiones se recuerdan por (contenido de la
   micromemoria, inicio del bloque), así que al volver a cargar un microprograma se reutilizan sus
   bloques.
