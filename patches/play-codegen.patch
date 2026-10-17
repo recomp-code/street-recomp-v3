@@ -111,7 +111,7 @@ index 0036a51..1268726 100644
  		INST_F32x4_CONVERT_I32x4_S = 0xFA
  	};
 diff --git a/src/Jitter_CodeGen_Wasm.cpp b/src/Jitter_CodeGen_Wasm.cpp
-index 3f86e4a..46d406c 100644
+index 3f86e4a..03ba388 100644
 --- a/src/Jitter_CodeGen_Wasm.cpp
 +++ b/src/Jitter_CodeGen_Wasm.cpp
 @@ -93,6 +93,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
@@ -228,7 +228,54 @@ index 3f86e4a..46d406c 100644
  void CCodeGen_Wasm::PrepareLocalVars(const StatementList& statements)
  {
  	for(const auto& statement : statements)
-@@ -806,6 +859,9 @@ void CCodeGen_Wasm::PrepareSymbolDef(CSymbol* symbol)
+@@ -678,12 +731,9 @@ void CCodeGen_Wasm::PushRelativeAddress(CSymbol* symbol)
+ 	    (symbol->m_type == SYM_FP_RELATIVE32) ||
+ 	    (symbol->m_type == SYM_RELATIVE128));
+ 
++	//Only the context: the symbol's offset goes in the load/store's offset immediate
++	//(RelativeOffset), which engines fold into the address instead of a separate add
+ 	PushContext();
+-
+-	m_functionStream.Write8(Wasm::INST_I32_CONST);
+-	CWasmModuleBuilder::WriteSLeb128(m_functionStream, symbol->m_valueLow);
+-
+-	m_functionStream.Write8(Wasm::INST_I32_ADD);
+ }
+ 
+ void CCodeGen_Wasm::PushRelative(CSymbol* symbol)
+@@ -692,7 +742,7 @@ void CCodeGen_Wasm::PushRelative(CSymbol* symbol)
+ 
+ 	m_functionStream.Write8(Wasm::INST_I32_LOAD);
+ 	m_functionStream.Write8(0x02);
+-	m_functionStream.Write8(0x00);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, symbol->m_valueLow);
+ }
+ 
+ void CCodeGen_Wasm::PushTemporary(CSymbol* symbol)
+@@ -717,12 +767,7 @@ void CCodeGen_Wasm::PushRelativeRefAddress(CSymbol* symbol)
+ {
+ 	assert(symbol->m_type == SYM_REL_REFERENCE);
+ 
+-	PushContext();
+-
+-	m_functionStream.Write8(Wasm::INST_I32_CONST);
+-	CWasmModuleBuilder::WriteSLeb128(m_functionStream, symbol->m_valueLow);
+-
+-	m_functionStream.Write8(Wasm::INST_I32_ADD);
++	PushContext(); //Offset in the load/store immediate (see PushRelativeAddress)
+ }
+ 
+ void CCodeGen_Wasm::PushRelativeRef(CSymbol* symbol)
+@@ -731,7 +776,7 @@ void CCodeGen_Wasm::PushRelativeRef(CSymbol* symbol)
+ 
+ 	m_functionStream.Write8(Wasm::INST_I32_LOAD);
+ 	m_functionStream.Write8(0x02);
+-	m_functionStream.Write8(0x00);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, symbol->m_valueLow);
+ }
+ 
+ void CCodeGen_Wasm::PushTemporaryRef(CSymbol* symbol)
+@@ -806,6 +851,9 @@ void CCodeGen_Wasm::PrepareSymbolDef(CSymbol* symbol)
  {
  	switch(symbol->m_type)
  	{
@@ -238,7 +285,7 @@ index 3f86e4a..46d406c 100644
  	case SYM_RELATIVE:
  	case SYM_RELATIVE64:
  	case SYM_RELATIVE128:
-@@ -828,6 +884,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
+@@ -828,10 +876,11 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
  {
  	switch(symbol->m_type)
  	{
@@ -246,7 +293,39 @@ index 3f86e4a..46d406c 100644
  	case SYM_RELATIVE:
  		m_functionStream.Write8(Wasm::INST_I32_STORE);
  		m_functionStream.Write8(0x02);
-@@ -1156,6 +1213,95 @@ void CCodeGen_Wasm::Emit_ExternJmp(const STATEMENT& statement)
+-		m_functionStream.Write8(0x00);
++		CWasmModuleBuilder::WriteULeb128(m_functionStream, symbol->m_valueLow);
+ 		break;
+ 	case SYM_TEMPORARY:
+ 		PullTemporary(symbol);
+@@ -842,7 +891,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
+ 	case SYM_RELATIVE64:
+ 		m_functionStream.Write8(Wasm::INST_I64_STORE);
+ 		m_functionStream.Write8(0x03);
+-		m_functionStream.Write8(0x00);
++		CWasmModuleBuilder::WriteULeb128(m_functionStream, symbol->m_valueLow);
+ 		break;
+ 	case SYM_TEMPORARY64:
+ 		PullTemporary64(symbol);
+@@ -850,7 +899,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
+ 	case SYM_FP_RELATIVE32:
+ 		m_functionStream.Write8(Wasm::INST_F32_STORE);
+ 		m_functionStream.Write8(0x02);
+-		m_functionStream.Write8(0x00);
++		CWasmModuleBuilder::WriteULeb128(m_functionStream, symbol->m_valueLow);
+ 		break;
+ 	case SYM_FP_TEMPORARY32:
+ 		PullTemporaryFp32(symbol);
+@@ -859,7 +908,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
+ 		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+ 		m_functionStream.Write8(Wasm::INST_V128_STORE);
+ 		m_functionStream.Write8(0x04);
+-		m_functionStream.Write8(0x00);
++		CWasmModuleBuilder::WriteULeb128(m_functionStream, symbol->m_valueLow);
+ 		break;
+ 	case SYM_TEMPORARY128:
+ 		PullTemporary128(symbol);
+@@ -1156,6 +1205,95 @@ void CCodeGen_Wasm::Emit_ExternJmp(const STATEMENT& statement)
  	m_functionStream.Write8(0x00);   //Table index
  }
  
@@ -342,7 +421,7 @@ index 3f86e4a..46d406c 100644
  void CCodeGen_Wasm::Emit_Jmp(const STATEMENT& statement)
  {
  	auto labelFlowIterator = m_labelFlows.find(statement.jmpBlock);
-@@ -1393,3 +1539,13 @@ void CCodeGen_Wasm::Emit_ExtHigh64VarMem64(const STATEMENT& statement)
+@@ -1393,3 +1531,13 @@ void CCodeGen_Wasm::Emit_ExtHigh64VarMem64(const STATEMENT& statement)
  
  	CommitSymbol(dst);
  }
@@ -356,10 +435,32 @@ index 3f86e4a..46d406c 100644
 +	PrepareSymbolUse(src1);
 +	CommitSymbol(dst);
 +}
+diff --git a/src/Jitter_CodeGen_Wasm_64.cpp b/src/Jitter_CodeGen_Wasm_64.cpp
+index 7d263e7..99cd5a9 100644
+--- a/src/Jitter_CodeGen_Wasm_64.cpp
++++ b/src/Jitter_CodeGen_Wasm_64.cpp
+@@ -45,7 +45,7 @@ void CCodeGen_Wasm::PushRelative64(CSymbol* symbol)
+ 
+ 	m_functionStream.Write8(Wasm::INST_I64_LOAD);
+ 	m_functionStream.Write8(0x03);
+-	m_functionStream.Write8(0x00);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, symbol->m_valueLow);
+ }
+ 
+ void CCodeGen_Wasm::PushTemporary64(CSymbol* symbol)
 diff --git a/src/Jitter_CodeGen_Wasm_Fpu.cpp b/src/Jitter_CodeGen_Wasm_Fpu.cpp
-index 60e1b6b..d486caf 100644
+index 60e1b6b..ff2687a 100644
 --- a/src/Jitter_CodeGen_Wasm_Fpu.cpp
 +++ b/src/Jitter_CodeGen_Wasm_Fpu.cpp
+@@ -40,7 +40,7 @@ void CCodeGen_Wasm::PushRelativeFp32(CSymbol* symbol)
+ 
+ 	m_functionStream.Write8(Wasm::INST_F32_LOAD);
+ 	m_functionStream.Write8(0x02);
+-	m_functionStream.Write8(0x00);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, symbol->m_valueLow);
+ }
+ 
+ void CCodeGen_Wasm::PushTemporaryFp32(CSymbol* symbol)
 @@ -181,15 +181,21 @@ void CCodeGen_Wasm::Emit_Fp_ToSingleI32_MemMem(const STATEMENT& statement)
  	auto dst = statement.dst->GetSymbol().get();
  	auto src1 = statement.src1->GetSymbol().get();
@@ -379,7 +480,7 @@ index 60e1b6b..d486caf 100644
 +		PushRelativeAddress(src1);
 +		m_functionStream.Write8(Wasm::INST_I32_LOAD);
 +		m_functionStream.Write8(0x02);
-+		m_functionStream.Write8(0x00);
++		CWasmModuleBuilder::WriteULeb128(m_functionStream, src1->m_valueLow);
 +	}
 +	else
 +	{
@@ -410,7 +511,7 @@ index 60e1b6b..d486caf 100644
 +	{
 +		m_functionStream.Write8(Wasm::INST_I32_STORE);
 +		m_functionStream.Write8(0x02);
-+		m_functionStream.Write8(0x00);
++		CWasmModuleBuilder::WriteULeb128(m_functionStream, dst->m_valueLow);
 +	}
 +	else
 +	{
@@ -448,6 +549,19 @@ index 60e1b6b..d486caf 100644
 +	PrepareSymbolUse(src1);
 +	CommitSymbol(dst);
 +}
+diff --git a/src/Jitter_CodeGen_Wasm_Md.cpp b/src/Jitter_CodeGen_Wasm_Md.cpp
+index cd87a1b..56e724b 100644
+--- a/src/Jitter_CodeGen_Wasm_Md.cpp
++++ b/src/Jitter_CodeGen_Wasm_Md.cpp
+@@ -104,7 +104,7 @@ void CCodeGen_Wasm::PushRelative128(CSymbol* symbol)
+ 	m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
+ 	m_functionStream.Write8(Wasm::INST_V128_LOAD);
+ 	m_functionStream.Write8(0x04);
+-	m_functionStream.Write8(0x00);
++	CWasmModuleBuilder::WriteULeb128(m_functionStream, symbol->m_valueLow);
+ }
+ 
+ void CCodeGen_Wasm::PushTemporary128(CSymbol* symbol)
 diff --git a/src/MemoryFunction.cpp b/src/MemoryFunction.cpp
 index 73a3dab..d820143 100644
 --- a/src/MemoryFunction.cpp

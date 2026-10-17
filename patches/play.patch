@@ -1,8 +1,33 @@
 diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
-index 4c460e6..80e26bd 100644
+index 4c460e6..f56d155 100644
 --- a/Source/BasicBlock.cpp
 +++ b/Source/BasicBlock.cpp
-@@ -306,6 +306,7 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+@@ -74,6 +74,10 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
+ 
+ #endif
+ 
++#ifdef __EMSCRIPTEN__
++bool CBasicBlock::s_keepCode = false;
++#endif
++
+ void CBasicBlock::Compile()
+ {
+ #ifndef AOT_USE_CACHE
+@@ -99,6 +103,13 @@ void CBasicBlock::Compile()
+ 	}
+ 
+ 	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
++#ifdef __EMSCRIPTEN__
++	if(s_keepCode)
++	{
++		auto bytes = reinterpret_cast<const uint8*>(stream.GetBuffer());
++		m_code.assign(bytes, bytes + stream.GetSize());
++	}
++#endif
+ 
+ #ifdef VTUNE_ENABLED
+ 	if(iJIT_IsProfilingActive() == iJIT_SAMPLING_ON)
+@@ -306,6 +317,7 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
  			}
  			jitter->EndIf();
  #endif
@@ -10,7 +35,7 @@ index 4c460e6..80e26bd 100644
  		}
  	}
  	jitter->Else();
-@@ -324,10 +325,44 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+@@ -324,10 +336,44 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
  		}
  		jitter->EndIf();
  #endif
@@ -55,11 +80,21 @@ index 4c460e6..80e26bd 100644
  void CBasicBlock::Execute()
  {
  	m_function(&m_context);
+@@ -453,6 +499,9 @@ void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
+ {
+ #ifndef AOT_USE_CACHE
+ 	m_function = other->m_function.CreateInstance();
++#ifdef __EMSCRIPTEN__
++	m_code = other->m_code;
++#endif
+ 	std::copy(std::begin(other->m_linkBlockTrampolineOffset), std::end(other->m_linkBlockTrampolineOffset), m_linkBlockTrampolineOffset);
+ #ifdef _DEBUG
+ 	std::copy(std::begin(other->m_linkBlock), std::end(other->m_linkBlock), m_linkBlock);
 diff --git a/Source/BasicBlock.h b/Source/BasicBlock.h
-index 56ef0ad..6ebb10b 100644
+index 56ef0ad..b9dbd73 100644
 --- a/Source/BasicBlock.h
 +++ b/Source/BasicBlock.h
-@@ -1,138 +1,148 @@
+@@ -1,138 +1,162 @@
 -#pragma once
 -
 -#include "MIPS.h"
@@ -200,6 +235,8 @@ index 56ef0ad..6ebb10b 100644
 -};
 +#pragma once
 +
++#include <vector>
++
 +#include "MIPS.h"
 +#include "MemoryFunction.h"
 +#ifdef AOT_BUILD_CACHE
@@ -303,6 +340,15 @@ index 56ef0ad..6ebb10b 100644
 +
 +	void CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& basicBlock);
 +
++#ifdef __EMSCRIPTEN__
++	//Keep each block's compiled module (to inspect the generated code)
++	static bool s_keepCode;
++	const std::vector<uint8>& GetCode() const
++	{
++		return m_code;
++	}
++#endif
++
 +protected:
 +	uint32 m_begin;
 +	uint32 m_end;
@@ -336,6 +382,9 @@ index 56ef0ad..6ebb10b 100644
 +
 +#ifndef AOT_USE_CACHE
 +	CMemoryFunction m_function;
++#ifdef __EMSCRIPTEN__
++	std::vector<uint8> m_code;
++#endif
 +#else
 +	void (*m_function)(void*);
 +#endif
@@ -347,7 +396,7 @@ index 56ef0ad..6ebb10b 100644
 +#endif
 +};
 diff --git a/Source/GenericMipsExecutor.h b/Source/GenericMipsExecutor.h
-index 2fb630f..b4dcd6b 100644
+index 2fb630f..2135381 100644
 --- a/Source/GenericMipsExecutor.h
 +++ b/Source/GenericMipsExecutor.h
 @@ -1,8 +1,16 @@
@@ -367,7 +416,7 @@ index 2fb630f..b4dcd6b 100644
  
  #include "BlockLookupOneWay.h"
  #include "BlockLookupTwoWay.h"
-@@ -56,6 +64,83 @@ public:
+@@ -56,6 +64,109 @@ public:
  
  	virtual ~CGenericMipsExecutor() = default;
  
@@ -406,6 +455,28 @@ index 2fb630f..b4dcd6b 100644
 +	{
 +		m_blockStats = enabled;
 +	}
++	//The most entered blocks with their compiled modules (needs CBasicBlock::s_keepCode):
++	//per block [begin, end, entries (low 32 bits), code size] (uint32 each) then the code
++	std::vector<uint8> DumpHotBlocks(size_t count) const
++	{
++		std::vector<std::pair<uint64, uint32>> hot;
++		for(const auto& [begin, entries] : m_blockEntries)
++			hot.emplace_back(entries, begin);
++		std::sort(hot.begin(), hot.end(), std::greater<>());
++		std::vector<uint8> blob;
++		for(size_t i = 0; i < std::min(count, hot.size()); i++)
++		{
++			auto codeIterator = m_blockCode.find(hot[i].second);
++			if(codeIterator == m_blockCode.end()) continue;
++			const auto& code = codeIterator->second.second;
++			uint32 header[4] = {hot[i].second, codeIterator->second.first, static_cast<uint32>(hot[i].first), static_cast<uint32>(code.size())};
++			auto headerBytes = reinterpret_cast<const uint8*>(header);
++			blob.insert(blob.end(), headerBytes, headerBytes + sizeof(header));
++			blob.insert(blob.end(), code.begin(), code.end());
++		}
++		return blob;
++	}
++
 +	BLOCK_STATS TakeBlockStats()
 +	{
 +		BLOCK_STATS stats = m_blockStatsCounters;
@@ -437,12 +508,16 @@ index 2fb630f..b4dcd6b 100644
 +			if(begin == ((m_lastEnd + 4) & ~(instructionSize - 1)) && begin > m_lastBegin) stats.fallThrough++;
 +			if(begin == m_lastBegin) stats.sameBlock++;
 +			m_blockSuccessors[m_lastBegin][begin]++;
++			if(m_blockEntries[begin]++ == 0 && CBasicBlock::s_keepCode)
++				m_blockCode[begin] = {block->GetEndAddress(), block->GetCode()};
 +		}
 +		m_lastBegin = begin;
 +		m_lastEnd = block->GetEndAddress();
 +	}
 +	bool m_blockStats = false;
 +	BLOCK_STATS m_blockStatsCounters;
++	std::unordered_map<uint32, uint64> m_blockEntries;
++	std::unordered_map<uint32, std::pair<uint32, std::vector<uint8>>> m_blockCode;
 +	uint32 m_lastBegin = MIPS_INVALID_PC;
 +	uint32 m_lastEnd = MIPS_INVALID_PC;
 +	std::unordered_map<uint32, std::unordered_map<uint32, uint32>> m_blockSuccessors;
@@ -451,7 +526,7 @@ index 2fb630f..b4dcd6b 100644
  	int Execute(int cycles) override
  	{
  		m_context.m_State.cycleQuota = cycles;
-@@ -65,10 +150,26 @@ public:
+@@ -65,10 +176,26 @@ public:
  #endif
  		while(m_context.m_State.nHasException == 0)
  		{
@@ -478,7 +553,7 @@ index 2fb630f..b4dcd6b 100644
  		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
  #ifdef DEBUGGER_INCLUDED
  		if(m_context.m_State.nHasException == MIPS_EXCEPTION_BREAKPOINT)
-@@ -88,6 +189,9 @@ public:
+@@ -88,6 +215,9 @@ public:
  
  	void Reset() override
  	{
@@ -488,7 +563,7 @@ index 2fb630f..b4dcd6b 100644
  		m_blockLookup.Clear();
  		m_blocks.clear();
  		m_blockOutLinks.clear();
-@@ -139,9 +243,27 @@ protected:
+@@ -139,9 +269,27 @@ protected:
  		auto block = BlockFactory(m_context, start, end);
  		ResetBlockOutLinks(block.get());
  		m_blockLookup.AddBlock(block.get());
@@ -516,7 +591,7 @@ index 2fb630f..b4dcd6b 100644
  	void ResetBlockOutLinks(CBasicBlock* block)
  	{
  		for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
-@@ -286,6 +408,7 @@ protected:
+@@ -286,6 +434,7 @@ protected:
  			if(block == protectedBlock) continue;
  			if(!RangesOverlap(block->GetBeginAddress(), block->GetEndAddress(), start, end)) continue;
  			clearedBlocks.insert(block);
@@ -524,7 +599,7 @@ index 2fb630f..b4dcd6b 100644
  			m_blockLookup.DeleteBlock(block);
  		}
  
-@@ -327,6 +450,12 @@ protected:
+@@ -327,6 +476,12 @@ protected:
  
  	BlockLookupType m_blockLookup;
  
@@ -637,6 +712,83 @@ index 2713062..8d60e31 100644
  	enum
  	{
  		FIFO_QWC = 0x10,
+diff --git a/Source/ee/MA_VU_Upper.cpp b/Source/ee/MA_VU_Upper.cpp
+index 7200729..0c2a963 100644
+--- a/Source/ee/MA_VU_Upper.cpp
++++ b/Source/ee/MA_VU_Upper.cpp
+@@ -476,7 +476,7 @@ void CMA_VU::CUpper::FTOI15()
+ //07
+ void CMA_VU::CUpper::CLIP()
+ {
+-	VUShared::CLIP(m_codeGen, m_nFS, m_nFT, m_relativePipeTime);
++	VUShared::CLIP(m_codeGen, m_nFS, m_nFT, m_relativePipeTime, m_compileHints);
+ }
+ 
+ //08
+diff --git a/Source/ee/VUShared.cpp b/Source/ee/VUShared.cpp
+index 52360eb..3f4c9ce 100644
+--- a/Source/ee/VUShared.cpp
++++ b/Source/ee/VUShared.cpp
+@@ -254,6 +254,12 @@ void VUShared::MakeComparableFromFloat(CMipsJitter* codeGen)
+ 
+ void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, uint32 relativePipeTime, uint32 compileHints)
+ {
++	//Neither MAC nor status flags can be read by anything: no flags to compute
++	if((compileHints & COMPILEHINT_SKIP_FMAC_UPDATE) && (compileHints & COMPILEHINT_SKIP_STICKY_UPDATE))
++	{
++		return;
++	}
++
+ 	codeGen->MD_PushRel(regOffset);
+ 	codeGen->MD_MakeSignZero();
+ 
+@@ -265,6 +271,7 @@ void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, u
+ 	}
+ 
+ 	//Update sticky flags
++	if((compileHints & COMPILEHINT_SKIP_STICKY_UPDATE) == 0)
+ 	{
+ 		codeGen->PushTop();
+ 
+@@ -804,8 +811,14 @@ void VUShared::ADDAq(CMipsJitter* codeGen, uint8 dest, uint8 fs, uint32 relative
+ 	          true, relativePipeTime, compileHints);
+ }
+ 
+-void VUShared::CLIP(CMipsJitter* codeGen, uint8 nFs, uint8 nFt, uint32 relativePipeTime)
++void VUShared::CLIP(CMipsJitter* codeGen, uint8 nFs, uint8 nFt, uint32 relativePipeTime, uint32 compileHints)
+ {
++	//The clip flags are its only result: skip it when nothing reads them
++	if(compileHints & COMPILEHINT_SKIP_CLIP_UPDATE)
++	{
++		return;
++	}
++
+ 	//Load previous value
+ 	{
+ 		codeGen->PushRelAddrRef(offsetof(CMIPS, m_State.pipeClip.values));
+diff --git a/Source/ee/VUShared.h b/Source/ee/VUShared.h
+index a2991f1..14e69bf 100644
+--- a/Source/ee/VUShared.h
++++ b/Source/ee/VUShared.h
+@@ -98,6 +98,9 @@ namespace VUShared
+ 		COMPILEHINT_SKIP_FMAC_UPDATE = (1 << 0),
+ 		COMPILEHINT_USE_ACCURATE_ADDI = (1 << 1), //For decompression in Tri-Ace games
+ 		COMPILEHINT_NO_CLAMPING = (1 << 2),
++		//Nothing in micro memory reads these flags (CVuExecutor::ComputeFlagUsage): don't maintain them
++		COMPILEHINT_SKIP_STICKY_UPDATE = (1 << 3),
++		COMPILEHINT_SKIP_CLIP_UPDATE = (1 << 4),
+ 	};
+ 
+ 	static bool UseClamping(uint32 compileHints)
+@@ -154,7 +157,7 @@ namespace VUShared
+ 	void ADDAbc(CMipsJitter*, uint8, uint8, uint8, uint8, uint32, uint32);
+ 	void ADDAi(CMipsJitter*, uint8, uint8, uint32, uint32);
+ 	void ADDAq(CMipsJitter*, uint8, uint8, uint32, uint32);
+-	void CLIP(CMipsJitter*, uint8, uint8, uint32);
++	void CLIP(CMipsJitter*, uint8, uint8, uint32, uint32 compileHints = 0);
+ 	void DIV(CMipsJitter*, uint8, uint8, uint8, uint8, uint32);
+ 	void FTOI0(CMipsJitter*, uint8, uint8, uint8);
+ 	void FTOI4(CMipsJitter*, uint8, uint8, uint8);
 diff --git a/Source/ee/Vif1.cpp b/Source/ee/Vif1.cpp
 index 6ad8461..8f1249d 100644
 --- a/Source/ee/Vif1.cpp
@@ -857,10 +1009,18 @@ index 052b681..f474dae 100644
  	struct BlockFmacPipelineInfo
  	{
 diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
-index 72e80fc..1990b4a 100644
+index 72e80fc..b923a68 100644
 --- a/Source/ee/VuExecutor.cpp
 +++ b/Source/ee/VuExecutor.cpp
-@@ -23,6 +23,8 @@ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
+@@ -2,6 +2,7 @@
+ #include "VuBasicBlock.h"
+ #include "VUShared.h"
+ #include "xxhash.h"
++#include <cstdio>
+ 
+ // clang-format off
+ const CVuExecutor::BLOCK_COMPILE_HINTS CVuExecutor::g_blockCompileHints[] =
+@@ -23,6 +24,8 @@ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
  
  void CVuExecutor::Reset()
  {
@@ -869,7 +1029,44 @@ index 72e80fc..1990b4a 100644
  	m_cachedBlocks.clear();
  	m_blockNoClamping.clear();
  	CGenericMipsExecutor::Reset();
-@@ -92,11 +94,51 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+@@ -43,13 +46,15 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+ 	memcpy(&hash, &xxHash, sizeof(xxHash));
+ 	static_assert(sizeof(hash) == sizeof(xxHash));
+ 	auto blockKey = std::make_pair(hash, blockSizeByte);
++	//Blocks compiled without some flags only fit micro memories that don't read them either
++	auto cacheKey = std::make_pair(hash, blockSizeByte | (m_flagHints << 24));
+ 
+ 	//Don't use the cached blocks of we have a breakpoint in our block range.
+ 	bool hasBreakpoint = m_context.HasBreakpointInRange(begin, end);
+ 	if(!hasBreakpoint)
+ 	{
+-		auto beginBlockIterator = m_cachedBlocks.lower_bound(blockKey);
+-		auto endBlockIterator = m_cachedBlocks.upper_bound(blockKey);
++		auto beginBlockIterator = m_cachedBlocks.lower_bound(cacheKey);
++		auto endBlockIterator = m_cachedBlocks.upper_bound(cacheKey);
+ 		//Check if we have a block that has the same contents and the same range.
+ 		for(auto blockIterator = beginBlockIterator; blockIterator != endBlockIterator; blockIterator++)
+ 		{
+@@ -64,7 +69,7 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+ 		{
+ 			auto result = std::make_shared<CVuBasicBlock>(context, begin, end, m_blockCategory);
+ 			result->CopyFunctionFrom(beginBlockIterator->second);
+-			m_cachedBlocks.insert(std::make_pair(blockKey, result));
++			m_cachedBlocks.insert(std::make_pair(cacheKey, result));
+ 			return result;
+ 		}
+ 	}
+@@ -84,19 +89,108 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+ 		result->AddBlockCompileHints(VUShared::COMPILEHINT_NO_CLAMPING);
+ 	}
+ 
++	result->AddBlockCompileHints(m_flagHints);
+ 	result->Compile();
+ 	if(!hasBreakpoint)
+ 	{
+-		m_cachedBlocks.insert(std::make_pair(blockKey, result));
++		m_cachedBlocks.insert(std::make_pair(cacheKey, result));
+ 	}
  	return result;
  }
  
@@ -890,6 +1087,7 @@ index 72e80fc..1990b4a 100644
 +		auto map = m_context.m_pMemoryMap->GetInstructionMap(0);
 +		m_microMemoryHash = XXH3_64bits(map->pPointer, m_maxAddress);
 +		m_microMemoryHashValid = true;
++		m_flagHints = ComputeFlagHints();
 +	}
 +	const auto partitionKey = std::make_pair(m_microMemoryHash, startAddress);
 +	if(auto partition = m_partitions.find(partitionKey); partition != std::end(m_partitions))
@@ -913,6 +1111,53 @@ index 72e80fc..1990b4a 100644
 +}
 +
 +bool CVuExecutor::s_superblocks = true;
++bool CVuExecutor::s_flagAnalysis = true;
++
++//The MAC, status (sticky) and clip flags are pipelines the code maintains after every FMAC/CLIP
++//instruction (~60 wasm operations each) for the few instructions that read them. When nothing in
++//the whole micro memory reads a kind of flag, compile without maintaining it.
++uint32 CVuExecutor::ComputeFlagHints() const
++{
++	if(!s_flagAnalysis) return 0;
++	bool readMac = false, readSticky = false, readClip = false;
++	for(uint32 address = 0; address < m_maxAddress; address += 8)
++	{
++		uint32 upperOp = m_context.m_pMemoryMap->GetInstruction(address + 4);
++		if(upperOp & 0x80000000) continue; //I bit: the lower word is a constant
++		uint32 lowerOp = m_context.m_pMemoryMap->GetInstruction(address);
++		switch(lowerOp >> 25)
++		{
++		case 0x10: //FCEQ
++		case 0x12: //FCAND
++		case 0x13: //FCOR
++		case 0x1C: //FCGET
++			readClip = true;
++			break;
++		case 0x16: //FSAND
++		case 0x17: //FSOR
++			readSticky = true;
++			readMac = true; //The status flag is built from both
++			break;
++		case 0x18: //FMEQ
++		case 0x1A: //FMAND
++		case 0x1B: //FMOR
++			readMac = true;
++			break;
++		}
++	}
++	uint32 hints = 0;
++	if(!readMac) hints |= VUShared::COMPILEHINT_SKIP_FMAC_UPDATE;
++	if(!readSticky) hints |= VUShared::COMPILEHINT_SKIP_STICKY_UPDATE;
++	if(!readClip) hints |= VUShared::COMPILEHINT_SKIP_CLIP_UPDATE;
++	static int s_logs = 0;
++	if(s_logs < 40)
++	{
++		s_logs++;
++		printf("[vu] micro memory %016llx: flags read: MAC %d, status %d, clip %d\n",
++		       static_cast<unsigned long long>(m_microMemoryHash), readMac ? 1 : 0, readSticky ? 1 : 0, readClip ? 1 : 0);
++	}
++	return hints;
++}
 +
 +//One VU basic block from startAddress: up to its branch and delay slot, an E bit and its delay slot,
 +//or a D/T bit.
@@ -924,7 +1169,7 @@ index 72e80fc..1990b4a 100644
  	{
  		uint32 addrLo = address + 0;
  		uint32 addrHi = address + 4;
-@@ -105,18 +147,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+@@ -105,18 +199,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  		auto branchType = m_context.m_pArch->IsInstructionBranch(&m_context, addrLo, lowerOp);
  		if(upperOp & VUShared::VU_UPPEROP_BIT_E)
  		{
@@ -958,7 +1203,7 @@ index 72e80fc..1990b4a 100644
  			break;
  		}
  		else if(branchType == MIPS_BRANCH_NODELAY)
-@@ -125,6 +178,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+@@ -125,6 +230,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  			assert(false);
  		}
  	}
@@ -988,7 +1233,7 @@ index 72e80fc..1990b4a 100644
  	assert((endAddress - startAddress) <= MAX_BLOCK_SIZE);
  	CreateBlock(startAddress, endAddress);
  	auto block = static_cast<CVuBasicBlock*>(FindBlockStartingAt(startAddress));
-@@ -132,4 +208,10 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+@@ -132,4 +260,10 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  	{
  		SetupBlockLinks(startAddress, endAddress, branchAddress);
  	}
@@ -1000,22 +1245,24 @@ index 72e80fc..1990b4a 100644
 +	m_partitions[partitionKey] = std::move(partition);
  }
 diff --git a/Source/ee/VuExecutor.h b/Source/ee/VuExecutor.h
-index e2b43c9..3ad274a 100644
+index e2b43c9..1888b3c 100644
 --- a/Source/ee/VuExecutor.h
 +++ b/Source/ee/VuExecutor.h
-@@ -14,7 +14,11 @@ public:
+@@ -14,7 +14,13 @@ public:
  
  	void SetBlockNoClamping(BlockNoClampingSet);
  
 +	//Blocks span the VU basic blocks reached when conditional branches aren't taken (superblocks)
 +	static bool s_superblocks;
++	//Flags that nothing in micro memory reads aren't maintained (?vuflags=0 turns it off)
++	static bool s_flagAnalysis;
 +
  	void Reset() override;
 +	void ClearActiveBlocksInRange(uint32, uint32, bool) override;
  
  protected:
  	typedef std::multimap<CachedBlockKey, BasicBlockPtr> CachedBlockMap;
-@@ -27,9 +31,37 @@ protected:
+@@ -27,9 +33,39 @@ protected:
  
  	BasicBlockPtr BlockFactory(CMIPS&, uint32, uint32) override;
  	void PartitionFunction(uint32) override;
@@ -1030,6 +1277,8 @@ index e2b43c9..3ad274a 100644
 +		bool stop = false;
 +	};
 +	BLOCK_EXTENT FindBlockExtent(uint32, uint32) const;
++	uint32 ComputeFlagHints() const;
++	uint32 m_flagHints = 0;
 +	enum
 +	{
 +		MAX_SUPERBLOCK_PARTS = 16,

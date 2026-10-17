@@ -3569,10 +3569,10 @@ index 0000000..eeb6883
 +MULTI_ISA_UNSHARED_END
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/ReadInput.cpp b/ps2xIOP/src/emulator/spu2/SPU2/ReadInput.cpp
 new file mode 100644
-index 0000000..dad247e
+index 0000000..c48d21e
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/ReadInput.cpp
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,189 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -3584,6 +3584,7 @@ index 0000000..dad247e
 +#include "SPU2/spu2.h"
 +
 +extern u32 g_spu2StaleHalves;
++extern u32 g_spu2RepeatedHalves;
 +
 +// Core 0 Input is "SPDIF mode" - Source audio is AC3 compressed.
 +
@@ -3706,6 +3707,26 @@ index 0000000..dad247e
 +
 +	if (PlayMode == 2 && Index == 0) //Bitstream bypass refills twice as quickly (GTA VC)
 +		ReadIndex = (ReadIndex * 2) & 0x1FF;
++
++	// ps2recomp diagnostics: a half of the core 0 input buffer about to play that is identical to what
++	// played from it 512 samples ago (the sound driver re-sent an old block: its feed fell behind).
++	if (Index == 0 && (ReadIndex == 0 || ReadIndex == 0x100) && (AutoDMACtrl & 1))
++	{
++		static u64 s_lastHalf[2] = {0, 0};
++		const s16* left = GetMemPtr(0x2000 + ReadIndex);
++		const s16* right = GetMemPtr(0x2200 + ReadIndex);
++		u64 sum = 0;
++		bool sound = false;
++		for (int i = 0; i < 0x100; i++)
++		{
++			sum = sum * 31 + static_cast<u16>(left[i]) * 7 + static_cast<u16>(right[i]);
++			sound |= (left[i] > 64 || left[i] < -64);
++		}
++		u64& last = s_lastHalf[ReadIndex >> 8];
++		if (sound && sum == last)
++			g_spu2RepeatedHalves++;
++		last = sum;
++	}
 +
 +	if (ReadIndex == 0x100 || ReadIndex == 0x0 || ReadIndex == 0x80 || ReadIndex == 0x180)
 +	{
@@ -5587,10 +5608,10 @@ index 0000000..d7e963a
 +
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/spu2_glue.cpp b/ps2xIOP/src/emulator/spu2/SPU2/spu2_glue.cpp
 new file mode 100644
-index 0000000..521df42
+index 0000000..7c11cc7
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/spu2_glue.cpp
-@@ -0,0 +1,388 @@
+@@ -0,0 +1,390 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -5628,6 +5649,7 @@ index 0000000..521df42
 +u32 psxNextStartCounter = 0;
 +
 +u32 g_spu2StaleHalves = 0; // ReadInput.cpp
++u32 g_spu2RepeatedHalves = 0; // ReadInput.cpp
 +u32 HW_DMA4_MADR = 0;
 +u32 HW_DMA4_TADR = 0;
 +u32 HW_DMA7_MADR = 0;
@@ -5962,13 +5984,14 @@ index 0000000..521df42
 +		}
 +		std::snprintf(line, sizeof(line), " playmode=%x outpos=%x madr=%x/%x", PlayMode, OutPos, HW_DMA4_MADR, HW_DMA7_MADR);
 +		text += line;
-+		std::snprintf(line, sizeof(line), " adma irq->next start (samples, /32): %u %u %u %u %u %u %u %u max %u stale halves %u",
++		std::snprintf(line, sizeof(line), " adma irq->next start (samples, /32): %u %u %u %u %u %u %u %u max %u stale halves %u repeated halves %u",
 +			s_admaLatencyHist[0], s_admaLatencyHist[1], s_admaLatencyHist[2], s_admaLatencyHist[3], s_admaLatencyHist[4],
-+			s_admaLatencyHist[5], s_admaLatencyHist[6], s_admaLatencyHist[7], s_admaLatencyMax, g_spu2StaleHalves);
++			s_admaLatencyHist[5], s_admaLatencyHist[6], s_admaLatencyHist[7], s_admaLatencyMax, g_spu2StaleHalves, g_spu2RepeatedHalves);
 +		text += line;
 +		std::fill(std::begin(s_admaLatencyHist), std::end(s_admaLatencyHist), 0u);
 +		s_admaLatencyMax = 0;
 +		g_spu2StaleHalves = 0;
++		g_spu2RepeatedHalves = 0;
 +		return text;
 +	}
 +
@@ -9285,10 +9308,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..aeb1002
+index 0000000..aca8862
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,1582 @@
+@@ -0,0 +1,1626 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -9552,8 +9575,13 @@ index 0000000..aeb1002
 +	bool g_hd = true;     // HD texture pack (data/hd/): on unless <page>?hd=0 (start screen setting)
 +	bool g_halfRate = false; // picture at 30 fps (the game at 60): <page>?fps=30
 +	bool g_fsr = true;       // FSR 1 upscaling to the window: on unless <page>?fsr=0 (start screen setting)
++	bool g_vuFlagAnalysis = true; // ?vuflags=0: VU1 flags maintained even when nothing reads them
 +	bool g_vuSuperblocks = true; // ?superblocks=0: one VU1 basic block per compiled function
 +	bool g_vuStats = false;  // ?vustats=1: VU1 block transition statistics (use with ?chain=0)
++	int g_vuSlowPercent = 0; // ?vuslow=N: test aid, see RunVu1
++	bool g_vuDump = false;   // ?vudump=1 (with ?chain=0&vustats=1): Module._ps2xVuDump() gives the hottest VU1 blocks' code
++	std::mutex g_vuDumpMutex;
++	std::vector<uint8_t> g_vuDumpBlob;
 +	int g_vuChainParam = 1;  // VU1 block chaining: 1 = tail calls if available, else dispatcher; 0 = off (?chain=0); 2 = dispatcher (?chain=dispatch)
 +	ps2live::RingHeader* g_ring = nullptr;
 +	// Canvas size in device pixels, measured on the page thread (the GL thread can't read CSS)
@@ -10020,6 +10048,12 @@ index 0000000..aeb1002
 +				            "most frequent successor %.0f%% (%u blocks)\n",
 +				            stats.entries * 1000.0 / (now - s_last), stats.instructions / n, 100.0 * stats.fallThrough / n,
 +				            100.0 * stats.sameBlock / n, 100.0 * stats.dominantSuccessor / n, stats.blocks);
++				if(g_vuDump)
++				{
++					auto blob = static_cast<CVuExecutor*>(h.vu1.m_executor.get())->DumpHotBlocks(40);
++					std::lock_guard<std::mutex> lock(g_vuDumpMutex);
++					g_vuDumpBlob = std::move(blob);
++				}
 +				s_last = now;
 +			}
 +		}
@@ -10123,7 +10157,22 @@ index 0000000..aeb1002
 +	}
 +
 +	// Feeds whole quadwords of the game's VIF1 stream; a VIF waiting for the VU gets it run.
++	void FeedVif1Work(Host& h, const uint8_t* bytes, uint32_t size);
++
 +	void FeedVif1(Host& h, const uint8_t* bytes, uint32_t size)
++	{
++		if(g_vuSlowPercent <= 0)
++			return FeedVif1Work(h, bytes, size);
++		// ?vuslow=N (tests): VIF1/VU1 work takes N% longer, to reproduce a phone's saturated worker
++		const double start = emscripten_get_now();
++		FeedVif1Work(h, bytes, size);
++		const double until = emscripten_get_now() + (emscripten_get_now() - start) * g_vuSlowPercent / 100.0;
++		while(emscripten_get_now() < until)
++		{
++		}
++	}
++
++	void FeedVif1Work(Host& h, const uint8_t* bytes, uint32_t size)
 +	{
 +		static int s_dumped = 0;
 +		if(s_dumped < 12 && size >= 16)
@@ -10593,9 +10642,12 @@ index 0000000..aeb1002
 +			if(chainParam != 0)
 +				static_cast<CVuExecutor*>(vu1.m_executor.get())->EnableBlockChaining(tailCalls);
 +			static_cast<CVuExecutor*>(vu1.m_executor.get())->EnableBlockStats(g_vuStats);
++			CBasicBlock::s_keepCode = g_vuDump;
 +			// Superblocks: blocks that follow each other when a conditional branch isn't taken are
 +			// compiled into one function (~45% of block-to-block transitions in a match).
 +			CVuExecutor::s_superblocks = g_vuSuperblocks;
++			// Flags nothing in micro memory reads aren't maintained (?vuflags=0 keeps them all)
++			CVuExecutor::s_flagAnalysis = g_vuFlagAnalysis;
 +			std::printf("[webgs] VU1 superblocks %s\n", g_vuSuperblocks ? "on" : "off");
 +			std::printf("[webgs] VU1 block chaining %s\n", (chainParam == 0) ? "off" : tailCalls ? "with tail calls" : "through the dispatcher");
 +		}
@@ -10819,7 +10871,10 @@ index 0000000..aeb1002
 +		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
 +		g_hd = EM_ASM_INT({ return new URLSearchParams(location.search).get('hd') === '0' ? 0 : 1; }) != 0;
 +		g_fsr = EM_ASM_INT({ return new URLSearchParams(location.search).get('fsr') === '0' ? 0 : 1; }) != 0;
++		g_vuFlagAnalysis = EM_ASM_INT({ return new URLSearchParams(location.search).get('vuflags') === '0' ? 0 : 1; }) != 0;
 +		g_vuSuperblocks = EM_ASM_INT({ return new URLSearchParams(location.search).get('superblocks') === '0' ? 0 : 1; }) != 0;
++		g_vuSlowPercent = EM_ASM_INT({ return parseInt(new URLSearchParams(location.search).get('vuslow') || '0', 10) || 0; });
++		g_vuDump = EM_ASM_INT({ return new URLSearchParams(location.search).has('vudump') ? 1 : 0; }) != 0;
 +		g_vuStats = EM_ASM_INT({ return new URLSearchParams(location.search).has('vustats') ? 1 : 0; }) != 0;
 +		g_vuChainParam = EM_ASM_INT({
 +			const chain = new URLSearchParams(location.search).get('chain');
@@ -10857,6 +10912,18 @@ index 0000000..aeb1002
 +{
 +	emscripten_async_run_in_main_runtime_thread(EM_FUNC_SIG_VI, &StartOnMainThread, header);
 +	return true;
++}
++
++// ?vudump=1: [size (uint32)][blob] of the hottest VU1 blocks (see CGenericMipsExecutor::DumpHotBlocks)
++extern "C" EMSCRIPTEN_KEEPALIVE uint8_t* ps2xVuDump()
++{
++	static std::vector<uint8_t> copy;
++	std::lock_guard<std::mutex> lock(g_vuDumpMutex);
++	const uint32_t size = static_cast<uint32_t>(g_vuDumpBlob.size());
++	copy.resize(4 + size);
++	std::memcpy(copy.data(), &size, 4);
++	std::memcpy(copy.data() + 4, g_vuDumpBlob.data(), size);
++	return copy.data();
 +}
 +
 +extern "C" EMSCRIPTEN_KEEPALIVE void ps2xPrecompileShaderList(char* list)
