@@ -8052,18 +8052,20 @@ index 31a296b..f3532df 100644
      std::vector<ScheduledEvent> m_deadlines;
      std::deque<GuestInvocation> m_pendingInvocations;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index f09ec48..3f282c3 100644
+index f09ec48..bbae5cc 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -10,6 +10,7 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
+@@ -9,7 +9,9 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
+ #include "../gs/gs_dump_writer.h"
  
  #include <algorithm>
++#include <unordered_map>
  #include <array>
 +#include <vector>
  #include <atomic>
  #include <chrono>
  #include <cstdio>
-@@ -462,6 +463,18 @@ void EeScheduler::requestStop()
+@@ -462,6 +464,18 @@ void EeScheduler::requestStop()
      m_eventCv.notify_all();
  }
  
@@ -8082,7 +8084,7 @@ index f09ec48..3f282c3 100644
  void EeScheduler::postEvent(EeEvent event)
  {
      if (event.type == EeEventType::Stop)
-@@ -478,6 +491,37 @@ void EeScheduler::postEvent(EeEvent event)
+@@ -478,6 +492,37 @@ void EeScheduler::postEvent(EeEvent event)
      m_eventCv.notify_one();
  }
  
@@ -8120,7 +8122,34 @@ index f09ec48..3f282c3 100644
  bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
  {
      accountCycles(cycles);
-@@ -541,6 +585,77 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -517,12 +562,26 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+             static auto s_lastReport = std::chrono::steady_clock::now();
+             ++s_warps;
+             s_warpedCycles += warp;
++            // Where the game was when time had to jump: loops spinning for an event (candidates for
++            // ps2xAddEeIdleLoop, which sleeps instead of burning a core)
++            static std::unordered_map<uint32_t, uint32_t> s_warpPcs;
++            if (const GuestThread *spinning = currentThread())
++                s_warpPcs[spinning->activeContext().pc]++;
+             const auto now = std::chrono::steady_clock::now();
+             if (now - s_lastReport >= std::chrono::seconds(5))
+             {
+                 std::cerr << "[sched:warp] warps=" << s_warps << " cycles=" << s_warpedCycles
+                           << " vsync=" << m_vsyncTick << " pendingInvocations=" << m_pendingInvocations.size()
+                           << " eeCycle=" << m_eeCycle << std::endl;
++                {
++                    std::vector<std::pair<uint32_t, uint32_t>> top(s_warpPcs.begin(), s_warpPcs.end());
++                    std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++                    std::cerr << "[sched:warp] at pc";
++                    for (size_t i = 0; i < top.size() && i < 8u; ++i)
++                        std::cerr << " " << std::hex << top[i].first << std::dec << "=" << top[i].second;
++                    std::cerr << std::endl;
++                    s_warpPcs.clear();
++                }
+                 s_lastReport = now;
+                 s_warps = 0u;
+                 s_warpedCycles = 0u;
+@@ -541,6 +600,86 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return true;
      }
  
@@ -8163,8 +8192,17 @@ index f09ec48..3f282c3 100644
 +                // Time asleep in the game's frame waits: the rest is the game thread's load (game
 +                // code, IOP, sound); near 100% it can't keep up with the frame rate
 +                const double windowMs = std::chrono::duration<double, std::milli>(now - s_sleepReport).count();
++#if defined(__EMSCRIPTEN__)
++                // Of the busy time: waiting for room in the GS ring (the VU1 worker behind)
++                extern double g_ps2RingWaitMs;
++                std::printf("[sched] idle sleeps %u, %u woke >4 ms late (max %.0f ms); game thread %.0f%% busy (%.0f%% waiting for the GS ring)\n",
++                            s_sleeps, s_lateSleeps, s_maxLateMs, windowMs > 0.0 ? 100.0 * (1.0 - s_sleptMs / windowMs) : 0.0,
++                            windowMs > 0.0 ? 100.0 * g_ps2RingWaitMs / windowMs : 0.0);
++                g_ps2RingWaitMs = 0.0;
++#else
 +                std::printf("[sched] idle sleeps %u, %u woke >4 ms late (max %.0f ms); game thread %.0f%% busy\n", s_sleeps, s_lateSleeps,
 +                            s_maxLateMs, windowMs > 0.0 ? 100.0 * (1.0 - s_sleptMs / windowMs) : 0.0);
++#endif
 +                s_sleptMs = 0.0;
 +                if (s_sleeps >= 200u && s_lateSleeps * 20u > s_sleeps)
 +                {
@@ -8198,7 +8236,7 @@ index f09ec48..3f282c3 100644
      renewTimeSlice();
      return false;
  }
-@@ -1946,9 +2061,9 @@ void EeScheduler::makeRunning(GuestThread &item)
+@@ -1946,9 +2085,9 @@ void EeScheduler::makeRunning(GuestThread &item)
          struct Slot { uint64_t ticks = 0; uint32_t entry = 0; int priority = 0; uint32_t switches = 0; };
          static Slot s_slots[256];
          static int s_lastId = -1;
@@ -8210,7 +8248,7 @@ index f09ec48..3f282c3 100644
          if (s_lastId >= 0)
              s_slots[s_lastId & 255].ticks += tsc - s_lastTsc;
          s_lastTsc = tsc;
-@@ -2206,11 +2321,17 @@ void EeScheduler::processDueDeadlines()
+@@ -2206,11 +2345,17 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -8230,7 +8268,7 @@ index f09ec48..3f282c3 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -2293,6 +2414,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -2293,6 +2438,22 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }
@@ -8575,7 +8613,7 @@ index 0e1a2ad..721e03b 100644
          }
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-index db0ff1d..7d536d1 100644
+index db0ff1d..515aa5f 100644
 --- a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 @@ -21,7 +21,7 @@
@@ -8587,7 +8625,7 @@ index db0ff1d..7d536d1 100644
  #include "ps2x/host_intrin.h"
  #include <cerrno>
  #include <chrono>
-@@ -36,10 +36,16 @@ extern char **environ;
+@@ -36,10 +36,18 @@ extern char **environ;
  #endif
  
  // The live ring to the PCSX2 GS host exists on Windows and on POSIX hosts with a futex-like wait.
@@ -8598,14 +8636,16 @@ index db0ff1d..7d536d1 100644
  #endif
  
 +#if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
 +// web/play_gs_host.cpp: starts the in-page GS host on the browser's main thread.
 +bool ps2xWebStartGsHost(ps2live::RingHeader *header);
++double g_ps2RingWaitMs = 0.0; // time the game thread waited for room in the GS ring (EeScheduler report)
 +#endif
 +
  // ps2_runtime.cpp, frame-budget report (PS2X_NBA_FRAME_LOG): time the game blocked on a full ring.
  extern uint64_t g_ps2StatRingWaitTicks;
  
-@@ -163,13 +169,13 @@ namespace ps2_gsdump
+@@ -163,13 +171,13 @@ namespace ps2_gsdump
                          if (hostGone())
                              return false;
                          SetEvent(dataEvent);
@@ -8621,7 +8661,7 @@ index db0ff1d..7d536d1 100644
                          continue;
                      }
                      const uint64_t offset = static_cast<uint64_t>(w) % capacity;
-@@ -192,6 +198,81 @@ namespace ps2_gsdump
+@@ -192,6 +200,83 @@ namespace ps2_gsdump
                      SetEvent(dataEvent);
              }
          };
@@ -8680,12 +8720,14 @@ index db0ff1d..7d536d1 100644
 +                        if (hostGone())
 +                            return false;
 +                        const uint64_t waitStart = ps2xStatTicks();
++                        const double waitStartMs = emscripten_get_now();
 +                        header->producerWaiting = 1u;
 +                        __atomic_thread_fence(__ATOMIC_SEQ_CST);
 +                        if (header->readPos == r)
 +                            ps2live::eventWait(&events->space, 20);
 +                        header->producerWaiting = 0u;
 +                        g_ps2StatRingWaitTicks += ps2xStatTicks() - waitStart;
++                        g_ps2RingWaitMs += emscripten_get_now() - waitStartMs;
 +                        continue;
 +                    }
 +                    const uint64_t offset = static_cast<uint64_t>(w) % capacity;
@@ -8703,7 +8745,7 @@ index db0ff1d..7d536d1 100644
  #elif defined(__APPLE__) || defined(__linux__)
          // POSIX version of the live ring above: shm_open mapping, events as shared words
          // (ps2live::eventSet/eventWait), the host started with posix_spawn.
-@@ -305,13 +386,13 @@ namespace ps2_gsdump
+@@ -305,13 +390,13 @@ namespace ps2_gsdump
                          if (hostGone())
                              return false;
                          ps2live::eventSet(&events->data);
@@ -8719,7 +8761,7 @@ index db0ff1d..7d536d1 100644
                          continue;
                      }
                      const uint64_t offset = static_cast<uint64_t>(w) % capacity;
-@@ -342,6 +423,11 @@ namespace ps2_gsdump
+@@ -342,6 +427,11 @@ namespace ps2_gsdump
  #if defined(PS2X_GS_LIVE_RING)
              LiveRing live;
              bool liveActive = false;
@@ -8731,7 +8773,7 @@ index db0ff1d..7d536d1 100644
  #endif
              bool headerWritten = false;
              bool finished = false;
-@@ -373,6 +459,22 @@ namespace ps2_gsdump
+@@ -373,6 +463,22 @@ namespace ps2_gsdump
                  if (size == 0)
                      return;
  #if defined(PS2X_GS_LIVE_RING)
@@ -8754,7 +8796,7 @@ index db0ff1d..7d536d1 100644
                  if (liveActive)
                  {
                      if (!live.write(static_cast<const uint8_t *>(data), size))
-@@ -410,7 +512,7 @@ namespace ps2_gsdump
+@@ -410,7 +516,7 @@ namespace ps2_gsdump
              void endPacket()
              {
  #if defined(PS2X_GS_LIVE_RING)
@@ -8763,7 +8805,7 @@ index db0ff1d..7d536d1 100644
                      live.signal();
  #endif
              }
-@@ -471,8 +573,16 @@ namespace ps2_gsdump
+@@ -471,8 +577,16 @@ namespace ps2_gsdump
              {
                  Writer &init = w;
  #if defined(PS2X_GS_LIVE_RING)
@@ -8813,10 +8855,31 @@ index 7532552..b8c6172 100644
          const timespec timeout{static_cast<time_t>(timeoutMs / 1000u), static_cast<long>(timeoutMs % 1000u) * 1000000l};
          syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, nullptr, 0);
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index e493c89..2c27875 100644
+index e493c89..6daf928 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
-@@ -1570,7 +1570,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -552,11 +552,17 @@ void PS2Memory::resetEeTimers() noexcept
+ 
+ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+ {
+-    // Charged after every few guest instructions: batch into 512-cycle steps (~1.7 us of EE
+-    // time) instead of a hash lookup and 64-bit divisions per timer each time.
++    // Charged after every few guest instructions: batch into steps (512 cycles, ~1.7 us of EE
++    // time; 2048 on the web, ~7 us: phones are short of game-thread time) instead of a hash
++    // lookup and 64-bit divisions per timer each time.
++#if defined(__EMSCRIPTEN__)
++    constexpr uint64_t kTimerBatchCycles = 2048u;
++#else
++    constexpr uint64_t kTimerBatchCycles = 512u;
++#endif
+     static uint64_t s_pendingCycles = 0u;
+     s_pendingCycles += eeCycles;
+-    if (s_pendingCycles < 512u)
++    if (s_pendingCycles < kTimerBatchCycles)
+     {
+         return 0u;
+     }
+@@ -1570,7 +1576,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                      // tag, so the game's end-of-frame wait (0x003E1910) times out and its thread
                      // falls into an endless error loop that eats the EE's time.
                      const int kMaxChainTags = 1 << 20;
@@ -8825,7 +8888,7 @@ index e493c89..2c27875 100644
                      std::vector<uint8_t> chainBuf = takeChainBuffer(); // recycled: pages already mapped
                      // Chains are rebuilt every frame with similar sizes: start at the size of
                      // the last one instead of growing (and copying) tag by tag.
-@@ -1773,7 +1773,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1773,7 +1779,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                          }
                      }
                      {
@@ -8834,7 +8897,7 @@ index e493c89..2c27875 100644
                          size_t total = 0;
                          for (const ChainSegment &seg : chainSegments)
                              total += seg.size;
-@@ -1790,10 +1790,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1790,10 +1796,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                              const ChainSegment &seg = chainSegments[i];
                              chainBuf.insert(chainBuf.end(), seg.data, seg.data + seg.size);
                          }

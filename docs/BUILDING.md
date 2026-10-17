@@ -190,6 +190,12 @@ their own patches, and the few runtime changes shared with native code are behin
 - IOP time runs to an absolute target derived from EE time: the native EA mixer charges ~11.5k
   cycles at once, and taking each slice from wherever the last one ended let the IOP run ~3% ahead,
   so FMV sound was consumed faster than it arrived and the driver repeated blocks (a ~94 Hz buzz).
+- Game wait loops slept in the browser (`game/overrides/nba_street_v3_overrides.cpp`,
+  `ps2xAddEeIdleLoop`, web only): the frame wait at 0x3E3920 and the video/menu wait at 0x3E36F0
+  ("while (flag) { callback; 32 NOPs }"). Spinning in the latter made emulated time move in jumps
+  during videos and menus, and EA's sound driver repeated blocks (noise); asleep, time flows in 1 ms
+  steps. Intro video: game thread ~95% -> ~20%, repeated sound blocks -> 0.
+- EE timers advance in 2048-cycle steps on the web (512 natively).
 - Diagnostics: `?vustats=1&chain=0` (VU1 block statistics), `?env=NAME=value` (environment
   variables), `Module._ps2xSpu2Dump()` (last 8 s of SPU2 inputs and output).
 - EE scheduler: idle-loop sleep with time flowing in 1 ms steps, vblank rebase after stalls.

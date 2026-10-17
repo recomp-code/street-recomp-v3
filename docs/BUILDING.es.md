@@ -186,6 +186,12 @@ nativo están dentro de `__EMSCRIPTEN__`.
   nativo de EA suma ~11,5k ciclos de golpe, y empezar cada tramo donde acabó el anterior adelantaba
   el IOP ~3%, así que el sonido de los vídeos se consumía más rápido de lo que llegaba y el driver
   repetía bloques (un zumbido de ~94 Hz).
+- Bucles de espera del juego que duermen en el navegador (`game/overrides/nba_street_v3_overrides.cpp`,
+  `ps2xAddEeIdleLoop`, solo web): la espera de fotograma en 0x3E3920 y la de vídeos/menús en 0x3E36F0
+  ("while (flag) { callback; 32 NOPs }"). Girar en esta última hacía que el tiempo emulado avanzara a
+  saltos en vídeos y menús, y el driver de sonido de EA repetía bloques (ruido); dormido, el tiempo
+  avanza en pasos de 1 ms. Vídeo de inicio: hilo del juego ~95% -> ~20%, bloques repetidos -> 0.
+- Los temporizadores del EE avanzan en pasos de 2048 ciclos en la web (512 en nativo).
 - Diagnóstico: `?vustats=1&chain=0` (estadísticas de bloques de la VU1), `?env=NOMBRE=valor`
   (variables de entorno), `Module._ps2xSpu2Dump()` (últimos 8 s de entradas y salida del SPU2).
 - Planificador del EE: espera dormida con el tiempo avanzando en pasos de 1 ms, rebase del vblank
