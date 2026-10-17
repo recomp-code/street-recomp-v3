@@ -228,6 +228,12 @@ their own patches, and the few runtime changes shared with native code are behin
   Firefox 121+, Safari 18.2+); browsers without tail calls get a dispatcher hand-off (`nextBlockFunction`).
   The chaining code sits in its own conditional block so the Jitter writes nPC back first. VU1 worker
   ~51% -> ~42% on a Mac with tail calls. `?chain=0` turns it off, `?chain=dispatch` forces the hand-off.
+- VU1 superblocks (`ee/VuExecutor.cpp` `FindBlockExtent`/`PartitionNewFunction`, `ee/VuBasicBlock.cpp`
+  `CompileSubBlocks`): a block also takes the VU basic blocks reached when its conditional branches aren't
+  taken (up to 16, no self-loops). Each part is compiled as before (pipeline state, cycle quota, integer
+  branch delays); not-taken branches go straight on, taken ones leave through block chaining. ~45% of
+  block transitions in a match were fall-throughs: 7.6M -> 4.6M block entries/s, VU1 worker ~52% -> ~49.5%
+  with tail calls (58% -> 42% without chaining). `?superblocks=0` turns them off.
 - VU microprograms (`ee/VuExecutor.cpp`): partitions are remembered per (micro memory contents,
   block start), so swapping microprograms back in reuses their blocks.
 

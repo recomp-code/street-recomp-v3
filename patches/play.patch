@@ -347,7 +347,7 @@ index 56ef0ad..6ebb10b 100644
 +#endif
 +};
 diff --git a/Source/GenericMipsExecutor.h b/Source/GenericMipsExecutor.h
-index 2fb630f..3304da4 100644
+index 2fb630f..b4dcd6b 100644
 --- a/Source/GenericMipsExecutor.h
 +++ b/Source/GenericMipsExecutor.h
 @@ -1,8 +1,16 @@
@@ -367,7 +367,7 @@ index 2fb630f..3304da4 100644
  
  #include "BlockLookupOneWay.h"
  #include "BlockLookupTwoWay.h"
-@@ -56,6 +64,82 @@ public:
+@@ -56,6 +64,83 @@ public:
  
  	virtual ~CGenericMipsExecutor() = default;
  
@@ -433,7 +433,8 @@ index 2fb630f..3304da4 100644
 +		const uint32 begin = block->GetBeginAddress();
 +		if(m_lastBegin != MIPS_INVALID_PC)
 +		{
-+			if(begin == m_lastEnd + instructionSize) stats.fallThrough++;
++			//Blocks end on the last word of their last instruction (VU: the upper word, +4)
++			if(begin == ((m_lastEnd + 4) & ~(instructionSize - 1)) && begin > m_lastBegin) stats.fallThrough++;
 +			if(begin == m_lastBegin) stats.sameBlock++;
 +			m_blockSuccessors[m_lastBegin][begin]++;
 +		}
@@ -450,7 +451,7 @@ index 2fb630f..3304da4 100644
  	int Execute(int cycles) override
  	{
  		m_context.m_State.cycleQuota = cycles;
-@@ -65,10 +149,26 @@ public:
+@@ -65,10 +150,26 @@ public:
  #endif
  		while(m_context.m_State.nHasException == 0)
  		{
@@ -477,7 +478,7 @@ index 2fb630f..3304da4 100644
  		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
  #ifdef DEBUGGER_INCLUDED
  		if(m_context.m_State.nHasException == MIPS_EXCEPTION_BREAKPOINT)
-@@ -88,6 +188,9 @@ public:
+@@ -88,6 +189,9 @@ public:
  
  	void Reset() override
  	{
@@ -487,7 +488,7 @@ index 2fb630f..3304da4 100644
  		m_blockLookup.Clear();
  		m_blocks.clear();
  		m_blockOutLinks.clear();
-@@ -139,9 +242,27 @@ protected:
+@@ -139,9 +243,27 @@ protected:
  		auto block = BlockFactory(m_context, start, end);
  		ResetBlockOutLinks(block.get());
  		m_blockLookup.AddBlock(block.get());
@@ -515,7 +516,7 @@ index 2fb630f..3304da4 100644
  	void ResetBlockOutLinks(CBasicBlock* block)
  	{
  		for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
-@@ -286,6 +407,7 @@ protected:
+@@ -286,6 +408,7 @@ protected:
  			if(block == protectedBlock) continue;
  			if(!RangesOverlap(block->GetBeginAddress(), block->GetEndAddress(), start, end)) continue;
  			clearedBlocks.insert(block);
@@ -523,7 +524,7 @@ index 2fb630f..3304da4 100644
  			m_blockLookup.DeleteBlock(block);
  		}
  
-@@ -327,6 +449,12 @@ protected:
+@@ -327,6 +450,12 @@ protected:
  
  	BlockLookupType m_blockLookup;
  
@@ -702,11 +703,133 @@ index 6ad8461..8f1249d 100644
  			assert(processed <= nSize);
  			stream.Advance(processed);
  			//Adjust size in case not everything was processed by GIF
+diff --git a/Source/ee/VuBasicBlock.cpp b/Source/ee/VuBasicBlock.cpp
+index a1ca3ca..31293f3 100644
+--- a/Source/ee/VuBasicBlock.cpp
++++ b/Source/ee/VuBasicBlock.cpp
+@@ -14,10 +14,106 @@ bool CVuBasicBlock::IsLinkable() const
+ 	return m_isLinkable;
+ }
+ 
++//Superblocks: a block may span several VU basic blocks that follow each other when a conditional
++//branch is not taken (see CVuExecutor::PartitionNewFunction). Each one is compiled exactly as if it
++//were a block of its own (pipeline state, cycle quota, integer branch delays), but instead of
++//returning to the dispatcher between them, the code goes straight on to the next one when the branch
++//isn't taken. Taken branches leave through the usual block chaining.
++std::vector<uint32> CVuBasicBlock::FindSubBlockEnds() const
++{
++	std::vector<uint32> ends;
++	for(uint32 address = m_begin; address + 0xC < m_end; address += 8)
++	{
++		uint32 opcodeLo = m_context.m_pMemoryMap->GetInstruction(address);
++		if(IsConditionalBranch(opcodeLo))
++		{
++			ends.push_back(address + 0xC);
++			address += 8; //Skip the delay slot
++		}
++	}
++	ends.push_back(m_end);
++	return ends;
++}
++
+ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
+ {
+-	CompileProlog(jitter);
+-	jitter->MarkFirstBlockLabel();
++	const uint32 begin = m_begin;
++	const uint32 end = m_end;
++	auto ends = FindSubBlockEnds();
++	CompileSubBlocks(jitter, ends, 0, begin);
++	m_begin = begin;
++	m_end = end;
++}
++
++void CVuBasicBlock::CompileSubBlocks(CMipsJitter* jitter, const std::vector<uint32>& ends, size_t index, uint32 begin)
++{
++	//The per-block analyses below all work on [m_begin, m_end]
++	m_begin = begin;
++	m_end = ends[index];
++	bool loopsOnItself = CompileSubBlockBody(jitter, index == 0);
++	if(index + 1 == ends.size())
++	{
++		CompileEpilog(jitter, loopsOnItself && m_isLinkable && (ends.size() == 1));
++		return;
++	}
++
++	//Same as the end of a block (CBasicBlock::CompileEpilog), minus the return to the dispatcher
++	jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
++	jitter->PushCst(((m_end - m_begin) / 4) + 1);
++	jitter->Sub();
++	jitter->PullRel(offsetof(CMIPS, m_State.cycleQuota));
++
++	jitter->PushRel(offsetof(CMIPS, m_State.cycleQuota));
++	jitter->PushCst(0);
++	jitter->BeginIf(Jitter::CONDITION_LE);
++	{
++		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
++		jitter->PushCst(MIPS_EXCEPTION_STATUS_QUOTADONE);
++		jitter->Or();
++		jitter->PullRel(offsetof(CMIPS, m_State.nHasException));
++	}
++	jitter->EndIf();
++
++	jitter->PushCst(MIPS_INVALID_PC);
++	jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
++	jitter->BeginIf(Jitter::CONDITION_NE);
++	{
++		//Branch taken: leave like any other block
++		jitter->PushRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
++		jitter->PullRel(offsetof(CMIPS, m_State.nPC));
++
++		jitter->PushCst(MIPS_INVALID_PC);
++		jitter->PullRel(offsetof(CMIPS, m_State.nDelayedJumpAddr));
++
++		CompileChain(jitter);
++	}
++	jitter->Else();
++	{
++		jitter->PushRel(offsetof(CMIPS, m_State.nPC));
++		jitter->PushCst(m_end - m_begin + 4);
++		jitter->Add();
++		jitter->PullRel(offsetof(CMIPS, m_State.nPC));
++
++		//Not taken: go on with the next one, unless the quota ran out (or an exception happened)
++		uint32 nextBegin = m_end + 4;
++		jitter->PushRel(offsetof(CMIPS, m_State.nHasException));
++		jitter->PushCst(0);
++		jitter->BeginIf(Jitter::CONDITION_EQ);
++		{
++			CompileSubBlocks(jitter, ends, index + 1, nextBegin);
++		}
++		jitter->EndIf();
++	}
++	jitter->EndIf();
++}
++
++bool CVuBasicBlock::CompileSubBlockBody(CMipsJitter* jitter, bool first)
++{
++	if(first)
++	{
++		CompileProlog(jitter);
++		jitter->MarkFirstBlockLabel();
++	}
+ 
+ 	assert((m_begin & 0x07) == 0);
+ 	assert(((m_end + 4) & 0x07) == 0);
+@@ -436,7 +532,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
+ 	jitter->PushCst(integerTrailingDelayInfo.regIndex);
+ 	jitter->PullRel(offsetof(CMIPS, m_State.savedNextBlockIntRegIdx));
+ 
+-	CompileEpilog(jitter, loopsOnItself && m_isLinkable);
++	return loopsOnItself;
+ }
+ 
+ bool CVuBasicBlock::IsConditionalBranch(uint32 opcodeLo)
 diff --git a/Source/ee/VuBasicBlock.h b/Source/ee/VuBasicBlock.h
-index 052b681..ce7a83d 100644
+index 052b681..f474dae 100644
 --- a/Source/ee/VuBasicBlock.h
 +++ b/Source/ee/VuBasicBlock.h
-@@ -9,6 +9,10 @@ public:
+@@ -9,6 +9,12 @@ public:
  	virtual ~CVuBasicBlock() = default;
  
  	bool IsLinkable() const;
@@ -714,11 +837,27 @@ index 052b681..ce7a83d 100644
 +	{
 +		return m_isLinkable;
 +	}
++
++	static bool IsConditionalBranch(uint32);
  
  protected:
  	void CompileRange(CMipsJitter*) override;
+@@ -21,9 +27,12 @@ private:
+ 		uint32 useRegAddress = MIPS_INVALID_PC;
+ 	};
+ 
+-	static bool IsConditionalBranch(uint32);
+ 	static bool IsNonConditionalBranch(uint32);
+ 
++	std::vector<uint32> FindSubBlockEnds() const;
++	void CompileSubBlocks(CMipsJitter*, const std::vector<uint32>&, size_t, uint32);
++	bool CompileSubBlockBody(CMipsJitter*, bool);
++
+ 	typedef uint32 FmacRegWriteTimes[32][4];
+ 	struct BlockFmacPipelineInfo
+ 	{
 diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
-index 72e80fc..1912a41 100644
+index 72e80fc..1990b4a 100644
 --- a/Source/ee/VuExecutor.cpp
 +++ b/Source/ee/VuExecutor.cpp
 @@ -23,6 +23,8 @@ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
@@ -730,7 +869,7 @@ index 72e80fc..1912a41 100644
  	m_cachedBlocks.clear();
  	m_blockNoClamping.clear();
  	CGenericMipsExecutor::Reset();
-@@ -92,7 +94,43 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+@@ -92,11 +94,51 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
  	return result;
  }
  
@@ -742,7 +881,10 @@ index 72e80fc..1912a41 100644
 +}
 +
  void CVuExecutor::PartitionFunction(uint32 startAddress)
-+{
+ {
+-	uint32 endAddress = std::min<uint32>(startAddress + MAX_BLOCK_SIZE - 4, m_maxAddress - 4);
+-	uint32 branchAddress = MIPS_INVALID_PC;
+-	for(uint32 address = startAddress; address < endAddress; address += 8)
 +	if(!m_microMemoryHashValid)
 +	{
 +		auto map = m_context.m_pMemoryMap->GetInstructionMap(0);
@@ -770,11 +912,83 @@ index 72e80fc..1912a41 100644
 +	PartitionNewFunction(startAddress, partitionKey);
 +}
 +
++bool CVuExecutor::s_superblocks = true;
++
++//One VU basic block from startAddress: up to its branch and delay slot, an E bit and its delay slot,
++//or a D/T bit.
++CVuExecutor::BLOCK_EXTENT CVuExecutor::FindBlockExtent(uint32 startAddress, uint32 limit) const
++{
++	BLOCK_EXTENT extent;
++	extent.end = limit;
++	for(uint32 address = startAddress; address < limit; address += 8)
+ 	{
+ 		uint32 addrLo = address + 0;
+ 		uint32 addrHi = address + 4;
+@@ -105,18 +147,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+ 		auto branchType = m_context.m_pArch->IsInstructionBranch(&m_context, addrLo, lowerOp);
+ 		if(upperOp & VUShared::VU_UPPEROP_BIT_E)
+ 		{
+-			endAddress = address + 0xC;
++			extent.end = address + 0xC;
++			extent.stop = true;
+ 			break;
+ 		}
+ 		else if((branchType == MIPS_BRANCH_NONE) && (upperOp & (VUShared::VU_UPPEROP_BIT_D | VUShared::VU_UPPEROP_BIT_T)))
+ 		{
+-			endAddress = address + 0x04;
++			extent.end = address + 0x04;
++			extent.stop = true;
+ 			break;
+ 		}
+ 		else if(branchType == MIPS_BRANCH_NORMAL)
+ 		{
+-			branchAddress = m_context.m_pArch->GetInstructionEffectiveAddress(&m_context, addrLo, lowerOp);
+-			endAddress = address + 0xC;
++			extent.branchAddress = m_context.m_pArch->GetInstructionEffectiveAddress(&m_context, addrLo, lowerOp);
++			extent.end = address + 0xC;
++			//Only blocks ending in a plain conditional branch can be followed by another one: not an
++			//unconditional jump, nor a branch or an E bit in the delay slot (special cases in
++			//CVuBasicBlock::CompileRange), nor a loop on itself (kept as a loop inside its function)
++			uint32 slotLo = m_context.m_pMemoryMap->GetInstruction(address + 8);
++			uint32 slotHi = m_context.m_pMemoryMap->GetInstruction(address + 12);
++			extent.conditional = CVuBasicBlock::IsConditionalBranch(lowerOp) &&
++			                     (m_context.m_pArch->IsInstructionBranch(&m_context, address + 8, slotLo) == MIPS_BRANCH_NONE) &&
++			                     !(slotHi & VUShared::VU_UPPEROP_BIT_E);
++			extent.loopsOnItself = (extent.branchAddress == startAddress);
+ 			break;
+ 		}
+ 		else if(branchType == MIPS_BRANCH_NODELAY)
+@@ -125,6 +178,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+ 			assert(false);
+ 		}
+ 	}
++	return extent;
++}
++
 +void CVuExecutor::PartitionNewFunction(uint32 startAddress, const std::pair<uint64, uint32>& partitionKey)
- {
- 	uint32 endAddress = std::min<uint32>(startAddress + MAX_BLOCK_SIZE - 4, m_maxAddress - 4);
- 	uint32 branchAddress = MIPS_INVALID_PC;
-@@ -132,4 +170,10 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
++{
++	uint32 limit = std::min<uint32>(startAddress + MAX_BLOCK_SIZE - 4, m_maxAddress - 4);
++	auto extent = FindBlockExtent(startAddress, limit);
++	uint32 endAddress = extent.end;
++	uint32 branchAddress = extent.branchAddress;
++	//Superblock: append the blocks reached when the conditional branch isn't taken
++	if(s_superblocks && extent.conditional && !extent.loopsOnItself)
++	{
++		for(unsigned int count = 1; count < MAX_SUPERBLOCK_PARTS; count++)
++		{
++			uint32 nextStart = endAddress + 4;
++			if(nextStart >= limit) break;
++			auto next = FindBlockExtent(nextStart, limit);
++			if(next.loopsOnItself || (next.end >= limit)) break;
++			endAddress = next.end;
++			branchAddress = next.branchAddress;
++			if(next.stop || !next.conditional) break;
++		}
++	}
+ 	assert((endAddress - startAddress) <= MAX_BLOCK_SIZE);
+ 	CreateBlock(startAddress, endAddress);
+ 	auto block = static_cast<CVuBasicBlock*>(FindBlockStartingAt(startAddress));
+@@ -132,4 +208,10 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  	{
  		SetupBlockLinks(startAddress, endAddress, branchAddress);
  	}
@@ -786,22 +1000,40 @@ index 72e80fc..1912a41 100644
 +	m_partitions[partitionKey] = std::move(partition);
  }
 diff --git a/Source/ee/VuExecutor.h b/Source/ee/VuExecutor.h
-index e2b43c9..a26f491 100644
+index e2b43c9..3ad274a 100644
 --- a/Source/ee/VuExecutor.h
 +++ b/Source/ee/VuExecutor.h
-@@ -15,6 +15,7 @@ public:
+@@ -14,7 +14,11 @@ public:
+ 
  	void SetBlockNoClamping(BlockNoClampingSet);
  
++	//Blocks span the VU basic blocks reached when conditional branches aren't taken (superblocks)
++	static bool s_superblocks;
++
  	void Reset() override;
 +	void ClearActiveBlocksInRange(uint32, uint32, bool) override;
  
  protected:
  	typedef std::multimap<CachedBlockKey, BasicBlockPtr> CachedBlockMap;
-@@ -27,9 +28,23 @@ protected:
+@@ -27,9 +31,37 @@ protected:
  
  	BasicBlockPtr BlockFactory(CMIPS&, uint32, uint32) override;
  	void PartitionFunction(uint32) override;
 +	void PartitionNewFunction(uint32, const std::pair<uint64, uint32>&);
++
++	struct BLOCK_EXTENT
++	{
++		uint32 end = 0;
++		uint32 branchAddress = MIPS_INVALID_PC;
++		bool conditional = false;
++		bool loopsOnItself = false;
++		bool stop = false;
++	};
++	BLOCK_EXTENT FindBlockExtent(uint32, uint32) const;
++	enum
++	{
++		MAX_SUPERBLOCK_PARTS = 16,
++	};
  
  	static const BLOCK_COMPILE_HINTS g_blockCompileHints[];
  	CachedBlockMap m_cachedBlocks;

@@ -9285,10 +9285,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..f869469
+index 0000000..aeb1002
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,1576 @@
+@@ -0,0 +1,1582 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -9552,6 +9552,7 @@ index 0000000..f869469
 +	bool g_hd = true;     // HD texture pack (data/hd/): on unless <page>?hd=0 (start screen setting)
 +	bool g_halfRate = false; // picture at 30 fps (the game at 60): <page>?fps=30
 +	bool g_fsr = true;       // FSR 1 upscaling to the window: on unless <page>?fsr=0 (start screen setting)
++	bool g_vuSuperblocks = true; // ?superblocks=0: one VU1 basic block per compiled function
 +	bool g_vuStats = false;  // ?vustats=1: VU1 block transition statistics (use with ?chain=0)
 +	int g_vuChainParam = 1;  // VU1 block chaining: 1 = tail calls if available, else dispatcher; 0 = off (?chain=0); 2 = dispatcher (?chain=dispatch)
 +	ps2live::RingHeader* g_ring = nullptr;
@@ -10592,6 +10593,10 @@ index 0000000..f869469
 +			if(chainParam != 0)
 +				static_cast<CVuExecutor*>(vu1.m_executor.get())->EnableBlockChaining(tailCalls);
 +			static_cast<CVuExecutor*>(vu1.m_executor.get())->EnableBlockStats(g_vuStats);
++			// Superblocks: blocks that follow each other when a conditional branch isn't taken are
++			// compiled into one function (~45% of block-to-block transitions in a match).
++			CVuExecutor::s_superblocks = g_vuSuperblocks;
++			std::printf("[webgs] VU1 superblocks %s\n", g_vuSuperblocks ? "on" : "off");
 +			std::printf("[webgs] VU1 block chaining %s\n", (chainParam == 0) ? "off" : tailCalls ? "with tail calls" : "through the dispatcher");
 +		}
 +		vu1.m_pMemoryMap->InsertReadMap(0x00000000, 0x00003FFF, h->vuMem1, 0x00);
@@ -10814,6 +10819,7 @@ index 0000000..f869469
 +		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
 +		g_hd = EM_ASM_INT({ return new URLSearchParams(location.search).get('hd') === '0' ? 0 : 1; }) != 0;
 +		g_fsr = EM_ASM_INT({ return new URLSearchParams(location.search).get('fsr') === '0' ? 0 : 1; }) != 0;
++		g_vuSuperblocks = EM_ASM_INT({ return new URLSearchParams(location.search).get('superblocks') === '0' ? 0 : 1; }) != 0;
 +		g_vuStats = EM_ASM_INT({ return new URLSearchParams(location.search).has('vustats') ? 1 : 0; }) != 0;
 +		g_vuChainParam = EM_ASM_INT({
 +			const chain = new URLSearchParams(location.search).get('chain');

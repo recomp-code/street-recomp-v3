@@ -230,6 +230,13 @@ nativo están dentro de `__EMSCRIPTEN__`.
   usan un trampolín (`nextBlockFunction`). El código va en su propio bloque condicional para que el Jitter
   escriba antes nPC en memoria. Hilo VU1 ~51% -> ~42% en un Mac con llamadas de cola. `?chain=0` lo desactiva,
   `?chain=dispatch` fuerza el trampolín.
+- Superbloques de la VU1 (`ee/VuExecutor.cpp` `FindBlockExtent`/`PartitionNewFunction`,
+  `ee/VuBasicBlock.cpp` `CompileSubBlocks`): un bloque incluye también los bloques básicos de la VU a los
+  que se llega cuando sus ramas condicionales no se toman (hasta 16, sin bucles sobre sí mismos). Cada
+  parte se compila igual que antes (estado del pipeline, cuota de ciclos, retardos de ramas enteras); las
+  ramas no tomadas siguen de largo y las tomadas salen por el encadenado de bloques. ~45% de los saltos
+  entre bloques en un partido eran caídas: 7,6M -> 4,6M entradas a bloques/s, hilo de la VU1 ~52% -> ~49,5%
+  con llamadas de cola (58% -> 42% sin encadenado). `?superblocks=0` los desactiva.
 - Microprogramas de la VU (`ee/VuExecutor.cpp`): las particiones se recuerdan por (contenido de la
   micromemoria, inicio del bloque), así que al volver a cargar un microprograma se reutilizan sus
   bloques.
