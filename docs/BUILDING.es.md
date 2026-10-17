@@ -192,6 +192,16 @@ nativo están dentro de `__EMSCRIPTEN__`.
   saltos en vídeos y menús, y el driver de sonido de EA repetía bloques (ruido); dormido, el tiempo
   avanza en pasos de 1 ms. Vídeo de inicio: hilo del juego ~95% -> ~20%, bloques repetidos -> 0.
 - Los temporizadores del EE avanzan en pasos de 2048 ciclos en la web (512 en nativo).
+- Mezclador del SPU2 (código de PCSX2, `spu2/SPU2/Mixer.cpp`, `ADSR.cpp`): incrementos de barrido y ADSR
+  calculados al escribir el registro, sin comprobaciones de IRQ por voz cuando no hay IRQ activa,
+  interpolación y suma de puertas con SIMD: +24%, idéntico en 10M muestras estéreo y 220k lecturas.
+- Cadenas DMA de VIF1 (`ps2_memory.cpp`, `ps2_vif1_interpreter.cpp`, `vif1_source.h`): con la VU remota la
+  cadena se decodifica desde los trozos de RDRAM/scratchpad y se escribe en el anillo del GS sin la copia
+  intermedia; idéntico byte a byte en 1500 cadenas aleatorias.
+- Desactivado por defecto (en el juego medido peor o sin mejora): caché de llamadas del IOP + libsd nativa
+  (`?env=PS2X_IOP_IMPORT_CACHE=1&env=PS2X_IOP_LIBSD=1`), campos de la VU1 en locales (`?vulocals=1`),
+  grupos de módulos de la VU1 por microcódigo (`?vumodules=1`). La clave de la caché de bloques de la VU1
+  incluye ahora las instrucciones que el compilador lee fuera del bloque (podía reutilizar código viejo).
 - Diagnóstico: `?vustats=1&chain=0` (estadísticas de bloques de la VU1), `?env=NOMBRE=valor`
   (variables de entorno), `Module._ps2xSpu2Dump()` (últimos 8 s de entradas y salida del SPU2).
 - Planificador del EE: espera dormida con el tiempo avanzando en pasos de 1 ms, rebase del vblank

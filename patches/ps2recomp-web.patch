@@ -1984,8 +1984,164 @@ index 0000000..2f99b0d
 +#endif
 +
 +#endif
+diff --git a/ps2xIOP/src/emulator/imports/iop_imports.cpp b/ps2xIOP/src/emulator/imports/iop_imports.cpp
+index f13267f..b070211 100644
+--- a/ps2xIOP/src/emulator/imports/iop_imports.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_imports.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstdlib>
+ #include <utility>
+ 
+ namespace ps2x::iop::detail
+@@ -43,9 +44,60 @@ namespace ps2x::iop::detail
+     void IopImportRegistry::reset()
+     {
+         m_libraries.clear();
++        m_decoded.clear();
++        ++m_generation;
++    }
++
++    IopImportRegistry::CachedImport *IopImportRegistry::decodeCached(uint32_t pc) const
++    {
++        const uint32_t word0 = m_memory.read32(pc);
++        if (word0 != 0x03E00008u)
++            return nullptr;
++        const uint32_t word1 = m_memory.read32(pc + 4u);
++        if ((word1 & 0xFFFF0000u) != 0x24000000u)
++            return nullptr;
++        // PS2X_IOP_IMPORT_CACHE=1 turns the cache on. Off by default: with it (and the native libsd)
++        // the intro video's game thread went from ~20% to ~90% and the sound repeated blocks.
++        static const bool s_cache = []
++        {
++            const char *value = std::getenv("PS2X_IOP_IMPORT_CACHE");
++            return value && value[0] == '1';
++        }();
++        if (!s_cache)
++        {
++            static CachedImport s_uncached;
++            uint32_t table = 0u;
++            const auto call = decodeAt(pc, &table);
++            if (!call)
++                return nullptr;
++            s_uncached = CachedImport{word0, word1, table, 0u, 0u, *call, 0u, 0u};
++            return &s_uncached;
++        }
++        if (auto cached = m_decoded.find(pc); cached != m_decoded.end())
++        {
++            CachedImport &entry = cached->second;
++            if (entry.stubWord0 == word0 && entry.stubWord1 == word1 && m_memory.read32(entry.table) == kImportMagic &&
++                m_memory.read32(entry.table + 12u) == entry.tableName0 && m_memory.read32(entry.table + 16u) == entry.tableName1)
++                return &entry;
++            m_decoded.erase(cached);
++        }
++        uint32_t table = 0u;
++        const auto call = decodeAt(pc, &table);
++        if (!call)
++            return nullptr;
++        if (m_decoded.size() > 4096u)
++            m_decoded.clear();
++        CachedImport &entry = m_decoded[pc];
++        entry = CachedImport{word0, word1, table, m_memory.read32(table + 12u), m_memory.read32(table + 16u), *call, 0u, 0u};
++        return &entry;
+     }
+ 
+     std::optional<IopImportCall> IopImportRegistry::decode(uint32_t pc) const
++    {
++        return decodeAt(pc, nullptr);
++    }
++
++    std::optional<IopImportCall> IopImportRegistry::decodeAt(uint32_t pc, uint32_t *tableOut) const
+     {
+         if (m_memory.read32(pc) != 0x03E00008u)
+             return std::nullopt;
+@@ -89,6 +141,8 @@ namespace ps2x::iop::detail
+             }
+             if (valid)
+             {
++                if (tableOut)
++                    *tableOut = table;
+                 return IopImportCall{
+                     trimLibraryName(name),
+                     static_cast<uint16_t>(delay & 0xFFFFu),
+@@ -101,6 +155,7 @@ namespace ps2x::iop::detail
+ 
+     bool IopImportRegistry::registerExportTable(uint32_t address)
+     {
++        ++m_generation;
+         const uint32_t physical = IopMemory::physicalAddress(address);
+         if (physical + 20u > IopMemory::RamSize ||
+             m_memory.read32(physical) != kExportMagic)
+@@ -129,6 +184,7 @@ namespace ps2x::iop::detail
+ 
+     bool IopImportRegistry::releaseExportTable(uint32_t address)
+     {
++        ++m_generation;
+         return m_libraries.erase(IopMemory::physicalAddress(address)) != 0u;
+     }
+ 
+@@ -184,6 +240,7 @@ namespace ps2x::iop::detail
+ 
+     void IopImportRegistry::eraseRange(uint32_t base, uint32_t size)
+     {
++        ++m_generation;
+         for (auto library = m_libraries.begin(); library != m_libraries.end();)
+         {
+             if (library->first >= base && library->first < base + size)
+diff --git a/ps2xIOP/src/emulator/imports/iop_imports.h b/ps2xIOP/src/emulator/imports/iop_imports.h
+index cae8d91..5ff0c36 100644
+--- a/ps2xIOP/src/emulator/imports/iop_imports.h
++++ b/ps2xIOP/src/emulator/imports/iop_imports.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <unordered_map>
++
+ #include <cstddef>
+ #include <cstdint>
+ #include <map>
+@@ -26,6 +28,25 @@ namespace ps2x::iop::detail
+ 
+         void reset();
+         [[nodiscard]] std::optional<IopImportCall> decode(uint32_t pc) const;
++
++        // An import stub at pc, decoded once: the IOP calls the same stubs tens of thousands of
++        // times a second (the sound driver's libsd calls for every voice), and decode() scans the
++        // module's import table and builds the library name each time. Checked against the stub's
++        // two words and its table header on every use, so changed code is decoded again.
++        struct CachedImport
++        {
++            uint32_t stubWord0 = 0;
++            uint32_t stubWord1 = 0;
++            uint32_t table = 0;
++            uint32_t tableName0 = 0;
++            uint32_t tableName1 = 0;
++            IopImportCall call;
++            uint32_t guestTarget = 0;      // set by the caller once it jumped into a guest library
++            uint32_t targetGeneration = 0; // generation() when guestTarget was set
++        };
++        [[nodiscard]] CachedImport *decodeCached(uint32_t pc) const;
++        // Changes whenever export tables are registered or released (guest targets go stale).
++        [[nodiscard]] uint32_t generation() const noexcept { return m_generation; }
+         [[nodiscard]] bool registerExportTable(uint32_t address);
+         [[nodiscard]] bool releaseExportTable(uint32_t address);
+         [[nodiscard]] uint32_t findTable(std::string_view library, std::optional<uint16_t> version = std::nullopt) const;
+@@ -43,8 +64,11 @@ namespace ps2x::iop::detail
+         };
+ 
+         [[nodiscard]] const ExportLibrary *findLibrary(std::string_view name, std::optional<uint16_t> version) const;
++        [[nodiscard]] std::optional<IopImportCall> decodeAt(uint32_t pc, uint32_t *tableOut) const;
+ 
+         IopMemory &m_memory;
+         std::map<uint32_t, ExportLibrary> m_libraries;
++        uint32_t m_generation = 1;
++        mutable std::unordered_map<uint32_t, CachedImport> m_decoded;
+     };
+ }
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index 423e0f0..f6fe2b8 100644
+index 423e0f0..a376a30 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
 @@ -148,6 +148,8 @@ namespace ps2x::iop::detail
@@ -1997,8 +2153,378 @@ index 423e0f0..f6fe2b8 100644
              totalInstructions = 0;
              eeCycleCarry = 0;
              activeCpu = nullptr;
-@@ -713,9 +715,9 @@ namespace ps2x::iop::detail
+@@ -272,6 +274,20 @@ namespace ps2x::iop::detail
+             Missing,
+         };
+ 
++        // Libraries dispatchImport handles natively (it reaches imports.resolve only for the rest,
++        // and for their ordinals it doesn't implement)
++        static bool isHleLibrary(const std::string &library)
++        {
++            static constexpr std::string_view kHle[] = {
++                "cdvdman", "dmacman", "heaplib", "intrman", "ioman", "loadcore", "modload",
++                "secrman", "sifcmd", "sifman", "stdio", "sysclib", "sysmem", "thbase",
++                "thevent", "thmsgbx", "threadman", "thsemap", "timrman", "vblank"};
++            for (const std::string_view name : kHle)
++                if (iequals(library, name))
++                    return true;
++            return false;
++        }
++
+         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
+         {
+             const uint32_t a0 = cpu.gpr[4];
+@@ -616,6 +632,320 @@ namespace ps2x::iop::detail
+             return true;
+         }
+ 
++        // libsd accessors (hle::LibsdRoutine), called from an import stub whose guest target is
++        // known: run natively with the guest's exact effects. Each SPU2 register access happens
++        // at the IOP cycle the interpreter would reach it (the SPU2 catches up to that cycle), and
++        // the call is charged the instructions the guest path takes. PS2X_IOP_HLE=0 runs the
++        // guest code; PS2X_IOP_HLE=verify runs it too and compares the result (v0) with the
++        // native one computed beforehand (setters: the register address; reads at the call cycle).
++        struct LibsdVerify
++        {
++            bool active = false;
++            uint32_t ra = 0;
++            uint32_t sp = 0;
++            uint32_t expected = 0;
++            uint32_t expectedA0 = 0;
++            uint32_t expectedA1 = 0;
++            hle::LibsdRoutine routine = hle::LibsdRoutine::None;
++            uint64_t checked[5] = {};
++            uint64_t mismatched[5] = {}; // registers/addresses (must stay 0)
++            uint64_t readsLater[5] = {}; // getters: the guest read the register later (timing)
++        } libsdVerify;
++        struct LibsdTargets
++        {
++            uint32_t generation = 0;
++            struct Entry
++            {
++                hle::LibsdRoutine routine;
++                uint32_t table; // register table pointer array
++                uint32_t high;  // what the relocated lui loads
++            };
++            std::unordered_map<uint32_t, Entry> routines;
++        } libsdTargets;
++        uint64_t libsdNativeCalls = 0;
++
++        static int libsdHleMode()
++        {
++            static const int mode = []
++            {
++                const char *only = std::getenv("PS2X_IOP_LIBSD"); // PS2X_IOP_LIBSD=1 turns them on (off
++                if (!(only && only[0] == '1'))                    // by default: see iop_imports.cpp)
++                    return 0;
++                const char *env = std::getenv("PS2X_IOP_HLE");
++                if (env && env[0] == '0')
++                    return 0;
++                if (env && std::strcmp(env, "verify") == 0)
++                    return 2;
++                return 1;
++            }();
++            return mode;
++        }
++
++        // Runs routine with a0/a1 from cpu; apply = false computes v0 only (no register writes,
++        // SPU2 reads at the current cycle). Returns the instructions the guest path executes.
++        uint32_t libsdExecute(CpuState &cpu, hle::LibsdRoutine routine, uint32_t table, uint32_t high, bool apply, uint32_t &result,
++                             uint32_t *finalA0 = nullptr, uint32_t *finalA1 = nullptr)
++        {
++            const uint64_t start = totalCycles; // the routine's first instruction runs at this cycle
++            const auto at = [&](uint32_t index)
++            {
++                if (apply)
++                    totalCycles = start + index;
++            };
++            const auto entry = [&](uint32_t index) { return memory.read32(table + index); };
++            uint32_t a0 = cpu.gpr[4], a1 = cpu.gpr[5], a2 = cpu.gpr[6], a3 = cpu.gpr[7];
++            uint32_t v0 = 0, v1 = 0, at1 = cpu.gpr[1], hi = cpu.hi, lo = cpu.lo;
++            uint32_t count = 0;
++            const auto setStride = [&](uint32_t core, uint32_t flag)
++            {
++                // v1 = 0x400 - 984 * (a0 & 0x80 != 0); hi:lo = core * v1
++                const uint32_t f = flag ? 1u : 0u;
++                v0 = (((f << 5) - f) << 2) - f;
++                v0 <<= 3;
++                v1 = 0x400u - v0;
++                const int64_t product = static_cast<int64_t>(static_cast<int32_t>(core)) * static_cast<int32_t>(v1);
++                lo = static_cast<uint32_t>(product);
++                hi = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32);
++            };
++            switch (routine)
++            {
++            case hle::LibsdRoutine::SetParam:
++            {
++                a2 = a0 & 1u;
++                setStride(a2, a0 & 0x80u);
++                v0 = (a0 >> 6) & 0x3FCu;
++                a0 = (a0 & 0x3Eu) << 3;
++                at1 = high + v0; // at = the lui's half + index, as in the guest
++                v0 = entry(v0);
++                a3 = lo;
++                v0 = v0 + a3 + a0;
++                at(22);
++                if (apply)
++                    memory.write16(v0, static_cast<uint16_t>(a1));
++                result = v0;
++                count = 23;
++                break;
++            }
++            case hle::LibsdRoutine::GetParam:
++            {
++                a1 = a0 & 1u;
++                setStride(a1, a0 & 0x80u);
++                v0 = (a0 >> 6) & 0x3FCu;
++                a0 = (a0 & 0x3Eu) << 3;
++                at1 = high + v0;
++                v0 = entry(v0);
++                a2 = lo;
++                v0 += a2;
++                a0 += v0;
++                at(21);
++                v0 = memory.read16(a0);
++                result = v0;
++                count = 24;
++                break;
++            }
++            case hle::LibsdRoutine::SetAddr:
++            {
++                a2 = a1;
++                v0 = (a0 >> 6) & 0x3FCu;
++                v1 = a0 & 1u;
++                a1 = entry(v0);
++                v1 <<= 10;
++                a1 += v1;
++                v1 = a0 & 0x3Eu;
++                v0 = ((v1 << 1) + v1) << 1;
++                a1 += v0;
++                v0 = a2 >> 17;
++                a0 &= 0xFF00u;
++                at(16);
++                if (apply)
++                    memory.write16(a1, static_cast<uint16_t>(v0));
++                v0 = 0x1D00u;
++                const bool shortForm = a0 == v0;
++                a1 += 2u;
++                if (shortForm)
++                    count = 22;
++                else
++                {
++                    v0 = (a2 >> 1) & 0xFFF8u;
++                    at(22);
++                    if (apply)
++                        memory.write16(a1, static_cast<uint16_t>(v0));
++                    count = 25;
++                }
++                result = v0;
++                break;
++            }
++            case hle::LibsdRoutine::GetAddr:
++            {
++                a3 = 0x1FFFFu;
++                v0 = (a0 >> 6) & 0x3FCu;
++                v1 = (a0 & 1u) << 10;
++                a1 = entry(v0) + v1;
++                v1 = a0 & 0x3Eu;
++                v0 = ((v1 << 1) + v1) << 1;
++                a1 += v0;
++                at(15);
++                v0 = memory.read16(a1);
++                a0 &= 0xFF00u;
++                a2 = v0 << 17;
++                v0 = 0x1D00u;
++                if (a0 == v0)
++                    count = 23;
++                else
++                {
++                    at(21);
++                    v0 = memory.read16(a1 + 2u);
++                    a3 = v0 << 1;
++                    uint32_t reread = 0; // index of the second read (0: none)
++                    if (a0 == 0x2100u)
++                        reread = 27;
++                    else if (a0 == 0x2200u)
++                        reread = 29;
++                    else
++                    {
++                        v0 = 0x2200u;
++                        count = 31;
++                    }
++                    if (reread != 0u)
++                    {
++                        at(reread);
++                        v0 = memory.read16(a1);
++                        at(reread + 1u);
++                        v1 = memory.read16(a1 + 2u);
++                        v0 <<= 17;
++                        v1 <<= 1;
++                        if (a2 != v0)
++                        {
++                            a2 = v0;
++                            a3 = v1;
++                            count = reread + 9u;
++                        }
++                        else if (a3 != v1)
++                            count = reread + 9u;
++                        else
++                        {
++                            a2 = v0;
++                            a3 = v1;
++                            count = reread + 11u;
++                        }
++                    }
++                }
++                v0 = a2 | a3;
++                result = v0;
++                break;
++            }
++            case hle::LibsdRoutine::None:
++                return 0;
++            }
++            if (finalA0)
++                *finalA0 = a0;
++            if (finalA1)
++                *finalA1 = a1;
++            if (apply)
++            {
++                cpu.gpr[1] = at1;
++                cpu.gpr[2] = v0;
++                cpu.gpr[3] = v1;
++                cpu.gpr[4] = a0;
++                cpu.gpr[5] = a1;
++                cpu.gpr[6] = a2;
++                cpu.gpr[7] = a3;
++                cpu.hi = hi;
++                cpu.lo = lo;
++                totalCycles = start + count;
++            }
++            return count;
++        }
++
++        bool runLibsdHle(CpuState &cpu, uint32_t target)
++        {
++            const int mode = libsdHleMode();
++            if (mode == 0 || libsdVerify.active)
++                return false;
++            if (libsdTargets.generation != imports.generation())
++            {
++                libsdTargets.routines.clear();
++                libsdTargets.generation = imports.generation();
++            }
++            auto known = libsdTargets.routines.find(target);
++            if (known == libsdTargets.routines.end())
++            {
++                uint32_t table = 0, high = 0;
++                const hle::LibsdRoutine routine = hle::libsdRoutineAt(memory.ram().data(), target, table, high);
++                known = libsdTargets.routines.emplace(target, LibsdTargets::Entry{routine, table, high}).first;
++                if (routine != hle::LibsdRoutine::None)
++                {
++                    char line[96];
++                    std::snprintf(line, sizeof(line), "[IOP] native libsd routine %d at 0x%X (table 0x%X)",
++                                  static_cast<int>(routine), target, table);
++                    log(LogLevel::Info, line);
++                }
++            }
++            const hle::LibsdRoutine routine = known->second.routine;
++            if (routine == hle::LibsdRoutine::None)
++                return false;
++            const uint32_t table = known->second.table;
++            const uint32_t high = known->second.high;
++            if (mode == 2)
++            {
++                // Let the guest run; compare its v0 with the native result at its return
++                uint32_t expected = 0;
++                libsdExecute(cpu, routine, table, high, false, expected, &libsdVerify.expectedA0, &libsdVerify.expectedA1);
++                libsdVerify.active = true;
++                libsdVerify.ra = cpu.gpr[31];
++                libsdVerify.sp = cpu.gpr[29];
++                libsdVerify.expected = expected;
++                libsdVerify.routine = routine;
++                return false;
++            }
++            // The stub (jr ra; li zero, n) counts as one instruction, then the routine's
++            ++totalInstructions;
++            ++totalCycles;
++            uint32_t result = 0;
++            const uint32_t count = libsdExecute(cpu, routine, table, high, true, result);
++            totalInstructions += count;
++            cpu.pc = cpu.gpr[31];
++            cpu.branchPending = false;
++            ++libsdNativeCalls;
++            return true;
++        }
++
++        void finishLibsdVerify(const CpuState &cpu)
++        {
++            libsdVerify.active = false;
++            const int r = static_cast<int>(libsdVerify.routine);
++            ++libsdVerify.checked[r];
++            const bool getter = libsdVerify.routine == hle::LibsdRoutine::GetParam || libsdVerify.routine == hle::LibsdRoutine::GetAddr;
++            // a0/a1 end up holding the register address (or derived values) in every routine
++            const bool registersMatch = cpu.gpr[4] == libsdVerify.expectedA0 && cpu.gpr[5] == libsdVerify.expectedA1;
++            const bool resultMatch = cpu.gpr[2] == libsdVerify.expected;
++            const bool mismatch = !registersMatch || (!getter && !resultMatch);
++            if (mismatch)
++                ++libsdVerify.mismatched[r];
++            else if (!resultMatch)
++                ++libsdVerify.readsLater[r];
++            static uint32_t s_reports = 0;
++            uint64_t total = 0;
++            for (uint64_t value : libsdVerify.checked)
++                total += value;
++            if ((mismatch && s_reports < 40u) || total % 50000u == 1u)
++            {
++                if (mismatch)
++                    ++s_reports;
++                char line[320];
++                std::snprintf(line, sizeof(line),
++                              "[IOP hle verify] libsd %s: a0 %08x/%08x a1 %08x/%08x v0 %08x/%08x (guest/native); checked set/get param %llu/%llu, set/get addr %llu/%llu; "
++                              "mismatched %llu/%llu/%llu/%llu; getter read later %llu/%llu",
++                              mismatch ? "MISMATCH" : "ok", cpu.gpr[4], libsdVerify.expectedA0, cpu.gpr[5], libsdVerify.expectedA1, cpu.gpr[2], libsdVerify.expected,
++                              (unsigned long long)libsdVerify.checked[1], (unsigned long long)libsdVerify.checked[2],
++                              (unsigned long long)libsdVerify.checked[3], (unsigned long long)libsdVerify.checked[4],
++                              (unsigned long long)libsdVerify.mismatched[1], (unsigned long long)libsdVerify.mismatched[2],
++                              (unsigned long long)libsdVerify.mismatched[3], (unsigned long long)libsdVerify.mismatched[4],
++                              (unsigned long long)libsdVerify.readsLater[2], (unsigned long long)libsdVerify.readsLater[4]);
++                log(LogLevel::Info, line);
++            }
++        }
++
+         void finishEaMixerVerify()
+         {
+             eaMixerVerify.active = false;
+@@ -689,8 +1019,10 @@ namespace ps2x::iop::detail
+                 return true;
+             if (eaMixerVerify.active && cpu.pc == eaMixerVerify.ra && cpu.gpr[29] == eaMixerVerify.sp)
+                 finishEaMixerVerify();
++            if (libsdVerify.active && cpu.pc == libsdVerify.ra && cpu.gpr[29] == libsdVerify.sp)
++                finishLibsdVerify(cpu);
+ 
+-            if (const auto import = imports.decode(cpu.pc))
++            if (IopImportRegistry::CachedImport *cachedImport = imports.decodeCached(cpu.pc))
+             {
+                 // PS2X_IOP_IMPORT_TRACE=1: log every import call (HLE or guest library) with its
+                 // arguments and result, up to 20000 lines.
+@@ -711,11 +1043,33 @@ namespace ps2x::iop::detail
+                         s_traceHi = 0xFFFFFFFFu;
+                     return true;
                  }();
++                // A guest library already reached from this stub: straight there
++                if (!s_traceImports && cachedImport->guestTarget != 0u && cachedImport->targetGeneration == imports.generation())
++                {
++                    if (runLibsdHle(cpu, cachedImport->guestTarget))
++                        return true;
++                    ++totalInstructions;
++                    ++totalCycles;
++                    cpu.pc = cachedImport->guestTarget;
++                    cpu.branchPending = false;
++                    return true;
++                }
++                const IopImportCall importCall = cachedImport->call; // dispatching may load modules (and drop the cache)
++                const IopImportCall *import = &importCall;
++                const uint32_t stubPc = cpu.pc;
                  const uint32_t traceArgs[4] = {cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]};
                  const uint32_t traceRa = cpu.gpr[31];
 -                const uint64_t importStart = __rdtsc();
@@ -2006,10 +2532,18 @@ index 423e0f0..f6fe2b8 100644
                  const ImportDisposition disposition = dispatchImport(*import, cpu);
 -                g_iopStatImportTicks += __rdtsc() - importStart;
 +                g_iopStatImportTicks += ps2xStatTicks() - importStart;
++                if (disposition == ImportDisposition::JumpToGuest && !isHleLibrary(import->library))
++                {
++                    if (IopImportRegistry::CachedImport *again = imports.decodeCached(stubPc))
++                    {
++                        again->guestTarget = cpu.pc;
++                        again->targetGeneration = imports.generation();
++                    }
++                }
                  // PS2X_IOP_IMPORT_TRACE_SKIP="thbase,thevent": libraries left out of the trace.
                  static const std::string s_traceSkip = []
                  {
-@@ -802,6 +804,10 @@ namespace ps2x::iop::detail
+@@ -802,6 +1156,10 @@ namespace ps2x::iop::detail
                  }
                  if (!step(cpu))
                      break;
@@ -2020,7 +2554,7 @@ index 423e0f0..f6fe2b8 100644
                  if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                      servicePendingDmaInterrupts();
                  if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
-@@ -976,10 +982,19 @@ namespace ps2x::iop::detail
+@@ -976,10 +1334,19 @@ namespace ps2x::iop::detail
          // interrupt (line 9), delivered through the same path as the SPU2 DMA interrupts.
          void serviceSpu2()
          {
@@ -2040,7 +2574,7 @@ index 423e0f0..f6fe2b8 100644
          }
  
          // DEV9 (network adapter): received frames and register writes raise the SPEED interrupt
-@@ -1029,15 +1044,22 @@ namespace ps2x::iop::detail
+@@ -1029,15 +1396,22 @@ namespace ps2x::iop::detail
          {
              try
              {
@@ -2066,7 +2600,7 @@ index 423e0f0..f6fe2b8 100644
                      }
                      servicePendingDmaInterrupts();
                      servicePendingGuestCallbacks();
-@@ -1059,9 +1081,9 @@ namespace ps2x::iop::detail
+@@ -1059,9 +1433,9 @@ namespace ps2x::iop::detail
                          continue;
                      }
                      const uint64_t before = totalCycles;
@@ -2078,7 +2612,7 @@ index 423e0f0..f6fe2b8 100644
                      kernel.endTimeslice(*next, kThreadReturnSentinel);
                      if (totalCycles == before)
                          ++totalCycles;
-@@ -1221,6 +1243,9 @@ namespace ps2x::iop::detail
+@@ -1221,6 +1595,9 @@ namespace ps2x::iop::detail
          uint32_t nextModuleId = 1;
          uint32_t moduleCursor = kModuleLoadBase;
          uint64_t totalCycles = 0;
@@ -2088,7 +2622,7 @@ index 423e0f0..f6fe2b8 100644
          uint64_t totalInstructions = 0;
          uint64_t eeCycleCarry = 0;
          CpuState *activeCpu = nullptr;
-@@ -1296,9 +1321,9 @@ namespace ps2x::iop::detail
+@@ -1296,9 +1673,9 @@ namespace ps2x::iop::detail
          const uint64_t iopCycles = total / 8u;
          m_impl->eeCycleCarry = total % 8u;
          ++g_iopStatRunCalls;
@@ -2100,12 +2634,93 @@ index 423e0f0..f6fe2b8 100644
      }
  
      RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+diff --git a/ps2xIOP/src/emulator/iop_hle_routines.h b/ps2xIOP/src/emulator/iop_hle_routines.h
+index ed38992..cec0889 100644
+--- a/ps2xIOP/src/emulator/iop_hle_routines.h
++++ b/ps2xIOP/src/emulator/iop_hle_routines.h
+@@ -7,6 +7,7 @@
+ 
+ #include <cstdint>
+ #include <cstring>
++#include <iterator>
+ 
+ namespace ps2x::iop::detail::hle
+ {
+@@ -124,4 +125,68 @@ namespace ps2x::iop::detail::hle
+             }
+         }
+     }
++
++    // NBA Street V3's libsd.irx (loaded at 0x47500): the parameter/address accessors EA's sound
++    // driver calls for every voice on every update (~90% of the IOP's time went to them and to
++    // their caller). Signature words exclude the relocated lui/lw pair that loads the register
++    // table pointer; the table address is read back from those two instructions.
++    enum class LibsdRoutine : uint8_t
++    {
++        None,
++        SetParam, // sceSdSetParam, export 5
++        GetParam, // sceSdGetParam, export 6
++        SetAddr,  // sceSdSetAddr, export 9
++        GetAddr,  // sceSdGetAddr, export 10
++    };
++    struct LibsdRoutineInfo
++    {
++        LibsdRoutine routine;
++        uint32_t address;
++        uint32_t luiAddress; // lui (relocated high half of the register table)
++        uint32_t lwAddress;  // lw (relocated low half)
++        const GuestWord *signature;
++        size_t signatureWords;
++    };
++    constexpr GuestWord kLibsdSetParamSignature[] = {
++        {0x4AB60u, 0x30860001u}, {0x4AB64u, 0x30830080u}, {0x4AB68u, 0x0003182Bu}, {0x4AB6Cu, 0x00031140u}, {0x4AB70u, 0x00431023u}, {0x4AB74u, 0x00021080u}, {0x4AB78u, 0x00431023u}, {0x4AB7Cu, 0x000210C0u}, {0x4AB80u, 0x24030400u}, {0x4AB84u, 0x00621823u}, {0x4AB88u, 0x00C30018u}, {0x4AB8Cu, 0x00041182u}, {0x4AB90u, 0x304203FCu}, {0x4AB94u, 0x3084003Eu}, {0x4AB98u, 0x000420C0u}, {0x4ABA0u, 0x00220821u}, {0x4ABA8u, 0x00003812u}, {0x4ABACu, 0x00471021u}, {0x4ABB0u, 0x00441021u}, {0x4ABB4u, 0x03E00008u}, {0x4ABB8u, 0xA4450000u}};
++    constexpr GuestWord kLibsdGetParamSignature[] = {
++        {0x4ABBCu, 0x30850001u}, {0x4ABC0u, 0x30830080u}, {0x4ABC4u, 0x0003182Bu}, {0x4ABC8u, 0x00031140u}, {0x4ABCCu, 0x00431023u}, {0x4ABD0u, 0x00021080u}, {0x4ABD4u, 0x00431023u}, {0x4ABD8u, 0x000210C0u}, {0x4ABDCu, 0x24030400u}, {0x4ABE0u, 0x00621823u}, {0x4ABE4u, 0x00A30018u}, {0x4ABE8u, 0x00041182u}, {0x4ABECu, 0x304203FCu}, {0x4ABF0u, 0x3084003Eu}, {0x4ABF4u, 0x000420C0u}, {0x4ABFCu, 0x00220821u}, {0x4AC04u, 0x00003012u}, {0x4AC08u, 0x00461021u}, {0x4AC0Cu, 0x00822021u}, {0x4AC10u, 0x94820000u}, {0x4AC14u, 0x03E00008u}, {0x4AC18u, 0x00000000u}};
++    constexpr GuestWord kLibsdSetAddrSignature[] = {
++        {0x4AC8Cu, 0x00A03021u}, {0x4AC90u, 0x00041182u}, {0x4AC94u, 0x304203FCu}, {0x4AC98u, 0x30830001u}, {0x4ACA0u, 0x00A22821u}, {0x4ACA8u, 0x00031A80u}, {0x4ACACu, 0x00A32821u}, {0x4ACB0u, 0x3083003Eu}, {0x4ACB4u, 0x00031040u}, {0x4ACB8u, 0x00431021u}, {0x4ACBCu, 0x00021040u}, {0x4ACC0u, 0x00A22821u}, {0x4ACC4u, 0x00061442u}, {0x4ACC8u, 0x3084FF00u}, {0x4ACCCu, 0xA4A20000u}, {0x4ACD0u, 0x24021D00u}, {0x4ACD4u, 0x10820004u}, {0x4ACD8u, 0x24A50002u}, {0x4ACDCu, 0x00061042u}, {0x4ACE0u, 0x3042FFF8u}, {0x4ACE4u, 0xA4A20000u}, {0x4ACE8u, 0x03E00008u}, {0x4ACECu, 0x00000000u}};
++    constexpr GuestWord kLibsdGetAddrSignature[] = {
++        {0x4ACF0u, 0x3C070001u}, {0x4ACF4u, 0x00041182u}, {0x4ACF8u, 0x304203FCu}, {0x4ACFCu, 0x30830001u}, {0x4AD00u, 0x00031A80u}, {0x4AD08u, 0x00A22821u}, {0x4AD10u, 0x34E7FFFFu}, {0x4AD14u, 0x00A32821u}, {0x4AD18u, 0x3083003Eu}, {0x4AD1Cu, 0x00031040u}, {0x4AD20u, 0x00431021u}, {0x4AD24u, 0x00021040u}, {0x4AD28u, 0x00A22821u}, {0x4AD2Cu, 0x94A20000u}, {0x4AD30u, 0x3084FF00u}, {0x4AD34u, 0x00023440u}, {0x4AD38u, 0x24021D00u}, {0x4AD3Cu, 0x10820012u}, {0x4AD40u, 0x00000000u}, {0x4AD44u, 0x94A20002u}, {0x4AD48u, 0x00000000u}, {0x4AD4Cu, 0x00023840u}, {0x4AD50u, 0x24022100u}, {0x4AD54u, 0x10820003u}, {0x4AD58u, 0x24022200u}, {0x4AD5Cu, 0x1482000Au}, {0x4AD60u, 0x00000000u}, {0x4AD64u, 0x94A20000u}, {0x4AD68u, 0x94A30002u}, {0x4AD6Cu, 0x00021440u}, {0x4AD70u, 0x14C20003u}, {0x4AD74u, 0x00031840u}, {0x4AD78u, 0x14E30003u}, {0x4AD7Cu, 0x00000000u}, {0x4AD80u, 0x00403021u}, {0x4AD84u, 0x00603821u}, {0x4AD88u, 0x03E00008u}, {0x4AD8Cu, 0x00C71025u}};
++    constexpr LibsdRoutineInfo kLibsdRoutines[] = {
++        {LibsdRoutine::SetParam, 0x4AB60u, 0x4AB9Cu, 0x4ABA4u, kLibsdSetParamSignature, std::size(kLibsdSetParamSignature)},
++        {LibsdRoutine::GetParam, 0x4ABBCu, 0x4ABF8u, 0x4AC00u, kLibsdGetParamSignature, std::size(kLibsdGetParamSignature)},
++        {LibsdRoutine::SetAddr, 0x4AC8Cu, 0x4AC9Cu, 0x4ACA4u, kLibsdSetAddrSignature, std::size(kLibsdSetAddrSignature)},
++        {LibsdRoutine::GetAddr, 0x4ACF0u, 0x4AD04u, 0x4AD0Cu, kLibsdGetAddrSignature, std::size(kLibsdGetAddrSignature)},
++    };
++
++    // The routine at a guest address (None unless every signature word matches and the relocated
++    // pair is still a lui/lw of the expected registers); table = the register table pointer array.
++    inline LibsdRoutine libsdRoutineAt(const uint8_t *ram, uint32_t address, uint32_t &table, uint32_t &high)
++    {
++        const auto word = [ram](uint32_t at)
++        {
++            uint32_t value;
++            std::memcpy(&value, ram + (at & 0x1FFFFFu), sizeof(value));
++            return value;
++        };
++        for (const LibsdRoutineInfo &info : kLibsdRoutines)
++        {
++            if ((address & 0x1FFFFFu) != info.address)
++                continue;
++            for (size_t i = 0; i < info.signatureWords; ++i)
++                if (word(info.signature[i].address) != info.signature[i].value)
++                    return LibsdRoutine::None;
++            const uint32_t lui = word(info.luiAddress);
++            const uint32_t lw = word(info.lwAddress);
++            if ((lui & 0xFFE00000u) != 0x3C000000u || (lw & 0xFC000000u) != 0x8C000000u)
++                return LibsdRoutine::None;
++            high = (lui & 0xFFFFu) << 16;
++            table = high + static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(lw & 0xFFFFu)));
++            return info.routine;
++        }
++        return LibsdRoutine::None;
++    }
+ }
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/ADSR.cpp b/ps2xIOP/src/emulator/spu2/SPU2/ADSR.cpp
 new file mode 100644
-index 0000000..3f3c77a
+index 0000000..9aac67e
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/ADSR.cpp
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,193 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -2144,6 +2759,12 @@ index 0000000..3f3c77a
 +	CachedPhases[PHASE_RELEASE].Shift = ReleaseShift;
 +	CachedPhases[PHASE_RELEASE].Step = -8;
 +	CachedPhases[PHASE_RELEASE].Target = 0;
++
++	for (auto& p : CachedPhases)
++	{
++		p.CounterIncX = (0x8000u >> std::max(0, p.Shift - 11)) ^ 0x8000u;
++		p.LevelInc = p.Step << std::max(0, 11 - p.Shift);
++	}
 +}
 +
 +bool V_ADSR::Calculate(int voiceidx)
@@ -2153,8 +2774,8 @@ index 0000000..3f3c77a
 +	auto& p = CachedPhases[Phase]; // ps2recomp: [] instead of at() (no bounds-check throw path)
 +
 +	// maybe not correct for the "infinite" settings
-+	u32 counter_inc = 0x8000 >> std::max(0, p.Shift - 11);
-+	s32 level_inc = p.Step << std::max(0, 11 - p.Shift);
++	u32 counter_inc = p.CounterIncX ^ 0x8000u;
++	s32 level_inc = p.LevelInc;
 +
 +	if (p.Exp)
 +	{
@@ -2215,20 +2836,8 @@ index 0000000..3f3c77a
 +	}
 +}
 +
-+void V_VolumeSlide::RegSet(u16 src)
++void V_VolumeSlide::UpdateRate()
 +{
-+	Reg_VOL = src;
-+	if (!Enable)
-+	{
-+		Value = SignExtend16(src << 1);
-+	}
-+}
-+
-+void V_VolumeSlide::Update()
-+{
-+	if (!Enable)
-+		return;
-+
 +	s32 step_size = 7 - Step;
 +
 +	if (Decr)
@@ -2236,8 +2845,25 @@ index 0000000..3f3c77a
 +		step_size = ~step_size;
 +	}
 +
-+	u32 counter_inc = 0x8000 >> std::max(0, Shift - 11);
-+	s32 level_inc = step_size << std::max(0, 11 - Shift);
++	RateCounterInc = 0x8000 >> std::max(0, Shift - 11);
++	RateLevelInc = step_size << std::max(0, 11 - Shift);
++	RateMinOne = Step != 3 && Shift != 0x1f;
++}
++
++void V_VolumeSlide::RegSet(u16 src)
++{
++	Reg_VOL = src;
++	UpdateRate();
++	if (!Enable)
++	{
++		Value = SignExtend16(src << 1);
++	}
++}
++
++void V_VolumeSlide::Slide()
++{
++	u32 counter_inc = RateCounterInc;
++	s32 level_inc = RateLevelInc;
 +
 +	if (Exp)
 +	{
@@ -2254,7 +2880,7 @@ index 0000000..3f3c77a
 +
 +	// Allow counter_inc to be zero only in when all bits
 +	// of the rate field are set
-+	if (Step != 3 && Shift != 0x1f)
++	if (RateMinOne)
 +	{
 +		counter_inc = std::max<u32>(1, counter_inc);
 +	}
@@ -2943,10 +3569,10 @@ index 0000000..833873d
 \ No newline at end of file
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/Mixer.cpp b/ps2xIOP/src/emulator/spu2/SPU2/Mixer.cpp
 new file mode 100644
-index 0000000..eeb6883
+index 0000000..4ba0f38
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/Mixer.cpp
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,669 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -2957,6 +3583,16 @@ index 0000000..eeb6883
 +#include "SPU2/interpolate_table.h"
 +
 +#include "common/Assertions.h"
++
++#ifdef __wasm_simd128__
++#include <wasm_simd128.h>
++#endif
++
++// ps2recomp: either core's address IRQ enabled (the per-voice IRQ address checks are skipped otherwise)
++static __forceinline bool AnyIrqEnabled()
++{
++	return Cores[0].IRQEnable | Cores[1].IRQEnable;
++}
 +
 +// LOOP/END sets the ENDX bit and sets NAX to LSA, and the voice is muted if LOOP is not set
 +// LOOP seems to only have any effect on the block with LOOP/END set, where it prevents muting the voice
@@ -3029,7 +3665,7 @@ index 0000000..eeb6883
 +	// Important!  Both cores signal IRQ when an address is read, regardless of
 +	// which core actually reads the address.
 +
-+	for (int i = 0; i < 2; i++)
++	for (int i = 0; AnyIrqEnabled() && i < 2; i++)
 +	{
 +		if (Cores[i].IRQEnable && (vc.NextA == Cores[i].IRQA))
 +		{
@@ -3093,10 +3729,23 @@ index 0000000..eeb6883
 +
 +	// Get the sample index for NextA, we have to subtract 1 to ignore the loop header
 +	int sampleIdx = ((vc.NextA % pcm_WordsPerBlock) - 1) * 4;
++#ifdef __wasm_simd128__
++	// ps2recomp: DecPosWrite moves in steps of 4 from 0, so the 4 slots never wrap; slot 0 is also
++	// copied to the mirror (see V_Voice::DecodeFifo)
++	const u32 slot = vc.DecPosWrite % 32;
++	const v128_t decoded = wasm_i32x4_load16x4(&vc.SBuffer[sampleIdx]);
++	wasm_v128_store(&vc.DecodeFifo[slot], decoded);
++	if (slot == 0)
++		wasm_v128_store(&vc.DecodeFifo[32], decoded);
++#else
 +	for (int i = 0; i < 4; i++)
 +	{
-+		vc.DecodeFifo[(vc.DecPosWrite + i) % 32] = vc.SBuffer[sampleIdx + i];
++		const u32 slot = (vc.DecPosWrite + i) % 32;
++		vc.DecodeFifo[slot] = vc.SBuffer[sampleIdx + i];
++		if (slot < 3)
++			vc.DecodeFifo[32 + slot] = vc.SBuffer[sampleIdx + i]; // ps2recomp: mirror (see V_Voice)
 +	}
++#endif
 +}
 +
 +/////////////////////////////////////////////////////////////////////////////////////////
@@ -3126,7 +3775,7 @@ index 0000000..eeb6883
 +{
 +	V_Voice& vc(thiscore.Voices[voiceidx]);
 +
-+	for (int i = 0; i < 2; i++)
++	for (int i = 0; AnyIrqEnabled() && i < 2; i++)
 +		if (Cores[i].IRQEnable && Cores[i].IRQA == (vc.NextA & 0xFFFF8))
 +			SetIrqCall(i);
 +
@@ -3240,6 +3889,16 @@ index 0000000..eeb6883
 +	V_Voice& vc(thiscore.Voices[voiceidx]);
 +
 +	int phase = (vc.SP & 0x0ff0) >> 4;
++#ifdef __wasm_simd128__
++	// ps2recomp: the 4 taps at once (same per-tap products and shifts; the FIFO is mirrored so the
++	// taps are contiguous)
++	const v128_t taps = wasm_v128_load(&vc.DecodeFifo[vc.DecPosRead % 32]);
++	const v128_t coefs = wasm_i32x4_load16x4(interpTable[phase].data());
++	const v128_t products = wasm_i32x4_shr(wasm_i32x4_mul(coefs, taps), 15);
++	const v128_t pairs = wasm_i32x4_add(products, wasm_i32x4_shuffle(products, products, 2, 3, 0, 1));
++	const v128_t sum = wasm_i32x4_add(pairs, wasm_i32x4_shuffle(pairs, pairs, 1, 0, 3, 2));
++	return wasm_i32x4_extract_lane(sum, 0);
++#endif
 +	s32 out = 0;
 +	out += (interpTable[phase][0] * vc.DecodeFifo[(vc.DecPosRead + 0) % 32]) >> 15;
 +	out += (interpTable[phase][1] * vc.DecodeFifo[(vc.DecPosRead + 1) % 32]) >> 15;
@@ -3303,7 +3962,7 @@ index 0000000..eeb6883
 +static __forceinline void spu2M_WriteFast(u32 addr, s16 value)
 +{
 +	// Fixes some of the oldest hangs in pcsx2's history! :p
-+	for (int i = 0; i < 2; i++)
++	for (int i = 0; AnyIrqEnabled() && i < 2; i++)
 +	{
 +		if (Cores[i].IRQEnable && Cores[i].IRQA == addr)
 +		{
@@ -3374,6 +4033,22 @@ index 0000000..eeb6883
 +static __forceinline void MixCoreVoices(VoiceMixSet& dest, const uint coreidx)
 +{
 +	V_Core& thiscore(Cores[coreidx]);
++
++#ifdef __wasm_simd128__
++	// ps2recomp: dry L/R and wet L/R accumulated as one vector (gates are DryL, DryR, WetL, WetR)
++	v128_t acc = wasm_i32x4_make(dest.Dry.Left, dest.Dry.Right, dest.Wet.Left, dest.Wet.Right);
++	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
++	{
++		StereoOut32 VVal(MixVoice(coreidx, voiceidx));
++		const v128_t value = wasm_i32x4_make(VVal.Left, VVal.Right, VVal.Left, VVal.Right);
++		acc = wasm_i32x4_add(acc, wasm_v128_and(value, wasm_v128_load(&thiscore.VoiceGates[voiceidx])));
++	}
++	dest.Dry.Left = wasm_i32x4_extract_lane(acc, 0);
++	dest.Dry.Right = wasm_i32x4_extract_lane(acc, 1);
++	dest.Wet.Left = wasm_i32x4_extract_lane(acc, 2);
++	dest.Wet.Right = wasm_i32x4_extract_lane(acc, 3);
++	return;
++#endif
 +
 +	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
 +	{
@@ -4395,10 +5070,10 @@ index 0000000..8ca900b
 +MULTI_ISA_UNSHARED_END
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/defs.h b/ps2xIOP/src/emulator/spu2/SPU2/defs.h
 new file mode 100644
-index 0000000..3e240bc
+index 0000000..e27e55e
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/defs.h
-@@ -0,0 +1,627 @@
+@@ -0,0 +1,648 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -4527,15 +5202,29 @@ index 0000000..3e240bc
 +	u32 Counter;
 +	s32 Value;
 +
++	// ps2recomp: Slide()'s values that depend only on the register (set with it: RegSet, constructor)
++	u32 RateCounterInc;
++	s32 RateLevelInc;
++	bool RateMinOne;
++
 +public:
 +	V_VolumeSlide() = default;
 +	V_VolumeSlide(s16 regval, s32 fullvol)
 +		: Reg_VOL(regval)
 +		, Value(fullvol)
 +	{
++		UpdateRate();
 +	}
 +
-+	void Update();
++	void UpdateRate();
++
++	// ps2recomp: the sweep is rare; testing Enable inline saves a call per voice and sample
++	__forceinline void Update()
++	{
++		if (Enable)
++			Slide();
++	}
++	void Slide();
 +	void RegSet(u16 src); // used to set the volume from a register source
 +
 +#ifdef PCSX2_DEVBUILD
@@ -4613,6 +5302,11 @@ index 0000000..3e240bc
 +		u8 Shift;
 +		s8 Step;
 +		s32 Target;
++		// ps2recomp: Calculate()'s increments before the exponential adjustments; the counter
++		// increment is kept XOR 0x8000 so that a cache never filled (all zero) gives the same
++		// values as computing them from its zero fields
++		u32 CounterIncX;
++		s32 LevelInc;
 +	};
 +
 +	std::array<CachedADSR, ADSR_PHASES> CachedPhases;
@@ -4665,7 +5359,9 @@ index 0000000..3e240bc
 +	s16* SBuffer;
 +
 +	// Each voice has a buffer of decoded samples
-+	s32 DecodeFifo[32];
++	// ps2recomp: entries 32-34 mirror 0-2, so the 4 interpolation taps are always contiguous
++	// (35 is padding for a 4-wide store)
++	s32 DecodeFifo[32 + 4];
 +	u32 DecPosWrite;
 +	u32 DecPosRead;
 +
@@ -8051,6 +8747,66 @@ index 31a296b..f3532df 100644
      std::deque<EeEvent> m_events;
      std::vector<ScheduledEvent> m_deadlines;
      std::deque<GuestInvocation> m_pendingInvocations;
+diff --git a/ps2xRuntime/include/runtime/ps2_byte_span.h b/ps2xRuntime/include/runtime/ps2_byte_span.h
+new file mode 100644
+index 0000000..0fbb16b
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_byte_span.h
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include <cstdint>
++
++namespace ps2_gsdump
++{
++    // A piece of a stream (e.g. one part of a DMA chain, read in place).
++    struct Span
++    {
++        const uint8_t *data;
++        uint32_t size;
++    };
++}
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..31c6972 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -12,6 +12,7 @@
+ #include <mutex>
+ 
+ #include "gs/ps2_gif_arbiter.h"
++#include "runtime/ps2_byte_span.h"
+ #if defined(_MSC_VER)
+ #include <intrin.h>
+ #elif defined(USE_SSE2NEON)
+@@ -343,6 +344,8 @@ public:
+     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
+     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
+     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
++    // A VIF1 stream given as pieces read in place (a DMA chain's tag halves and payloads)
++    void processVIF1Segments(const ps2_gsdump::Span *spans, size_t count);
+     void processPendingTransfers();
+     std::vector<uint32_t> consumeCompletedDmacCauses();
+ 
+@@ -411,12 +414,19 @@ public:
+     bool m_vif1PendingPath2DirectHl = false;
+     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
+ 
++    template <typename Source>
++    void processVIF1Source(const Source &source);
++
+     struct PendingTransfer
+     {
+         bool fromScratchpad = false;
+         uint32_t srcAddr = 0;
+         uint32_t qwc = 0;
+         std::vector<uint8_t> chainData;
++        // VIF1 chain read in place (remote VU): the pieces of the chain in RDRAM / scratchpad,
++        // decoded and forwarded before any guest code can change them (see writeIORegister)
++        std::vector<ps2_gsdump::Span> chainSpans;
++        uint32_t chainSpanBytes = 0;
+     };
+     std::vector<PendingTransfer> m_pendingGifTransfers;
+     std::vector<PendingTransfer> m_pendingVif0Transfers;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 index f09ec48..bbae5cc 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
@@ -8613,7 +9369,7 @@ index 0e1a2ad..721e03b 100644
          }
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-index db0ff1d..515aa5f 100644
+index db0ff1d..711f690 100644
 --- a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 @@ -21,7 +21,7 @@
@@ -8823,6 +9579,61 @@ index db0ff1d..515aa5f 100644
                  {
                      if (init.live.open() && init.live.launchHost())
                      {
+@@ -778,6 +892,31 @@ namespace ps2_gsdump
+         w.endPacket();
+     }
+ 
++    void vif1(const Span *spans, size_t count)
++    {
++        uint64_t total = 0;
++        for (size_t i = 0; i < count; ++i)
++            total += spans[i].size;
++        // As vif1(data, size): whole words only
++        uint32_t sizeBytes = static_cast<uint32_t>(std::min<uint64_t>(total, 0xFFFFFFFFull)) & ~3u;
++        if (sizeBytes == 0u || !remoteVu())
++            return;
++        Writer &w = writer();
++        std::lock_guard<std::mutex> lock(w.mutex);
++        if (!w.usable())
++            return;
++        w.writeByte(kTypeLiveVif1);
++        w.writeWord(sizeBytes);
++        for (size_t i = 0; i < count && sizeBytes != 0u; ++i)
++        {
++            const uint32_t take = std::min(spans[i].size, sizeBytes);
++            if (take != 0u)
++                w.write(spans[i].data, take);
++            sizeBytes -= take;
++        }
++        w.endPacket();
++    }
++
+     void vif1Register(uint32_t address, uint32_t value)
+     {
+         if (!remoteVu())
+diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.h b/ps2xRuntime/src/lib/gs/gs_dump_writer.h
+index b82f22e..e68a685 100644
+--- a/ps2xRuntime/src/lib/gs/gs_dump_writer.h
++++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.h
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
++#include "runtime/ps2_byte_span.h"
++
++#include <cstddef>
+ #include <cstdint>
+ 
+ struct GSRegisters;
+@@ -36,6 +39,9 @@ namespace ps2_gsdump
+     // skipped. Default on in live mode; PS2X_REMOTE_VU=0 keeps VU1 local.
+     bool remoteVu();
+     void vif1(const uint8_t *data, uint32_t sizeBytes);
++    // The same packet from pieces (a DMA chain read in place): one VIF1 packet of their bytes in
++    // order, without gathering them first.
++    void vif1(const Span *spans, size_t count);
+     // A game write to a VIF1 register the host's VIF1 must see (FBRST, ERR, MARK).
+     void vif1Register(uint32_t address, uint32_t value);
+     void vsync(const GSRegisters &regs, int field);
 diff --git a/ps2xRuntime/src/lib/gs/ps2_live_ring.h b/ps2xRuntime/src/lib/gs/ps2_live_ring.h
 index 7532552..b8c6172 100644
 --- a/ps2xRuntime/src/lib/gs/ps2_live_ring.h
@@ -8855,7 +9666,7 @@ index 7532552..b8c6172 100644
          const timespec timeout{static_cast<time_t>(timeoutMs / 1000u), static_cast<long>(timeoutMs % 1000u) * 1000000l};
          syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, nullptr, 0);
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index e493c89..6daf928 100644
+index e493c89..aaae6a6 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
 @@ -552,11 +552,17 @@ void PS2Memory::resetEeTimers() noexcept
@@ -8888,16 +9699,42 @@ index e493c89..6daf928 100644
                      std::vector<uint8_t> chainBuf = takeChainBuffer(); // recycled: pages already mapped
                      // Chains are rebuilt every frame with similar sizes: start at the size of
                      // the last one instead of growing (and copying) tag by tag.
-@@ -1773,7 +1779,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1582,11 +1588,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     // below copies them in one go into a buffer of the exact size, prefetching the
+                     // pieces ahead: the payloads are ~4000 small scattered reads per frame (3+ MB),
+                     // and copying them tag by tag while walking ran at memory latency.
+-                    struct ChainSegment
+-                    {
+-                        const uint8_t *data;
+-                        uint32_t size;
+-                    };
++                    using ChainSegment = ps2_gsdump::Span;
+                     static thread_local std::vector<ChainSegment> chainSegments;
+                     chainSegments.clear();
+ 
+@@ -1772,8 +1774,20 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             std::fprintf(stderr, "[dma] ch=0x%X longest chain so far: %d tags\n", channelBase, tagsProcessed);
                          }
                      }
++                    // Remote VU (the GS host runs VIF1): the VIF1 chain is decoded and forwarded from
++                    // its pieces in place (processPendingTransfers, right below, before any guest
++                    // code can change them) instead of being gathered into chainBuf first.
++                    const bool vif1InPlace = channelBase == 0x10009000u && ps2_gsdump::remoteVu();
++                    size_t inPlaceBytes = 0;
++                    if (vif1InPlace)
++                    {
++                        for (const ChainSegment &seg : chainSegments)
++                            inPlaceBytes += seg.size;
++                        g_ps2StatChainBytes += inPlaceBytes;
++                    }
++                    else
                      {
 -                        const uint64_t copyStart = __rdtsc();
 +                        const uint64_t copyStart = ps2xStatTicks();
                          size_t total = 0;
                          for (const ChainSegment &seg : chainSegments)
                              total += seg.size;
-@@ -1790,10 +1796,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1790,10 +1804,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                              const ChainSegment &seg = chainSegments[i];
                              chainBuf.insert(chainBuf.end(), seg.data, seg.data + seg.size);
                          }
@@ -8910,6 +9747,80 @@ index e493c89..6daf928 100644
                      g_ps2StatChainTags += static_cast<uint64_t>(tagsProcessed);
                      if (tagsProcessed >= kMaxChainTags)
                      {
+@@ -1809,7 +1823,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
+                     m_ioRegisters[channelBase + 0x00] = chcr;
+ 
+-                    s_lastChainBytes = std::clamp<size_t>(chainBuf.size() + chainBuf.size() / 4u, 4096u, 16u * 1024u * 1024u);
++                    if (vif1InPlace)
++                    {
++                        recycleChainBuffer(std::move(chainBuf));
++                        if (inPlaceBytes != 0u)
++                        {
++                            PendingTransfer pt;
++                            pt.chainSpans.assign(chainSegments.begin(), chainSegments.end());
++                            pt.chainSpanBytes = static_cast<uint32_t>(std::min<size_t>(inPlaceBytes, 0xFFFFFFFFu));
++                            m_pendingVif1Transfers.push_back(std::move(pt));
++                        }
++                    }
++                    else
++                        s_lastChainBytes = std::clamp<size_t>(chainBuf.size() + chainBuf.size() / 4u, 4096u, 16u * 1024u * 1024u);
+                     if (!chainBuf.empty())
+                     {
+                         PendingTransfer pt;
+@@ -2091,7 +2117,51 @@ void PS2Memory::processPendingTransfers()
+     bool vif1Stalled = !g_vif1StalledChain.empty();
+     for (auto &p : m_pendingVif1Transfers)
+     {
+-        if (!p.chainData.empty())
++        if (p.chainSpanBytes != 0u)
++        {
++            // A chain read in place: copied only when (or what) VIF1 can't decode now
++            const auto copySpans = [&](std::vector<uint8_t> &out, uint32_t from)
++            {
++                uint32_t pos = 0;
++                for (const ps2_gsdump::Span &span : p.chainSpans)
++                {
++                    const uint32_t end = pos + span.size;
++                    if (end > from)
++                    {
++                        const uint32_t skip = from > pos ? from - pos : 0u;
++                        out.insert(out.end(), span.data + skip, span.data + span.size);
++                    }
++                    pos = end;
++                }
++            };
++            if (vif1Stalled)
++            {
++                // VIF1 is still stalled on an earlier i-bit: queue behind it.
++                if (g_vif1StalledChain.empty())
++                    g_vif1StalledChain.clear();
++                copySpans(g_vif1StalledChain.data, 0u);
++                continue;
++            }
++            const uint32_t size = p.chainSpanBytes;
++            ps2_vif1_irq::setStallAllowed(true);
++            processVIF1Segments(p.chainSpans.data(), p.chainSpans.size());
++            ps2_vif1_irq::setStallAllowed(false);
++            uint32_t consumed = 0u;
++            if (ps2_vif1_irq::takeStall(consumed) && consumed < size)
++            {
++                recycleChainBuffer(std::move(g_vif1StalledChain.data));
++                g_vif1StalledChain.data = takeChainBuffer();
++                g_vif1StalledChain.data.reserve(size - consumed);
++                copySpans(g_vif1StalledChain.data, consumed);
++                g_vif1StalledChain.offset = 0;
++                vif1Stalled = true;
++                static int s_stallLogs = 0;
++                if (s_stallLogs++ < 20)
++                    std::fprintf(stderr, "[vif1:stall] code=0x%08X consumed=%u left=%zu\n", vif1_regs.code, consumed, g_vif1StalledChain.size());
++                vif1_regs.stat |= (1u << 10); // VIS: stalled by i-bit
++            }
++        }
++        else if (!p.chainData.empty())
+         {
+             if (vif1Stalled)
+             {
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
 index 5c92038..7e83d49 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
@@ -9007,10 +9918,53 @@ index aff25e6..1de2f76 100644
  }
  
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-index a857acc..8809d65 100644
+index a857acc..31aac30 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 +++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-@@ -368,8 +368,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "vif1_irq_queue.h"
+ #include "gs/gs_dump_writer.h"
++#include "vif1_source.h"
+ #include <algorithm>
+ #include "ps2x/host_intrin.h"
+ #include <cstdio>
+@@ -362,14 +363,43 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+ 
+ extern uint64_t g_ps2StatVif1Ticks; // ps2_runtime.cpp, frame-budget report
+ 
++namespace
++{
++    void forwardVif1(const ps2_vif1_source::Contiguous &src, uint32_t begin, uint32_t end)
++    {
++        ps2_gsdump::vif1(src.data + begin, end - begin);
++    }
++
++    void forwardVif1(const ps2_vif1_source::Segmented &src, uint32_t begin, uint32_t end)
++    {
++        static thread_local std::vector<ps2_gsdump::Span> spans;
++        spans.clear();
++        src.spans(begin, end, [](const ps2_gsdump::Span &span) { spans.push_back(span); });
++        ps2_gsdump::vif1(spans.data(), spans.size());
++    }
++}
++
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
++    processVIF1Source(ps2_vif1_source::Contiguous{data, sizeBytes});
++}
++
++void PS2Memory::processVIF1Segments(const ps2_gsdump::Span *spans, size_t count)
++{
++    processVIF1Source(ps2_vif1_source::Segmented(spans, count));
++}
++
++// The VIF1 decoder, reading from a contiguous buffer or from a DMA chain in place (vif1_source.h).
++template <typename Source>
++void PS2Memory::processVIF1Source(const Source &src)
++{
++    const uint32_t sizeBytes = src.size();
+     if (sizeBytes == 0u)
          return;
      struct StatTimer
      {
@@ -9021,6 +9975,266 @@ index a857acc..8809d65 100644
      } statTimer;
  
      uint32_t pos = 0;
+@@ -388,7 +418,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         end = std::min(end, sizeBytes);
+         if (remoteVu && end > forwarded)
+         {
+-            ps2_gsdump::vif1(data + forwarded, end - forwarded);
++            forwardVif1(src, forwarded, end);
+             forwarded = end;
+         }
+     };
+@@ -411,15 +441,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             }
+ 
+             const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
+-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+-            const uint64_t imageTag =
+-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+-                (static_cast<uint64_t>(kGifFmtImage) << 58);
+-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
+-            if (!remoteVu)
++            if (!remoteVu) // remote VU: the host's VIF1 sends the image itself
++            {
++                std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
++                const uint64_t imageTag =
++                    static_cast<uint64_t>(chunkQw & 0x7FFFu) |
++                    ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
++                    (static_cast<uint64_t>(kGifFmtImage) << 58);
++                std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
++                src.copy(imagePacket.data() + 16u, pos, chunkQw * 16u);
+                 submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
++            }
+ 
+             pos += chunkQw * 16u;
+             m_vif1PendingPath2ImageQwc -= chunkQw;
+@@ -430,8 +462,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             continue;
+         }
+ 
+-        uint32_t cmd;
+-        memcpy(&cmd, data + pos, 4);
++        const uint32_t cmd = src.read32(pos);
+         pos += 4;
+ 
+         uint8_t opcode = (cmd >> 24) & 0x7F;
+@@ -553,9 +584,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         {
+             if (pos + 4 > sizeBytes)
+                 break;
+-            uint32_t maskValue = 0;
+-            std::memcpy(&maskValue, data + pos, sizeof(maskValue));
+-            vif1_regs.mask = maskValue;
++            vif1_regs.mask = src.read32(pos);
+             pos += 4;
+             continue;
+         }
+@@ -563,7 +592,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         {
+             if (pos + 16 > sizeBytes)
+                 break;
+-            std::memcpy(vif1_regs.row, data + pos, 16);
++            src.copy(vif1_regs.row, pos, 16);
+             pos += 16;
+             continue;
+         }
+@@ -571,7 +600,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         {
+             if (pos + 16 > sizeBytes)
+                 break;
+-            std::memcpy(vif1_regs.col, data + pos, 16);
++            src.copy(vif1_regs.col, pos, 16);
+             pos += 16;
+             continue;
+         }
+@@ -587,7 +616,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
+                 if (pos + copyBytes <= sizeBytes)
+                 {
+-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
++                    src.copy(m_vu1Code + destAddr, pos, copyBytes);
+                     markVU1CodeModified();
+                 }
+             }
+@@ -609,10 +638,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             if (qwCount > 0)
+             {
+                 const bool directHl = (opcode == VIF_DIRECTHL);
++                const uint8_t *direct = src.ptr(pos, qwCount * 16u);
+                 if (!remoteVu)
+-                    submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
++                    submitGifPacket(GifPathId::Path2, direct, qwCount * 16, true, directHl);
+ 
+-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
++                const uint32_t pendingImageQw = pendingGifImageQwc(direct, qwCount * 16u);
+                 if (pendingImageQw != 0u)
+                 {
+                     m_vif1PendingPath2ImageQwc = pendingImageQw;
+@@ -687,7 +717,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             // Remote VU: the host's VIF1 fills its own VU1 memory; only the size matters here.
+             if (!remoteVu && m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+             {
+-                const uint8_t *srcBase = data + pos;
++                const uint8_t *srcBase = src.ptr(pos, totalBytes);
+                 uint32_t srcIndex = 0u;
+                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                 {
+@@ -897,3 +927,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+     // in the host's VIF1, which keeps that state).
+     forwardUpTo(sizeBytes);
+ }
++
++template void PS2Memory::processVIF1Source(const ps2_vif1_source::Contiguous &);
++template void PS2Memory::processVIF1Source(const ps2_vif1_source::Segmented &);
+diff --git a/ps2xRuntime/src/lib/vif1_source.h b/ps2xRuntime/src/lib/vif1_source.h
+new file mode 100644
+index 0000000..da296e1
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vif1_source.h
+@@ -0,0 +1,141 @@
++#pragma once
++
++#include "gs/gs_dump_writer.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++// Where PS2Memory::processVIF1Data reads a VIF1 stream from: one contiguous buffer, or the pieces
++// of a DMA chain in place (tag upper halves and payloads in RDRAM / scratchpad), so a chain needs
++// no gathering copy before it is decoded and forwarded (see processVIF1Segments).
++namespace ps2_vif1_source
++{
++    using ByteSpan = ps2_gsdump::Span;
++
++    struct Contiguous
++    {
++        const uint8_t *data;
++        uint32_t sizeBytes;
++
++        uint32_t size() const { return sizeBytes; }
++        // Pointer to [pos, pos + length) (within size()).
++        const uint8_t *ptr(uint32_t pos, uint32_t) const { return data + pos; }
++        void copy(void *dst, uint32_t pos, uint32_t length) const { std::memcpy(dst, data + pos, length); }
++        uint32_t read32(uint32_t pos) const
++        {
++            uint32_t value;
++            std::memcpy(&value, data + pos, sizeof(value));
++            return value;
++        }
++        // Calls emit(span) for the bytes [begin, end), in order.
++        template <typename Emit>
++        void spans(uint32_t begin, uint32_t end, Emit &&emit) const
++        {
++            if (end > begin)
++                emit(ByteSpan{data + begin, end - begin});
++        }
++    };
++
++    // The concatenation of 'count' spans. Reads are sequential in practice: a cursor remembers the
++    // span of the last access.
++    class Segmented
++    {
++    public:
++        Segmented(const ByteSpan *spans, size_t count) : m_spans(spans), m_count(count)
++        {
++            m_starts.resize(count + 1u);
++            uint64_t total = 0;
++            for (size_t i = 0; i < count; ++i)
++            {
++                m_starts[i] = static_cast<uint32_t>(total);
++                total += spans[i].size;
++            }
++            m_size = total > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(total);
++            m_starts[count] = m_size;
++        }
++
++        uint32_t size() const { return m_size; }
++
++        const uint8_t *ptr(uint32_t pos, uint32_t length) const
++        {
++            const size_t i = locate(pos);
++            if (i < m_count && pos - m_starts[i] + length <= m_spans[i].size)
++                return m_spans[i].data + (pos - m_starts[i]);
++            // Crosses into the next span(s): a contiguous copy
++            m_scratch.resize(length);
++            copy(m_scratch.data(), pos, length);
++            return m_scratch.data();
++        }
++
++        void copy(void *dst, uint32_t pos, uint32_t length) const
++        {
++            uint8_t *out = static_cast<uint8_t *>(dst);
++            size_t i = locate(pos);
++            while (length != 0u && i < m_count)
++            {
++                const uint32_t offset = pos - m_starts[i];
++                const uint32_t take = std::min(length, m_spans[i].size - offset);
++                std::memcpy(out, m_spans[i].data + offset, take);
++                out += take;
++                pos += take;
++                length -= take;
++                ++i;
++            }
++        }
++
++        uint32_t read32(uint32_t pos) const
++        {
++            const size_t i = locate(pos);
++            if (i < m_count && pos - m_starts[i] + 4u <= m_spans[i].size)
++            {
++                uint32_t value;
++                std::memcpy(&value, m_spans[i].data + (pos - m_starts[i]), sizeof(value));
++                return value;
++            }
++            uint32_t value = 0;
++            copy(&value, pos, sizeof(value));
++            return value;
++        }
++
++        template <typename Emit>
++        void spans(uint32_t begin, uint32_t end, Emit &&emit) const
++        {
++            if (end <= begin)
++                return;
++            size_t i = locate(begin);
++            uint32_t pos = begin;
++            while (pos < end && i < m_count)
++            {
++                const uint32_t offset = pos - m_starts[i];
++                const uint32_t take = std::min(end - pos, m_spans[i].size - offset);
++                if (take != 0u)
++                    emit(ByteSpan{m_spans[i].data + offset, take});
++                pos += take;
++                ++i;
++            }
++        }
++
++    private:
++        // Index of the span holding byte pos (m_count when pos == size()).
++        size_t locate(uint32_t pos) const
++        {
++            size_t i = m_cursor;
++            if (i >= m_count || pos < m_starts[i])
++                i = 0;
++            while (i < m_count && pos >= m_starts[i + 1u])
++                ++i;
++            m_cursor = i;
++            return i;
++        }
++
++        const ByteSpan *m_spans;
++        size_t m_count;
++        uint32_t m_size = 0;
++        std::vector<uint32_t> m_starts;
++        mutable size_t m_cursor = 0;
++        mutable std::vector<uint8_t> m_scratch;
++    };
++}
 diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
 index 563bcbd..66ce2e9 100644
 --- a/ps2xRuntime/src/main.cpp
@@ -9371,10 +10585,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..aca8862
+index 0000000..4ef766c
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,1626 @@
+@@ -0,0 +1,1640 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -9638,6 +10852,12 @@ index 0000000..aca8862
 +	bool g_hd = true;     // HD texture pack (data/hd/): on unless <page>?hd=0 (start screen setting)
 +	bool g_halfRate = false; // picture at 30 fps (the game at 60): <page>?fps=30
 +	bool g_fsr = true;       // FSR 1 upscaling to the window: on unless <page>?fsr=0 (start screen setting)
++	// ?vulocals=1: VU1 context fields kept in wasm locals for whole functions. Off: measured slower in a
++	// match (VU1 worker ~50% vs ~36%: small blocks with many exits flush every written field at each)
++	bool g_vuContextLocals = false;
++	// ?vumodules=1: merge a micro memory image's VU1 blocks into one wasm instance. Off: 2.2x blocks/s in a
++	// bench but no gain in a match (VU1 ~36.5% vs ~36.8%, game thread higher)
++	bool g_vuModuleGroups = false;
 +	bool g_vuFlagAnalysis = true; // ?vuflags=0: VU1 flags maintained even when nothing reads them
 +	bool g_vuSuperblocks = true; // ?superblocks=0: one VU1 basic block per compiled function
 +	bool g_vuStats = false;  // ?vustats=1: VU1 block transition statistics (use with ?chain=0)
@@ -10711,6 +11931,12 @@ index 0000000..aca8862
 +			CVuExecutor::s_superblocks = g_vuSuperblocks;
 +			// Flags nothing in micro memory reads aren't maintained (?vuflags=0 keeps them all)
 +			CVuExecutor::s_flagAnalysis = g_vuFlagAnalysis;
++			// A micro memory image's blocks, once they stop changing, are merged into one wasm instance:
++			// chained jumps no longer cross instances (~18 ns each in Chrome, ~43 ns in Firefox)
++			CVuExecutor::s_moduleGroups = g_vuModuleGroups;
++			// VU1 context fields stay in wasm locals for a whole compiled function (CodeGen
++			// CacheContextInLocals) instead of being stored/reloaded around every block
++			Jitter::CCodeGen_Wasm::s_cacheContextInLocals = g_vuContextLocals;
 +			std::printf("[webgs] VU1 superblocks %s\n", g_vuSuperblocks ? "on" : "off");
 +			std::printf("[webgs] VU1 block chaining %s\n", (chainParam == 0) ? "off" : tailCalls ? "with tail calls" : "through the dispatcher");
 +		}
@@ -10934,6 +12160,8 @@ index 0000000..aca8862
 +		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
 +		g_hd = EM_ASM_INT({ return new URLSearchParams(location.search).get('hd') === '0' ? 0 : 1; }) != 0;
 +		g_fsr = EM_ASM_INT({ return new URLSearchParams(location.search).get('fsr') === '0' ? 0 : 1; }) != 0;
++		g_vuContextLocals = EM_ASM_INT({ return new URLSearchParams(location.search).get('vulocals') === '1' ? 1 : 0; }) != 0;
++		g_vuModuleGroups = EM_ASM_INT({ return new URLSearchParams(location.search).get('vumodules') === '1' ? 1 : 0; }) != 0;
 +		g_vuFlagAnalysis = EM_ASM_INT({ return new URLSearchParams(location.search).get('vuflags') === '0' ? 0 : 1; }) != 0;
 +		g_vuSuperblocks = EM_ASM_INT({ return new URLSearchParams(location.search).get('superblocks') === '0' ? 0 : 1; }) != 0;
 +		g_vuSlowPercent = EM_ASM_INT({ return parseInt(new URLSearchParams(location.search).get('vuslow') || '0', 10) || 0; });

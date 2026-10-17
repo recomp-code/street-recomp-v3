@@ -1,8 +1,46 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 836114a..7603490 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -137,6 +137,8 @@ set(CodeGenTest_SRC
+ 	tests/CompareTest.h
+ 	tests/CompareTest2.cpp
+ 	tests/CompareTest2.h
++	tests/ContextCacheTest.cpp
++	tests/ContextCacheTest.h
+ 	tests/Crc32Test.cpp
+ 	tests/Crc32Test.h
+ 	tests/CursorTest.cpp
+@@ -253,7 +255,7 @@ if(EMSCRIPTEN)
+ 	target_link_options(CodeGenTestSuite PRIVATE "-sEXPORT_NAME=CodeGenTestSuite")
+ 	target_link_options(CodeGenTestSuite PRIVATE "-sASSERTIONS=2")
+ 	target_link_options(CodeGenTestSuite PRIVATE "-sWASM_BIGINT")
+-	target_link_options(CodeGenTestSuite PRIVATE "-sEXPORTED_FUNCTIONS=['_main', '_CCrc32Test_GetNextByte', '_CCrc32Test_GetTableValue', '_CCall64Test_Add64', '_CCall64Test_Sub64', '_CCall64Test_AddMul64', '_CCall64Test_AddMul64_2', '_RegAllocTempTest_DummyFunction']")
++	target_link_options(CodeGenTestSuite PRIVATE "-sEXPORTED_FUNCTIONS=['_main', '_CCrc32Test_GetNextByte', '_CCrc32Test_GetTableValue', '_CCall64Test_Add64', '_CCall64Test_Sub64', '_CCall64Test_AddMul64', '_CCall64Test_AddMul64_2', '_RegAllocTempTest_DummyFunction', '_ContextCacheTest_Callee']")
+ 	target_link_options(CodeGenTestSuite PRIVATE "-sALLOW_TABLE_GROWTH")
+ 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
+ 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread")
 diff --git a/include/Jitter_CodeGen_Wasm.h b/include/Jitter_CodeGen_Wasm.h
-index e2f1fbe..cc430a9 100644
+index e2f1fbe..37542c8 100644
 --- a/include/Jitter_CodeGen_Wasm.h
 +++ b/include/Jitter_CodeGen_Wasm.h
-@@ -24,11 +24,29 @@ namespace Jitter
+@@ -1,6 +1,8 @@
+ #pragma once
+ 
+ #include <stack>
++#include <string>
++#include <vector>
+ #include "Jitter_CodeGen.h"
+ #include "MemStream.h"
+ 
+@@ -19,16 +21,36 @@ namespace Jitter
+ 
+ 		static void RegisterFunction(uintptr_t, const char*, const char*);
+ 		static const WASM_FUNCTION_INFO* FindFunction(uintptr_t);
++		//Signatures of every registered function, sorted, without duplicates
++		static std::vector<std::string> GetSignatures();
+ 
+ 	private:
  		static std::map<uintptr_t, WASM_FUNCTION_INFO> m_functions;
  	};
  
@@ -32,15 +70,22 @@ index e2f1fbe..cc430a9 100644
  		void GenerateCode(const StatementList&, unsigned int) override;
  		void SetStream(Framework::CStream*) override;
  		void RegisterExternalSymbols(CObjectFile*) const override;
-@@ -75,6 +93,7 @@ namespace Jitter
+@@ -75,6 +97,14 @@ namespace Jitter
  		void PrepareSignatures(CWasmModuleBuilder&, const StatementList&);
  		void RegisterSignature(CWasmModuleBuilder&, std::string);
  		void PrepareLocalVars(const StatementList&);
 +		StatementList MapRegistersToLocals(const StatementList&);
++		StatementList CacheContextInLocals(const StatementList&);
++
++	public:
++		//Context fields stay in wasm locals for the whole function (see CacheContextInLocals)
++		static bool s_cacheContextInLocals;
++
++	private:
  
  		uint32 GetTemporaryLocation(CSymbol*) const;
  
-@@ -119,6 +138,7 @@ namespace Jitter
+@@ -119,6 +149,7 @@ namespace Jitter
  		void Emit_Break(const STATEMENT&);
  
  		void Emit_Mov_VarAny(const STATEMENT&);
@@ -48,7 +93,7 @@ index e2f1fbe..cc430a9 100644
  
  		void Emit_RelToRef_VarCst(const STATEMENT&);
  
-@@ -153,6 +173,8 @@ namespace Jitter
+@@ -153,6 +184,8 @@ namespace Jitter
  		void Emit_RetVal_Tmp(const STATEMENT&);
  
  		void Emit_ExternJmp(const STATEMENT&);
@@ -57,7 +102,7 @@ index e2f1fbe..cc430a9 100644
  
  		void Emit_Jmp(const STATEMENT&);
  		void Emit_CondJmp_AnyAny(const STATEMENT&);
-@@ -197,6 +219,7 @@ namespace Jitter
+@@ -197,6 +230,7 @@ namespace Jitter
  		void Emit_Fp_Clamp_MemMem(const STATEMENT&);
  		void Emit_Fp_ToSingleI32_MemMem(const STATEMENT&);
  		void Emit_Fp_ToInt32TruncS_MemMem(const STATEMENT&);
@@ -65,7 +110,7 @@ index e2f1fbe..cc430a9 100644
  		void Emit_Fp_LdCst_TmpCst(const STATEMENT&);
  		void Emit_Fp_SetRoundingMode_Cst(const STATEMENT&);
  
-@@ -238,6 +261,8 @@ namespace Jitter
+@@ -238,6 +272,8 @@ namespace Jitter
  		std::map<uint32, LABEL_FLOW> m_labelFlows;
  		std::map<std::string, uint32> m_signatures;
  		std::map<TemporaryInstance, uint32> m_temporaryLocations;
@@ -75,10 +120,18 @@ index e2f1fbe..cc430a9 100644
  		uint32 m_localI64Count = 0;
  		uint32 m_localF32Count = 0;
 diff --git a/include/MemoryFunction.h b/include/MemoryFunction.h
-index fca4a0f..354fa97 100644
+index fca4a0f..42540db 100644
 --- a/include/MemoryFunction.h
 +++ b/include/MemoryFunction.h
-@@ -24,6 +24,10 @@ public:
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include "Types.h"
++#include <vector>
+ 
+ #if defined(__EMSCRIPTEN__)
+ #include <emscripten/bind.h>
+@@ -24,6 +25,10 @@ public:
  	void operator()(void*);
  
  	void* GetCode() const;
@@ -89,6 +142,27 @@ index fca4a0f..354fa97 100644
  	size_t GetSize() const;
  
  	void BeginModify();
+@@ -31,6 +36,13 @@ public:
+ 
+ 	CMemoryFunction CreateInstance();
+ 
++#ifdef __EMSCRIPTEN__
++	//One instance of a module made by CWasmModuleBuilder::MergeModules: function i is its export
++	//"f<i>". Functions of one group call each other (block chaining) without changing instance,
++	//which costs browsers far less than calls into other modules' instances.
++	static std::vector<CMemoryFunction> CreateGroup(const void* code, size_t size, uint32 count);
++#endif
++
+ private:
+ 	void ClearCache();
+ 	void Reset();
+@@ -39,5 +51,6 @@ private:
+ 	size_t m_size;
+ #if defined(__EMSCRIPTEN__)
+ 	emscripten::val m_wasmModule;
++	int32 m_exportIndex = -1; //Export "f<index>" of a merged module, -1: the single "codeGenFunc"
+ #endif
+ };
 diff --git a/include/WasmDefs.h b/include/WasmDefs.h
 index 0036a51..1268726 100644
 --- a/include/WasmDefs.h
@@ -110,8 +184,24 @@ index 0036a51..1268726 100644
  		INST_I32x4_TRUNC_SAT_F32x4_S = 0xF8,
  		INST_F32x4_CONVERT_I32x4_S = 0xFA
  	};
+diff --git a/include/WasmModuleBuilder.h b/include/WasmModuleBuilder.h
+index 72a0582..eb7cc03 100644
+--- a/include/WasmModuleBuilder.h
++++ b/include/WasmModuleBuilder.h
+@@ -33,6 +33,11 @@ public:
+ 
+ 	void WriteModule(Framework::CStream&);
+ 
++	//Puts the functions of several modules written by WriteModule (one function each, same type and
++	//import sections) in one module, exported as "f0", "f1", ...: calls between them then stay in one
++	//instance. False (and `merged` untouched) when the modules don't fit together.
++	static bool MergeModules(const std::vector<const std::vector<uint8>*>& modules, std::vector<uint8>& merged);
++
+ private:
+ 	void WriteSectionHeader(Framework::CStream&, uint8, uint32);
+ 
 diff --git a/src/Jitter_CodeGen_Wasm.cpp b/src/Jitter_CodeGen_Wasm.cpp
-index 3f86e4a..03ba388 100644
+index 3f86e4a..828edca 100644
 --- a/src/Jitter_CodeGen_Wasm.cpp
 +++ b/src/Jitter_CodeGen_Wasm.cpp
 @@ -93,6 +93,7 @@ CCodeGen_Wasm::CONSTMATCHER CCodeGen_Wasm::g_constMatchers[] =
@@ -130,7 +220,34 @@ index 3f86e4a..03ba388 100644
  
  	{ OP_JMP,            MATCH_NIL,            MATCH_NIL,            MATCH_NIL,           MATCH_NIL,      &CCodeGen_Wasm::Emit_Jmp                                    },
  
-@@ -254,7 +256,7 @@ CCodeGen_Wasm::CCodeGen_Wasm()
+@@ -217,6 +219,14 @@ const CWasmFunctionRegistry::WASM_FUNCTION_INFO* CWasmFunctionRegistry::FindFunc
+ 	return &fctIterator->second;
+ }
+ 
++std::vector<std::string> CWasmFunctionRegistry::GetSignatures()
++{
++	std::set<std::string> signatures;
++	for(const auto& [ptr, info] : m_functions)
++		signatures.insert(info.signature);
++	return std::vector<std::string>(signatures.begin(), signatures.end());
++}
++
+ #else
+ 
+ void CWasmFunctionRegistry::RegisterFunction(uintptr_t functionPtr, const char* functionName, const char* functionSig)
+@@ -229,6 +239,11 @@ const CWasmFunctionRegistry::WASM_FUNCTION_INFO* CWasmFunctionRegistry::FindFunc
+ 	return &fctInfo;
+ }
+ 
++std::vector<std::string> CWasmFunctionRegistry::GetSignatures()
++{
++	return {};
++}
++
+ #endif
+ 
+ CCodeGen_Wasm::CCodeGen_Wasm()
+@@ -254,7 +269,7 @@ CCodeGen_Wasm::CCodeGen_Wasm()
  	copyMatchers(g_mdConstMatchers);
  }
  
@@ -139,17 +256,17 @@ index 3f86e4a..03ba388 100644
  {
  	CWasmModuleBuilder moduleBuilder;
  
-@@ -273,6 +275,9 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
+@@ -273,6 +288,9 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
  	m_currentBlockDepth = 0;
  	m_loopBlock = -1;
  
-+	const auto localStatements = MapRegistersToLocals(statementsIn);
++	const auto localStatements = CacheContextInLocals(MapRegistersToLocals(statementsIn));
 +	const auto& statements = localStatements;
 +
  	BuildLabelFlows(statements);
  	PrepareSignatures(moduleBuilder, statements);
  	PrepareLocalVars(statements);
-@@ -322,6 +327,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
+@@ -322,6 +340,7 @@ void CCodeGen_Wasm::GenerateCode(const StatementList& statements, unsigned int s
  
  	moduleBuilder.AddFunction(std::move(function));
  	moduleBuilder.WriteModule(*m_stream);
@@ -157,7 +274,7 @@ index 3f86e4a..03ba388 100644
  
  	assert(m_params.empty());
  }
-@@ -335,14 +341,16 @@ void CCodeGen_Wasm::RegisterExternalSymbols(CObjectFile*) const
+@@ -335,14 +354,16 @@ void CCodeGen_Wasm::RegisterExternalSymbols(CObjectFile*) const
  {
  }
  
@@ -176,7 +293,22 @@ index 3f86e4a..03ba388 100644
  }
  
  bool CCodeGen_Wasm::Has128BitsCallOperands() const
-@@ -587,6 +595,51 @@ void CCodeGen_Wasm::RegisterSignature(CWasmModuleBuilder& moduleBuilder, std::st
+@@ -527,6 +548,14 @@ void CCodeGen_Wasm::PrepareSignatures(CWasmModuleBuilder& moduleBuilder, const S
+ 	//Register this function's signature
+ 	RegisterSignature(moduleBuilder, "vi");
+ 
++	//Then every registered function's, in a fixed order: all modules get the same type section, so
++	//their function bodies can be put together in one module (CWasmModuleBuilder::MergeModules)
++	for(const auto& signature : CWasmFunctionRegistry::GetSignatures())
++	{
++		if(m_signatures.find(signature) != std::end(m_signatures)) continue;
++		RegisterSignature(moduleBuilder, signature);
++	}
++
+ 	for(const auto& statement : statements)
+ 	{
+ 		if(statement.op != OP_CALL) continue;
+@@ -587,6 +616,319 @@ void CCodeGen_Wasm::RegisterSignature(CWasmModuleBuilder& moduleBuilder, std::st
  	m_signatures.insert(std::make_pair(signature, static_cast<uint32>(m_signatures.size())));
  }
  
@@ -225,10 +357,278 @@ index 3f86e4a..03ba388 100644
 +	return result;
 +}
 +
++bool CCodeGen_Wasm::s_cacheContextInLocals = true;
++
++//The register allocator works per basic block: every context field a block uses is loaded from
++//the context at the block's start and stored back at its end (and around calls). In wasm, locals
++//are function-wide and structured control flow keeps them intact, so here each context field
++//(relative symbol) that doesn't overlap another one gets its own local for the whole function:
++//loaded once at the entry, stored back before the function can be left (calls, external jumps,
++//its end) or the context can be accessed some other way (through a reference that may point into
++//it), and reloaded after anything that may have changed the context (calls, such stores). The
++//register allocator's per-block loads and stores become local-to-local copies.
++//Invariant: at any point, a cached local holds the field's current value (written back to the
++//context at the sync points above), on every path.
++StatementList CCodeGen_Wasm::CacheContextInLocals(const StatementList& statements)
++{
++	if(!s_cacheContextInLocals) return statements;
++
++	static constexpr uint32 CACHE_LOCATION_BASE = 0x50000000;
++
++	struct CACHED
++	{
++		SymbolPtr relative;
++		SymbolPtr local;
++		uint32 begin = 0;
++		uint32 end = 0;
++		bool written = false;
++		bool excluded = false;
++	};
++
++	auto getCacheInfo =
++	    [](SYM_TYPE type, SYM_TYPE& localType, uint32& size) {
++		    switch(type)
++		    {
++		    case SYM_RELATIVE:
++			    localType = SYM_TEMPORARY;
++			    size = 4;
++			    return true;
++		    case SYM_REL_REFERENCE:
++			    localType = SYM_TMP_REFERENCE;
++			    size = 4;
++			    return true;
++		    case SYM_FP_RELATIVE32:
++			    localType = SYM_FP_TEMPORARY32;
++			    size = 4;
++			    return true;
++		    case SYM_RELATIVE64:
++			    localType = SYM_TEMPORARY64;
++			    size = 8;
++			    return true;
++		    case SYM_RELATIVE128:
++			    localType = SYM_TEMPORARY128;
++			    size = 16;
++			    return true;
++		    default:
++			    return false;
++		    }
++	    };
++
++	//Gather the context fields the function uses
++	std::map<std::pair<SYM_TYPE, uint32>, CACHED> cached;
++	for(const auto& statement : statements)
++	{
++		statement.VisitOperands(
++		    [&](const SymbolRefPtr& symbolRef, bool isDef) {
++			    auto symbol = symbolRef->GetSymbol();
++			    SYM_TYPE localType = SYM_CONSTANT;
++			    uint32 size = 0;
++			    if(!getCacheInfo(symbol->m_type, localType, size)) return;
++			    auto& entry = cached[std::make_pair(symbol->m_type, symbol->m_valueLow)];
++			    if(!entry.relative)
++			    {
++				    entry.relative = symbol;
++				    entry.begin = symbol->m_valueLow;
++				    entry.end = symbol->m_valueLow + size;
++			    }
++			    entry.written |= isDef;
++		    });
++	}
++	if(cached.empty()) return statements;
++
++	//Fields seen through overlapping symbols (e.g. a vector and one of its elements) stay in memory
++	for(auto it1 = cached.begin(); it1 != cached.end(); it1++)
++	{
++		for(auto it2 = std::next(it1); it2 != cached.end(); it2++)
++		{
++			if((it1->second.begin < it2->second.end) && (it2->second.begin < it1->second.end))
++			{
++				it1->second.excluded = true;
++				it2->second.excluded = true;
++			}
++		}
++	}
++
++	uint32 nextLocation = CACHE_LOCATION_BASE;
++	for(auto& [key, entry] : cached)
++	{
++		if(entry.excluded) continue;
++		SYM_TYPE localType = SYM_CONSTANT;
++		uint32 size = 0;
++		getCacheInfo(entry.relative->m_type, localType, size);
++		entry.local = std::make_shared<CSymbol>(localType, nextLocation, 0);
++		entry.local->m_stackLocation = nextLocation;
++		m_registerLocals.push_back(entry.local);
++		nextLocation++;
++	}
++
++	auto makeMove =
++	    [](const SymbolPtr& dst, const SymbolPtr& src) {
++		    STATEMENT move;
++		    move.op = OP_MOV;
++		    move.dst = std::make_shared<CSymbolRef>(dst);
++		    move.src1 = std::make_shared<CSymbolRef>(src);
++		    return move;
++	    };
++
++	StatementList result;
++
++	//Writes back the cached fields that end past 'lowerBound' (only the ones the function writes)
++	auto flush =
++	    [&](uint32 lowerBound) {
++		    for(const auto& [key, entry] : cached)
++		    {
++			    if(!entry.local || !entry.written || (entry.end <= lowerBound)) continue;
++			    result.push_back(makeMove(entry.relative, entry.local));
++		    }
++	    };
++	//Reloads the cached fields that end past 'lowerBound'
++	auto reload =
++	    [&](uint32 lowerBound) {
++		    for(const auto& [key, entry] : cached)
++		    {
++			    if(!entry.local || (entry.end <= lowerBound)) continue;
++			    result.push_back(makeMove(entry.local, entry.relative));
++		    }
++	    };
++
++	//Where references point: into the context (from OP_RELTOREF: from that offset upwards, as array
++	//indexing goes) or somewhere else (pointers kept in the context, loaded pointers).
++	struct ORIGIN
++	{
++		bool external = false;
++		uint32 lowerBound = 0;
++	};
++	static const ORIGIN unknownOrigin = {false, 0};
++	std::map<std::pair<SYM_TYPE, uint32>, ORIGIN> origins;
++	auto refKey =
++	    [](const SymbolPtr& symbol) {
++		    uint32 id = symbol->IsTemporary() ? symbol->m_stackLocation : symbol->m_valueLow;
++		    return std::make_pair(symbol->m_type, id);
++	    };
++	auto originOf =
++	    [&](const SymbolPtr& symbol) -> ORIGIN {
++		    auto it = origins.find(refKey(symbol));
++		    if(it != origins.end()) return it->second;
++		    //A pointer stored in the context, never written here from a context address
++		    if(symbol->m_type == SYM_REL_REFERENCE) return {true, 0};
++		    return unknownOrigin;
++	    };
++
++	//Entry: every cached field in its local
++	reload(0);
++
++	for(const auto& original : statements)
++	{
++		bool refLoad = false;
++		bool refStore = false;
++		switch(original.op)
++		{
++		case OP_LOADFROMREF:
++		case OP_LOAD8FROMREF:
++		case OP_LOAD16FROMREF:
++		case OP_MD_LOADFROMREF_MASKED:
++			refLoad = true;
++			break;
++		case OP_STOREATREF:
++		case OP_STORE8ATREF:
++		case OP_STORE16ATREF:
++		case OP_MD_STOREATREF_MASKED:
++			refStore = true;
++			break;
++		default:
++			break;
++		}
++
++		ORIGIN accessOrigin = {true, 0};
++		if(refLoad || refStore)
++		{
++			accessOrigin = originOf(original.src1->GetSymbol());
++		}
++		bool contextAccess = (refLoad || refStore) && !accessOrigin.external;
++
++		bool isCall = (original.op == OP_CALL);
++		bool isExit = (original.op == OP_EXTERNJMP) || (original.op == OP_EXTERNJMP_DYN);
++
++		if(isCall || isExit)
++		{
++			flush(0);
++		}
++		else if(contextAccess)
++		{
++			flush(accessOrigin.lowerBound);
++		}
++
++		//Track reference origins (on the original symbols)
++		if(original.dst)
++		{
++			auto dst = original.dst->GetSymbol();
++			bool dstIsRef = (dst->m_type == SYM_TMP_REFERENCE) || (dst->m_type == SYM_REG_REFERENCE) || (dst->m_type == SYM_REL_REFERENCE);
++			if(dstIsRef)
++			{
++				ORIGIN origin = unknownOrigin;
++				switch(original.op)
++				{
++				case OP_RELTOREF:
++				{
++					auto src1 = original.src1->GetSymbol();
++					origin = {false, (src1->m_type == SYM_CONSTANT) ? src1->m_valueLow : 0};
++				}
++				break;
++				case OP_ADDREF:
++				case OP_MOV:
++					origin = originOf(original.src1->GetSymbol());
++					break;
++				case OP_LOADFROMREF:
++					origin = {true, 0};
++					break;
++				default:
++					break;
++				}
++				if(dst->m_type == SYM_REL_REFERENCE)
++				{
++					//A pointer stored into the context: only keep "external" if it is one
++					if(!origin.external) origins[refKey(dst)] = unknownOrigin;
++				}
++				else
++				{
++					origins[refKey(dst)] = origin;
++				}
++			}
++		}
++
++		//The statement, with its cached fields replaced by their locals
++		STATEMENT statement = original;
++		statement.VisitOperands(
++		    [&](SymbolRefPtr& symbolRef, bool) {
++			    auto symbol = symbolRef->GetSymbol();
++			    auto it = cached.find(std::make_pair(symbol->m_type, symbol->m_valueLow));
++			    if(it == cached.end() || !it->second.local) return;
++			    if(!symbol->Equals(it->second.relative.get())) return;
++			    symbolRef = std::make_shared<CSymbolRef>(it->second.local);
++		    });
++		result.push_back(statement);
++
++		if(isCall)
++		{
++			reload(0);
++		}
++		else if(contextAccess && refStore)
++		{
++			reload(accessOrigin.lowerBound);
++		}
++	}
++
++	//Leaving the function: the context gets the final values
++	flush(0);
++
++	return result;
++}
++
  void CCodeGen_Wasm::PrepareLocalVars(const StatementList& statements)
  {
  	for(const auto& statement : statements)
-@@ -678,12 +731,9 @@ void CCodeGen_Wasm::PushRelativeAddress(CSymbol* symbol)
+@@ -678,12 +1020,9 @@ void CCodeGen_Wasm::PushRelativeAddress(CSymbol* symbol)
  	    (symbol->m_type == SYM_FP_RELATIVE32) ||
  	    (symbol->m_type == SYM_RELATIVE128));
  
@@ -243,7 +643,7 @@ index 3f86e4a..03ba388 100644
  }
  
  void CCodeGen_Wasm::PushRelative(CSymbol* symbol)
-@@ -692,7 +742,7 @@ void CCodeGen_Wasm::PushRelative(CSymbol* symbol)
+@@ -692,7 +1031,7 @@ void CCodeGen_Wasm::PushRelative(CSymbol* symbol)
  
  	m_functionStream.Write8(Wasm::INST_I32_LOAD);
  	m_functionStream.Write8(0x02);
@@ -252,7 +652,7 @@ index 3f86e4a..03ba388 100644
  }
  
  void CCodeGen_Wasm::PushTemporary(CSymbol* symbol)
-@@ -717,12 +767,7 @@ void CCodeGen_Wasm::PushRelativeRefAddress(CSymbol* symbol)
+@@ -717,12 +1056,7 @@ void CCodeGen_Wasm::PushRelativeRefAddress(CSymbol* symbol)
  {
  	assert(symbol->m_type == SYM_REL_REFERENCE);
  
@@ -266,7 +666,7 @@ index 3f86e4a..03ba388 100644
  }
  
  void CCodeGen_Wasm::PushRelativeRef(CSymbol* symbol)
-@@ -731,7 +776,7 @@ void CCodeGen_Wasm::PushRelativeRef(CSymbol* symbol)
+@@ -731,7 +1065,7 @@ void CCodeGen_Wasm::PushRelativeRef(CSymbol* symbol)
  
  	m_functionStream.Write8(Wasm::INST_I32_LOAD);
  	m_functionStream.Write8(0x02);
@@ -275,7 +675,7 @@ index 3f86e4a..03ba388 100644
  }
  
  void CCodeGen_Wasm::PushTemporaryRef(CSymbol* symbol)
-@@ -806,6 +851,9 @@ void CCodeGen_Wasm::PrepareSymbolDef(CSymbol* symbol)
+@@ -806,6 +1140,9 @@ void CCodeGen_Wasm::PrepareSymbolDef(CSymbol* symbol)
  {
  	switch(symbol->m_type)
  	{
@@ -285,7 +685,7 @@ index 3f86e4a..03ba388 100644
  	case SYM_RELATIVE:
  	case SYM_RELATIVE64:
  	case SYM_RELATIVE128:
-@@ -828,10 +876,11 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
+@@ -828,10 +1165,11 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
  {
  	switch(symbol->m_type)
  	{
@@ -298,7 +698,7 @@ index 3f86e4a..03ba388 100644
  		break;
  	case SYM_TEMPORARY:
  		PullTemporary(symbol);
-@@ -842,7 +891,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
+@@ -842,7 +1180,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
  	case SYM_RELATIVE64:
  		m_functionStream.Write8(Wasm::INST_I64_STORE);
  		m_functionStream.Write8(0x03);
@@ -307,7 +707,7 @@ index 3f86e4a..03ba388 100644
  		break;
  	case SYM_TEMPORARY64:
  		PullTemporary64(symbol);
-@@ -850,7 +899,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
+@@ -850,7 +1188,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
  	case SYM_FP_RELATIVE32:
  		m_functionStream.Write8(Wasm::INST_F32_STORE);
  		m_functionStream.Write8(0x02);
@@ -316,7 +716,7 @@ index 3f86e4a..03ba388 100644
  		break;
  	case SYM_FP_TEMPORARY32:
  		PullTemporaryFp32(symbol);
-@@ -859,7 +908,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
+@@ -859,7 +1197,7 @@ void CCodeGen_Wasm::CommitSymbol(CSymbol* symbol)
  		m_functionStream.Write8(Wasm::INST_PREFIX_SIMD);
  		m_functionStream.Write8(Wasm::INST_V128_STORE);
  		m_functionStream.Write8(0x04);
@@ -325,7 +725,7 @@ index 3f86e4a..03ba388 100644
  		break;
  	case SYM_TEMPORARY128:
  		PullTemporary128(symbol);
-@@ -1156,6 +1205,95 @@ void CCodeGen_Wasm::Emit_ExternJmp(const STATEMENT& statement)
+@@ -1156,6 +1494,95 @@ void CCodeGen_Wasm::Emit_ExternJmp(const STATEMENT& statement)
  	m_functionStream.Write8(0x00);   //Table index
  }
  
@@ -421,7 +821,7 @@ index 3f86e4a..03ba388 100644
  void CCodeGen_Wasm::Emit_Jmp(const STATEMENT& statement)
  {
  	auto labelFlowIterator = m_labelFlows.find(statement.jmpBlock);
-@@ -1393,3 +1531,13 @@ void CCodeGen_Wasm::Emit_ExtHigh64VarMem64(const STATEMENT& statement)
+@@ -1393,3 +1820,13 @@ void CCodeGen_Wasm::Emit_ExtHigh64VarMem64(const STATEMENT& statement)
  
  	CommitSymbol(dst);
  }
@@ -563,14 +963,65 @@ index cd87a1b..56e724b 100644
  
  void CCodeGen_Wasm::PushTemporary128(CSymbol* symbol)
 diff --git a/src/MemoryFunction.cpp b/src/MemoryFunction.cpp
-index 73a3dab..d820143 100644
+index 73a3dab..b744095 100644
 --- a/src/MemoryFunction.cpp
 +++ b/src/MemoryFunction.cpp
-@@ -56,12 +56,31 @@ EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
+@@ -3,6 +3,7 @@
+ #include <assert.h>
+ #include <algorithm>
+ #include <cstdint>
++#include <utility>
+ #include "AlignedAlloc.h"
+ #include "MemoryFunction.h"
+ 
+@@ -56,12 +57,74 @@ EM_JS(int, WasmCreateFunction, (emscripten::EM_VAL moduleHandle),
  	});
  	let fct = moduleInstance.exports.codeGenFunc;
  	let fctId = addFunction(fct, 'vi');
 +	//Also in the table generated code calls through (block chaining tail-calls into it)
++	let table = Module.codeGenImportTable;
++	if(!Module.codeGenChainFree) Module.codeGenChainFree = [];
++	if(!Module.codeGenChainIds) Module.codeGenChainIds = new Map();
++	let chainId = Module.codeGenChainFree.length ? Module.codeGenChainFree.pop() : table.grow(1);
++	table.set(chainId, fct);
++	Module.codeGenChainIds.set(fctId, chainId);
++	return fctId;
++});
++//Instantiates a merged module once; ids[i] gets the function id of its export "f<i>"
++EM_JS(void, WasmCreateGroupFunctions, (emscripten::EM_VAL moduleHandle, int count, int* ids),
++{
++	let module = Emval.toValue(moduleHandle);
++	let moduleInstance = new WebAssembly.Instance(module, {
++		env: {
++			memory: wasmMemory,
++			fctTable : Module.codeGenImportTable
++		}
++	});
++	let table = Module.codeGenImportTable;
++	if(!Module.codeGenChainFree) Module.codeGenChainFree = [];
++	if(!Module.codeGenChainIds) Module.codeGenChainIds = new Map();
++	for(let i = 0; i < count; i++)
++	{
++		let fct = moduleInstance.exports['f' + i];
++		let fctId = addFunction(fct, 'vi');
++		let chainId = Module.codeGenChainFree.length ? Module.codeGenChainFree.pop() : table.grow(1);
++		table.set(chainId, fct);
++		Module.codeGenChainIds.set(fctId, chainId);
++		HEAP32[(ids >> 2) + i] = fctId;
++	}
++});
++//A new instance of a merged module, for its export "f<index>" alone
++EM_JS(int, WasmCreateExportFunction, (emscripten::EM_VAL moduleHandle, int index),
++{
++	let module = Emval.toValue(moduleHandle);
++	let moduleInstance = new WebAssembly.Instance(module, {
++		env: {
++			memory: wasmMemory,
++			fctTable : Module.codeGenImportTable
++		}
++	});
++	let fct = moduleInstance.exports['f' + index];
++	let fctId = addFunction(fct, 'vi');
 +	let table = Module.codeGenImportTable;
 +	if(!Module.codeGenChainFree) Module.codeGenChainFree = [];
 +	if(!Module.codeGenChainIds) Module.codeGenChainIds = new Map();
@@ -598,7 +1049,37 @@ index 73a3dab..d820143 100644
  EM_JS(emscripten::EM_VAL, WasmCreateModule, (uintptr_t code, uintptr_t size),
  {
  	//var fs = require('fs');
-@@ -199,6 +218,13 @@ void CMemoryFunction::operator()(void* context)
+@@ -139,6 +202,13 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
+ #endif
+ }
+ 
++CMemoryFunction::CMemoryFunction(CMemoryFunction&& rhs)
++: m_code(nullptr)
++, m_size(0)
++{
++	*this = std::move(rhs);
++}
++
+ CMemoryFunction::~CMemoryFunction()
+ {
+ 	Reset();
+@@ -173,6 +243,7 @@ void CMemoryFunction::Reset()
+ 	m_size = 0;
+ #if defined(MEMFUNC_USE_WASM)
+ 	m_wasmModule = emscripten::val();
++	m_exportIndex = -1;
+ #endif
+ }
+ 
+@@ -188,6 +259,7 @@ CMemoryFunction& CMemoryFunction::operator =(CMemoryFunction&& rhs)
+ 	std::swap(m_size, rhs.m_size);
+ #if defined(MEMFUNC_USE_WASM)
+ 	std::swap(m_wasmModule, rhs.m_wasmModule);
++	std::swap(m_exportIndex, rhs.m_exportIndex);
+ #endif
+ 	return (*this);
+ }
+@@ -199,6 +271,13 @@ void CMemoryFunction::operator()(void* context)
  	fct(context);
  }
  
@@ -612,3 +1093,228 @@ index 73a3dab..d820143 100644
  void* CMemoryFunction::GetCode() const
  {
  	return m_code;
+@@ -236,9 +315,32 @@ CMemoryFunction CMemoryFunction::CreateInstance()
+ 	CMemoryFunction result;
+ 	result.m_wasmModule = m_wasmModule;
+ 	result.m_size = m_size;
+-	result.m_code = reinterpret_cast<void*>(WasmCreateFunction(m_wasmModule.as_handle()));
++	result.m_exportIndex = m_exportIndex;
++	if(m_exportIndex < 0)
++		result.m_code = reinterpret_cast<void*>(WasmCreateFunction(m_wasmModule.as_handle()));
++	else
++		result.m_code = reinterpret_cast<void*>(WasmCreateExportFunction(m_wasmModule.as_handle(), m_exportIndex));
+ 	return result;
+ #else
+ 	return CMemoryFunction(GetCode(), GetSize());
+ #endif
+ }
++
++#if defined(MEMFUNC_USE_WASM)
++std::vector<CMemoryFunction> CMemoryFunction::CreateGroup(const void* code, size_t size, uint32 count)
++{
++	auto module = emscripten::val::take_ownership(WasmCreateModule(reinterpret_cast<uintptr_t>(code), size));
++	std::vector<int> ids(count);
++	WasmCreateGroupFunctions(module.as_handle(), static_cast<int>(count), ids.data());
++	std::vector<CMemoryFunction> result(count);
++	for(uint32 i = 0; i < count; i++)
++	{
++		auto& function = result[i];
++		function.m_wasmModule = module;
++		function.m_size = size / count;
++		function.m_exportIndex = static_cast<int32>(i);
++		function.m_code = reinterpret_cast<void*>(static_cast<uintptr_t>(ids[i]));
++	}
++	return result;
++}
++#endif
+diff --git a/src/WasmModuleBuilder.cpp b/src/WasmModuleBuilder.cpp
+index 9f4ad6f..cfc5849 100644
+--- a/src/WasmModuleBuilder.cpp
++++ b/src/WasmModuleBuilder.cpp
+@@ -1,6 +1,7 @@
+ #include "WasmModuleBuilder.h"
+ #include <cassert>
+ #include <cstring>
++#include <string>
+ #include "WasmDefs.h"
+ 
+ static void WriteName(Framework::CStream& stream, const char* str)
+@@ -219,6 +220,148 @@ void CWasmModuleBuilder::WriteModule(Framework::CStream& stream)
+ 	}
+ }
+ 
++namespace
++{
++	bool ReadULeb128(const std::vector<uint8>& data, size_t& pos, uint32& value)
++	{
++		value = 0;
++		for(uint32 shift = 0; shift < 35; shift += 7)
++		{
++			if(pos >= data.size()) return false;
++			uint8 byte = data[pos++];
++			value |= static_cast<uint32>(byte & 0x7F) << shift;
++			if((byte & 0x80) == 0) return true;
++		}
++		return false;
++	}
++
++	struct MODULE_PARTS
++	{
++		std::vector<uint8> typeSection;   //section content (without id and size)
++		std::vector<uint8> importSection;
++		std::vector<uint8> body;          //the function body (locals + code), without its size
++	};
++
++	bool SplitModule(const std::vector<uint8>& data, MODULE_PARTS& parts)
++	{
++		if(data.size() < 8) return false;
++		uint32 magic = 0, version = 0;
++		memcpy(&magic, data.data(), 4);
++		memcpy(&version, data.data() + 4, 4);
++		if((magic != Wasm::BINARY_MAGIC) || (version != Wasm::BINARY_VERSION)) return false;
++		size_t pos = 8;
++		bool hasCode = false;
++		while(pos < data.size())
++		{
++			uint8 id = data[pos++];
++			uint32 size = 0;
++			if(!ReadULeb128(data, pos, size) || (pos + size > data.size())) return false;
++			const auto begin = data.begin() + pos;
++			switch(id)
++			{
++			case Wasm::SECTION_ID_TYPE:
++				parts.typeSection.assign(begin, begin + size);
++				break;
++			case Wasm::SECTION_ID_IMPORT:
++				parts.importSection.assign(begin, begin + size);
++				break;
++			case Wasm::SECTION_ID_FUNCTION:
++				//One function of type 0
++				if((size != 2) || (data[pos] != 1) || (data[pos + 1] != 0)) return false;
++				break;
++			case Wasm::SECTION_ID_EXPORT:
++				break;
++			case Wasm::SECTION_ID_CODE:
++			{
++				size_t codePos = pos;
++				uint32 count = 0, bodySize = 0;
++				if(!ReadULeb128(data, codePos, count) || (count != 1)) return false;
++				if(!ReadULeb128(data, codePos, bodySize) || (codePos + bodySize != pos + size)) return false;
++				parts.body.assign(data.begin() + codePos, data.begin() + codePos + bodySize);
++				hasCode = true;
++			}
++			break;
++			default:
++				return false;
++			}
++			pos += size;
++		}
++		return hasCode && !parts.typeSection.empty() && !parts.importSection.empty();
++	}
++
++	void WriteULeb128Vector(std::vector<uint8>& out, uint32 value)
++	{
++		do
++		{
++			uint8 byte = value & 0x7F;
++			value >>= 7;
++			if(value != 0) byte |= 0x80;
++			out.push_back(byte);
++		} while(value != 0);
++	}
++
++	void WriteSection(std::vector<uint8>& out, uint8 id, const std::vector<uint8>& content)
++	{
++		out.push_back(id);
++		WriteULeb128Vector(out, static_cast<uint32>(content.size()));
++		out.insert(out.end(), content.begin(), content.end());
++	}
++}
++
++bool CWasmModuleBuilder::MergeModules(const std::vector<const std::vector<uint8>*>& modules, std::vector<uint8>& merged)
++{
++	if(modules.empty()) return false;
++	std::vector<MODULE_PARTS> parts(modules.size());
++	for(size_t i = 0; i < modules.size(); i++)
++	{
++		if(!SplitModule(*modules[i], parts[i])) return false;
++		if(i != 0)
++		{
++			if(parts[i].typeSection != parts[0].typeSection) return false;
++			if(parts[i].importSection != parts[0].importSection) return false;
++		}
++	}
++	uint32 count = static_cast<uint32>(modules.size());
++
++	std::vector<uint8> out;
++	uint32 header[2] = {Wasm::BINARY_MAGIC, Wasm::BINARY_VERSION};
++	out.insert(out.end(), reinterpret_cast<const uint8*>(header), reinterpret_cast<const uint8*>(header) + sizeof(header));
++	WriteSection(out, Wasm::SECTION_ID_TYPE, parts[0].typeSection);
++	WriteSection(out, Wasm::SECTION_ID_IMPORT, parts[0].importSection);
++	{
++		std::vector<uint8> functions;
++		WriteULeb128Vector(functions, count);
++		for(uint32 i = 0; i < count; i++)
++			functions.push_back(0); //Type 0 ("vi")
++		WriteSection(out, Wasm::SECTION_ID_FUNCTION, functions);
++	}
++	{
++		std::vector<uint8> exports;
++		WriteULeb128Vector(exports, count);
++		for(uint32 i = 0; i < count; i++)
++		{
++			std::string name = "f" + std::to_string(i);
++			WriteULeb128Vector(exports, static_cast<uint32>(name.size()));
++			exports.insert(exports.end(), name.begin(), name.end());
++			exports.push_back(Wasm::IMPORT_EXPORT_TYPE_FUNCTION);
++			WriteULeb128Vector(exports, i);
++		}
++		WriteSection(out, Wasm::SECTION_ID_EXPORT, exports);
++	}
++	{
++		std::vector<uint8> code;
++		WriteULeb128Vector(code, count);
++		for(const auto& part : parts)
++		{
++			WriteULeb128Vector(code, static_cast<uint32>(part.body.size()));
++			code.insert(code.end(), part.body.begin(), part.body.end());
++		}
++		WriteSection(out, Wasm::SECTION_ID_CODE, code);
++	}
++	merged = std::move(out);
++	return true;
++}
++
+ void CWasmModuleBuilder::WriteSectionHeader(Framework::CStream& stream, uint8 sectionId, uint32 size)
+ {
+ 	stream.Write8(sectionId);
+diff --git a/tests/Main.cpp b/tests/Main.cpp
+index 0fbe0a5..bdd39cf 100644
+--- a/tests/Main.cpp
++++ b/tests/Main.cpp
+@@ -1,6 +1,7 @@
+ #include "Jitter_CodeGenFactory.h"
+ 
+ #include "Crc32Test.h"
++#include "ContextCacheTest.h"
+ #include "CursorTest.h"
+ #include "MultTest.h"
+ #include "DivTest.h"
+@@ -200,7 +201,8 @@ static const TestFactoryFunction s_factories[] =
+ 	[] () { return new CMemAccess64Test(false); },
+ 	[] () { return new CMemAccess64Test(true); },
+ 	[] () { return new CCall64Test(); },
+-	[] () { return new CExternJumpTest(); }
++	[] () { return new CExternJumpTest(); },
++	[] () { return new CContextCacheTest(); }
+ };
+ // clang-format on
+ 
+@@ -209,6 +211,7 @@ void PrepareExternalFunctions()
+ 	CCrc32Test::PrepareExternalFunctions();
+ 	CCall64Test::PrepareExternalFunctions();
+ 	CRegAllocTempTest::PrepareExternalFunctions();
++	CContextCacheTest::PrepareExternalFunctions();
+ }
+ 
+ int main(int argc, const char** argv)

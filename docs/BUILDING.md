@@ -196,6 +196,16 @@ their own patches, and the few runtime changes shared with native code are behin
   during videos and menus, and EA's sound driver repeated blocks (noise); asleep, time flows in 1 ms
   steps. Intro video: game thread ~95% -> ~20%, repeated sound blocks -> 0.
 - EE timers advance in 2048-cycle steps on the web (512 natively).
+- SPU2 mixer (PCSX2 code, `spu2/SPU2/Mixer.cpp`, `ADSR.cpp`): register-only sweep/ADSR increments computed
+  at register writes, no per-voice IRQ address checks when no IRQ is enabled, SIMD interpolation and gate
+  accumulation: +24%, bit-exact over 10M stereo samples and 220k register reads (offline harness).
+- VIF1 DMA chains (`ps2_memory.cpp`, `ps2_vif1_interpreter.cpp`, `vif1_source.h`): with the remote VU the
+  chain is decoded from RDRAM/scratchpad pieces and written into the GS ring without the gather copy;
+  byte-identical to the old path over 1500 random chains.
+- Off by default (measured worse or no better in the game): IOP import cache + native libsd
+  (`?env=PS2X_IOP_IMPORT_CACHE=1&env=PS2X_IOP_LIBSD=1`), VU1 context fields in locals (`?vulocals=1`),
+  VU1 module groups per micro memory (`?vumodules=1`). The VU1 block cache key now includes the
+  instructions the compiler reads outside the block (stale code could be reused).
 - Diagnostics: `?vustats=1&chain=0` (VU1 block statistics), `?env=NAME=value` (environment
   variables), `Module._ps2xSpu2Dump()` (last 8 s of SPU2 inputs and output).
 - EE scheduler: idle-loop sleep with time flowing in 1 ms steps, vblank rebase after stalls.
