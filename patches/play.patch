@@ -449,10 +449,10 @@ index 56ef0ad..1da85bf 100644
 +#endif
 +};
 diff --git a/Source/GenericMipsExecutor.h b/Source/GenericMipsExecutor.h
-index 2fb630f..2135381 100644
+index 2fb630f..8d61c95 100644
 --- a/Source/GenericMipsExecutor.h
 +++ b/Source/GenericMipsExecutor.h
-@@ -1,8 +1,16 @@
+@@ -1,8 +1,17 @@
  #pragma once
  
 +#include <algorithm>
@@ -465,11 +465,12 @@ index 2fb630f..2135381 100644
 +#include "Jitter_CodeGen_Wasm.h"
 +#include <algorithm>
 +#include <cstddef>
++#include <cstdio>
 +#endif
  
  #include "BlockLookupOneWay.h"
  #include "BlockLookupTwoWay.h"
-@@ -56,6 +64,109 @@ public:
+@@ -56,6 +65,132 @@ public:
  
  	virtual ~CGenericMipsExecutor() = default;
  
@@ -509,7 +510,8 @@ index 2fb630f..2135381 100644
 +		m_blockStats = enabled;
 +	}
 +	//The most entered blocks with their compiled modules (needs CBasicBlock::s_keepCode):
-+	//per block [begin, end, entries (low 32 bits), code size] (uint32 each) then the code
++	//per block [begin, end, entries (low 32 bits), code size, text size] (uint32 each), the code, then
++	//the disassembly of the guest instructions it was made from
 +	std::vector<uint8> DumpHotBlocks(size_t count) const
 +	{
 +		std::vector<std::pair<uint64, uint32>> hot;
@@ -521,11 +523,14 @@ index 2fb630f..2135381 100644
 +		{
 +			auto codeIterator = m_blockCode.find(hot[i].second);
 +			if(codeIterator == m_blockCode.end()) continue;
-+			const auto& code = codeIterator->second.second;
-+			uint32 header[4] = {hot[i].second, codeIterator->second.first, static_cast<uint32>(hot[i].first), static_cast<uint32>(code.size())};
++			const auto& code = codeIterator->second.code;
++			const auto& text = codeIterator->second.text;
++			uint32 header[5] = {hot[i].second, codeIterator->second.end, static_cast<uint32>(hot[i].first), static_cast<uint32>(code.size()),
++			                    static_cast<uint32>(text.size())};
 +			auto headerBytes = reinterpret_cast<const uint8*>(header);
 +			blob.insert(blob.end(), headerBytes, headerBytes + sizeof(header));
 +			blob.insert(blob.end(), code.begin(), code.end());
++			blob.insert(blob.end(), text.begin(), text.end());
 +		}
 +		return blob;
 +	}
@@ -562,7 +567,20 @@ index 2fb630f..2135381 100644
 +			if(begin == m_lastBegin) stats.sameBlock++;
 +			m_blockSuccessors[m_lastBegin][begin]++;
 +			if(m_blockEntries[begin]++ == 0 && CBasicBlock::s_keepCode)
-+				m_blockCode[begin] = {block->GetEndAddress(), block->GetCode()};
++			{
++				auto& kept = m_blockCode[begin];
++				kept.end = block->GetEndAddress();
++				kept.code = block->GetCode();
++				for(uint32 address = begin; address <= kept.end; address += 4)
++				{
++					char mnemonic[32] = {}, operands[64] = {}, line[128];
++					const uint32 opcode = m_context.m_pMemoryMap->GetInstruction(address);
++					m_context.m_pArch->GetInstructionMnemonic(&m_context, address, opcode, mnemonic, sizeof(mnemonic));
++					m_context.m_pArch->GetInstructionOperands(&m_context, address, opcode, operands, sizeof(operands));
++					int n = snprintf(line, sizeof(line), "%04x %08x %-10s %s\n", address, opcode, mnemonic, operands);
++					kept.text.insert(kept.text.end(), line, line + std::max(0, std::min<int>(n, sizeof(line) - 1)));
++				}
++			}
 +		}
 +		m_lastBegin = begin;
 +		m_lastEnd = block->GetEndAddress();
@@ -570,7 +588,13 @@ index 2fb630f..2135381 100644
 +	bool m_blockStats = false;
 +	BLOCK_STATS m_blockStatsCounters;
 +	std::unordered_map<uint32, uint64> m_blockEntries;
-+	std::unordered_map<uint32, std::pair<uint32, std::vector<uint8>>> m_blockCode;
++	struct KEPT_BLOCK
++	{
++		uint32 end = 0;
++		std::vector<uint8> code;
++		std::vector<uint8> text;
++	};
++	std::unordered_map<uint32, KEPT_BLOCK> m_blockCode;
 +	uint32 m_lastBegin = MIPS_INVALID_PC;
 +	uint32 m_lastEnd = MIPS_INVALID_PC;
 +	std::unordered_map<uint32, std::unordered_map<uint32, uint32>> m_blockSuccessors;
@@ -579,7 +603,7 @@ index 2fb630f..2135381 100644
  	int Execute(int cycles) override
  	{
  		m_context.m_State.cycleQuota = cycles;
-@@ -65,10 +176,26 @@ public:
+@@ -65,10 +200,26 @@ public:
  #endif
  		while(m_context.m_State.nHasException == 0)
  		{
@@ -606,7 +630,7 @@ index 2fb630f..2135381 100644
  		m_context.m_State.nHasException &= ~MIPS_EXCEPTION_STATUS_QUOTADONE;
  #ifdef DEBUGGER_INCLUDED
  		if(m_context.m_State.nHasException == MIPS_EXCEPTION_BREAKPOINT)
-@@ -88,6 +215,9 @@ public:
+@@ -88,6 +239,9 @@ public:
  
  	void Reset() override
  	{
@@ -616,7 +640,7 @@ index 2fb630f..2135381 100644
  		m_blockLookup.Clear();
  		m_blocks.clear();
  		m_blockOutLinks.clear();
-@@ -139,9 +269,27 @@ protected:
+@@ -139,9 +293,27 @@ protected:
  		auto block = BlockFactory(m_context, start, end);
  		ResetBlockOutLinks(block.get());
  		m_blockLookup.AddBlock(block.get());
@@ -644,7 +668,7 @@ index 2fb630f..2135381 100644
  	void ResetBlockOutLinks(CBasicBlock* block)
  	{
  		for(uint32 i = 0; i < LINK_SLOT_MAX; i++)
-@@ -286,6 +434,7 @@ protected:
+@@ -286,6 +458,7 @@ protected:
  			if(block == protectedBlock) continue;
  			if(!RangesOverlap(block->GetBeginAddress(), block->GetEndAddress(), start, end)) continue;
  			clearedBlocks.insert(block);
@@ -652,7 +676,7 @@ index 2fb630f..2135381 100644
  			m_blockLookup.DeleteBlock(block);
  		}
  
-@@ -327,6 +476,12 @@ protected:
+@@ -327,6 +500,12 @@ protected:
  
  	BlockLookupType m_blockLookup;
  
@@ -779,10 +803,15 @@ index 7200729..0c2a963 100644
  
  //08
 diff --git a/Source/ee/VUShared.cpp b/Source/ee/VUShared.cpp
-index 52360eb..3f4c9ce 100644
+index 52360eb..6598305 100644
 --- a/Source/ee/VUShared.cpp
 +++ b/Source/ee/VUShared.cpp
-@@ -254,6 +254,12 @@ void VUShared::MakeComparableFromFloat(CMipsJitter* codeGen)
+@@ -1,3 +1,4 @@
++#include <vector>
+ #include "VUShared.h"
+ #include "BitManip.h"
+ #include "../MIPS.h"
+@@ -254,6 +255,12 @@ void VUShared::MakeComparableFromFloat(CMipsJitter* codeGen)
  
  void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, uint32 relativePipeTime, uint32 compileHints)
  {
@@ -795,7 +824,7 @@ index 52360eb..3f4c9ce 100644
  	codeGen->MD_PushRel(regOffset);
  	codeGen->MD_MakeSignZero();
  
-@@ -265,6 +271,7 @@ void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, u
+@@ -265,6 +272,7 @@ void VUShared::TestSZFlags(CMipsJitter* codeGen, uint8 dest, size_t regOffset, u
  	}
  
  	//Update sticky flags
@@ -803,7 +832,7 @@ index 52360eb..3f4c9ce 100644
  	{
  		codeGen->PushTop();
  
-@@ -804,8 +811,14 @@ void VUShared::ADDAq(CMipsJitter* codeGen, uint8 dest, uint8 fs, uint32 relative
+@@ -804,8 +812,14 @@ void VUShared::ADDAq(CMipsJitter* codeGen, uint8 dest, uint8 fs, uint32 relative
  	          true, relativePipeTime, compileHints);
  }
  
@@ -819,8 +848,166 @@ index 52360eb..3f4c9ce 100644
  	//Load previous value
  	{
  		codeGen->PushRelAddrRef(offsetof(CMIPS, m_State.pipeClip.values));
+@@ -1800,6 +1814,9 @@ void VUShared::FlushPipeline(const REGISTER_PIPEINFO& pipeInfo, CMipsJitter* cod
+ 
+ void VUShared::SyncPipeline(const REGISTER_PIPEINFO& pipeInfo, CMipsJitter* codeGen, uint32 relativePipeTime)
+ {
++	//Moves the pipe time forward by an amount only known at run time
++	FlagTrackInvalidate();
++
+ 	codeGen->PushRel(pipeInfo.counter);
+ 
+ 	codeGen->PushRel(offsetof(CMIPS, m_State.pipeTime));
+@@ -1852,8 +1869,122 @@ void VUShared::QueueInPipeline(const REGISTER_PIPEINFO& pipeInfo, CMipsJitter* c
+ 	codeGen->PullRel(pipeInfo.counter);
+ }
+ 
++bool VUShared::s_flagTracking = true;
++
++namespace
++{
++	//Per flag pipeline, the times (relative to the current sub-block's start) at which the values
++	//queued so far in the block being compiled become visible, oldest first
++	struct FLAG_ENTRY
++	{
++		int64 visibleTime;
++		uint32 bumpsBefore; //possible +1 pipe time bumps compiled before it was queued
++	};
++	struct FLAG_TRACK
++	{
++		size_t indexOffset = 0;
++		std::vector<FLAG_ENTRY> visibleTimes;
++	};
++	thread_local bool g_flagTrackActive = false;
++	thread_local FLAG_TRACK g_flagTracks[3];
++	//Dynamic stall checks at the start of a block may each add 1 to the pipe time at run time: a value
++	//queued before them can become visible that much earlier than its compile time position says
++	thread_local uint32 g_flagTrackBumps = 0;
++
++	FLAG_TRACK* FindFlagTrack(const VUShared::FLAG_PIPEINFO& pipeInfo)
++	{
++		if(!g_flagTrackActive) return nullptr;
++		for(auto& track : g_flagTracks)
++		{
++			if(track.indexOffset == pipeInfo.index) return &track;
++		}
++		for(auto& track : g_flagTracks)
++		{
++			if(track.indexOffset == 0)
++			{
++				track.indexOffset = pipeInfo.index;
++				return &track;
++			}
++		}
++		return nullptr;
++	}
++}
++
++void VUShared::FlagTrackBegin()
++{
++	g_flagTrackActive = s_flagTracking;
++	g_flagTrackBumps = 0;
++	for(auto& track : g_flagTracks)
++	{
++		track.indexOffset = 0;
++		track.visibleTimes.clear();
++	}
++}
++
++//The pipe time advanced by this much at the end of a sub-block (superblocks)
++void VUShared::FlagTrackShift(uint32 amount)
++{
++	for(auto& track : g_flagTracks)
++	{
++		for(auto& entry : track.visibleTimes)
++			entry.visibleTime -= amount;
++	}
++}
++
++void VUShared::FlagTrackMayBump()
++{
++	g_flagTrackBumps++;
++}
++
++//Code compiled under a condition may or may not have queued values
++void VUShared::FlagTrackInvalidate()
++{
++	for(auto& track : g_flagTracks)
++		track.visibleTimes.clear();
++}
++
++void VUShared::FlagTrackEnd()
++{
++	FlagTrackInvalidate();
++	g_flagTrackActive = false;
++}
++
+ void VUShared::CheckFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen, uint32 relativePipeTime)
+ {
++	if(auto track = FindFlagTrack(pipeInfo))
++	{
++		//The newest value certainly visible is the result, if every newer one is certainly not visible
++		//yet (even with every possible stall bump since it was queued) and it is still in the 8 slots.
++		//The pipe time only grows: visible at its compile time position means visible.
++		const auto& times = track->visibleTimes;
++		size_t newer = 0;
++		for(size_t i = times.size(); i-- > 0;)
++		{
++			const int64 maxBumps = g_flagTrackBumps - times[i].bumpsBefore;
++			if(times[i].visibleTime <= static_cast<int64>(relativePipeTime))
++			{
++				if(newer < FLAG_PIPELINE_SLOTS)
++				{
++					codeGen->PushRelAddrRef(pipeInfo.valueArray);
++					codeGen->PushRel(pipeInfo.index);
++					codeGen->PushCst(static_cast<uint32>(newer + 1));
++					codeGen->Sub();
++					codeGen->PushCst(FLAG_PIPELINE_SLOTS - 1);
++					codeGen->And();
++					codeGen->LoadFromRefIdx();
++					codeGen->PullRel(pipeInfo.value);
++					return;
++				}
++				break;
++			}
++			if(times[i].visibleTime <= static_cast<int64>(relativePipeTime) + maxBumps)
++			{
++				break; //may or may not be visible at run time
++			}
++			newer++;
++		}
++	}
++
+ 	//This will check every slot in the pipeline and update
+ 	//the flag register every time (pipeTimes[i] <= (pipeTime + relativePipeTime))
+ 	for(unsigned int i = 0; i < FLAG_PIPELINE_SLOTS; i++)
+@@ -1896,6 +2027,11 @@ void VUShared::CheckFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* cod
+ 
+ void VUShared::QueueInFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen, uint32 latency, uint32 relativePipeTime)
+ {
++	if(auto track = FindFlagTrack(pipeInfo))
++	{
++		track->visibleTimes.push_back({static_cast<int64>(relativePipeTime) + latency, g_flagTrackBumps});
++	}
++
+ 	uint32 valueCursor = codeGen->GetTopCursor();
+ 
+ 	//Get offset
+@@ -1944,6 +2080,12 @@ void VUShared::QueueInFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* c
+ 
+ void VUShared::ResetFlagPipeline(const FLAG_PIPEINFO& pipeInfo, CMipsJitter* codeGen)
+ {
++	//All slots get time 0, which a signed comparison doesn't always see as passed: leave it to the scan
++	if(auto track = FindFlagTrack(pipeInfo))
++	{
++		track->visibleTimes.clear();
++	}
++
+ 	uint32 valueCursor = codeGen->GetTopCursor();
+ 
+ 	for(uint32 i = 0; i < FLAG_PIPELINE_SLOTS; i++)
 diff --git a/Source/ee/VUShared.h b/Source/ee/VUShared.h
-index a2991f1..14e69bf 100644
+index a2991f1..5b9d2fb 100644
 --- a/Source/ee/VUShared.h
 +++ b/Source/ee/VUShared.h
 @@ -98,6 +98,9 @@ namespace VUShared
@@ -842,6 +1029,23 @@ index a2991f1..14e69bf 100644
  	void DIV(CMipsJitter*, uint8, uint8, uint8, uint8, uint32);
  	void FTOI0(CMipsJitter*, uint8, uint8, uint8);
  	void FTOI4(CMipsJitter*, uint8, uint8, uint8);
+@@ -239,6 +242,16 @@ namespace VUShared
+ 	void QueueInFlagPipeline(const FLAG_PIPEINFO&, CMipsJitter*, uint32, uint32);
+ 	void ResetFlagPipeline(const FLAG_PIPEINFO&, CMipsJitter*);
+ 
++	//Flag pipeline reads resolved while compiling: inside a block, a read that comes after the latest
++	//queued value of the same block has become visible reads that slot directly instead of scanning
++	//the 8 slots (~50 operations per FCAND/FCOR/FMAND...). Anything not provable falls back to the scan.
++	extern bool s_flagTracking;
++	void FlagTrackBegin();
++	void FlagTrackShift(uint32);
++	void FlagTrackMayBump();
++	void FlagTrackInvalidate();
++	void FlagTrackEnd();
++
+ 	void CheckFlagPipelineImmediate(const FLAG_PIPEINFO&, CMIPS*, uint32);
+ 	void ResetFlagPipelineImmediate(const FLAG_PIPEINFO&, CMIPS*, uint32);
+ 
 diff --git a/Source/ee/Vif1.cpp b/Source/ee/Vif1.cpp
 index 6ad8461..8f1249d 100644
 --- a/Source/ee/Vif1.cpp
@@ -909,10 +1113,10 @@ index 6ad8461..8f1249d 100644
  			stream.Advance(processed);
  			//Adjust size in case not everything was processed by GIF
 diff --git a/Source/ee/VuBasicBlock.cpp b/Source/ee/VuBasicBlock.cpp
-index a1ca3ca..31293f3 100644
+index a1ca3ca..e8aa52e 100644
 --- a/Source/ee/VuBasicBlock.cpp
 +++ b/Source/ee/VuBasicBlock.cpp
-@@ -14,10 +14,106 @@ bool CVuBasicBlock::IsLinkable() const
+@@ -14,10 +14,108 @@ bool CVuBasicBlock::IsLinkable() const
  	return m_isLinkable;
  }
  
@@ -944,7 +1148,9 @@ index a1ca3ca..31293f3 100644
 +	const uint32 begin = m_begin;
 +	const uint32 end = m_end;
 +	auto ends = FindSubBlockEnds();
++	VUShared::FlagTrackBegin();
 +	CompileSubBlocks(jitter, ends, 0, begin);
++	VUShared::FlagTrackEnd();
 +	m_begin = begin;
 +	m_end = end;
 +}
@@ -1021,7 +1227,39 @@ index a1ca3ca..31293f3 100644
  
  	assert((m_begin & 0x07) == 0);
  	assert(((m_end + 4) & 0x07) == 0);
-@@ -436,7 +532,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
+@@ -96,6 +194,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
+ 						jitter->PushCst(stallMask.nV[stallIdx]);
+ 						jitter->And();
+ 						jitter->PushCst(0);
++						VUShared::FlagTrackMayBump();
+ 						jitter->BeginIf(Jitter::CONDITION_NE);
+ 						{
+ 							//Clear writes
+@@ -336,6 +435,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
+ 				//before the branch is taken
+ 				uint32 branchTgtAddress = branchOpcodeAddr + VUShared::GetBranch(branchOpcodeLo & 0x7FF) + 8;
+ 				arch->CompileInstruction(branchTgtAddress, jitter, &m_context, address - m_begin);
++				VUShared::FlagTrackInvalidate();
+ 			}
+ 		}
+ 		//Handle some E bit in delay slot situation (Edge of Reality games)
+@@ -360,6 +460,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
+ 					arch->CompileInstruction(nextOpcodeAddr, jitter, &m_context, nextOpcodeAddr - m_begin);
+ 				}
+ 				jitter->EndIf();
++				VUShared::FlagTrackInvalidate();
+ 			}
+ 		}
+ 
+@@ -381,6 +482,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
+ 		jitter->Add();
+ 		jitter->PullRel(offsetof(CMIPS, m_State.pipeTime));
+ 	}
++	VUShared::FlagTrackShift(relativePipeTime);
+ 
+ 	for(int32 i = extraPipeTimeIndex; i < 3; i++)
+ 	{
+@@ -436,7 +538,7 @@ void CVuBasicBlock::CompileRange(CMipsJitter* jitter)
  	jitter->PushCst(integerTrailingDelayInfo.regIndex);
  	jitter->PullRel(offsetof(CMIPS, m_State.savedNextBlockIntRegIdx));
  

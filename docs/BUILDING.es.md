@@ -210,6 +210,9 @@ nativo están dentro de `__EMSCRIPTEN__`.
   del hilo del juego un N% más lento (simula un móvil).
 - Cambios de microprograma de la VU1 (Play! `VuExecutor.cpp`): qué flags lee la micro memoria se recuerda por
   contenido; revisar los 16 KB en cada cambio era ~10% del hilo de la VU1 en un partido.
+- Lecturas de flags de la VU1 (Play! `VUShared.cpp`, `?vuflagtrack=0` = apagado): un FCAND/FCOR/FMAND que va
+  después de un valor escrito en el mismo bloque lee esa casilla del pipeline en vez de recorrer las 8
+  (comparado con el recorrido completo en la prueba de programas aleatorios de VuTest).
 - Lectura del disco (`library_fetch_stream.js`): el plazo de cada petición es de progreso (6 s sin datos), y
   un trozo que el juego lleva 1.5 s esperando se pide también por separado (una conexión trabada de un móvil
   llegó a retener la música dos minutos).

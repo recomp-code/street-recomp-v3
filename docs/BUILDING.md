@@ -212,6 +212,9 @@ their own patches, and the few runtime changes shared with native code are behin
   `?env=PS2X_EE_SLOW=N` makes the game thread's work N% slower (phone simulation).
 - VU1 microprogram swaps (Play! `VuExecutor.cpp`): which flags the micro memory reads is remembered per
   micro memory contents; scanning all 16 KB at every swap was ~10% of the VU1 worker in a match.
+- VU1 flag reads (Play! `VUShared.cpp`, `?vuflagtrack=0` = off): an FCAND/FCOR/FMAND read that comes after a
+  value queued in the same block reads its pipeline slot directly instead of scanning all 8 (checked against
+  the scan with VuTest's random-program stress test).
 - Disc streaming (`library_fetch_stream.js`): the request deadline is on progress (6 s without data), and a
   chunk the game has waited on for 1.5 s is also requested on its own (a stalled phone connection once held
   the music for two minutes).
