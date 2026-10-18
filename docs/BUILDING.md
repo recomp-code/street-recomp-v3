@@ -190,6 +190,33 @@ their own patches, and the few runtime changes shared with native code are behin
 - IOP time runs to an absolute target derived from EE time: the native EA mixer charges ~11.5k
   cycles at once, and taking each slice from wherever the last one ended let the IOP run ~3% ahead,
   so FMV sound was consumed faster than it arrived and the driver repeated blocks (a ~94 Hz buzz).
+- Game wait loops slept in the browser (`game/overrides/nba_street_v3_overrides.cpp`,
+  `ps2xAddEeIdleLoop`, web only): the frame wait at 0x3E3920 and the video/menu wait at 0x3E36F0
+  ("while (flag) { callback; 32 NOPs }"). Spinning in the latter made emulated time move in jumps
+  during videos and menus, and EA's sound driver repeated blocks (noise); asleep, time flows in 1 ms
+  steps. Intro video: game thread ~95% -> ~20%, repeated sound blocks -> 0.
+- EE timers advance in 2048-cycle steps on the web (512 natively).
+- SPU2 mixer (PCSX2 code, `spu2/SPU2/Mixer.cpp`, `ADSR.cpp`): register-only sweep/ADSR increments computed
+  at register writes, no per-voice IRQ address checks when no IRQ is enabled, SIMD interpolation and gate
+  accumulation: +24%, bit-exact over 10M stereo samples and 220k register reads (offline harness).
+- VIF1 DMA chains (`ps2_memory.cpp`, `ps2_vif1_interpreter.cpp`, `vif1_source.h`): with the remote VU the
+  chain is decoded from RDRAM/scratchpad pieces and written into the GS ring without the gather copy;
+  byte-identical to the old path over 1500 random chains.
+- EA sound driver voice loop (`iop_hle_routines.h`, `hle::eaVoiceIteration`): the IOP runs it natively
+  (88% of IOP time), verified against the interpreter over 1.14M voices; `?env=PS2X_IOP_EAVOICES=0` turns it off.
+- Time jumps (`EeScheduler.cpp`, web): an overdue event makes emulated time jump only inside the game's
+  registered wait loops, elsewhere only when 20 ms behind (`?env=PS2X_WARP_LAG_MS=N`, 0 = anywhere). On slow
+  hosts jumping in the middle of the game's work made the sound streamer late (crackle in the menus).
+  In the wait loops the jump goes 1 ms at a time (`?env=PS2X_WARP_STEP_US=N`, 0 = all at once): a phone made
+  up 8 ms in one jump, past the sound driver's 5 ms half-buffer swap.
+  `?env=PS2X_EE_SLOW=N` makes the game thread's work N% slower (phone simulation).
+- Disc streaming (`library_fetch_stream.js`): the request deadline is on progress (6 s without data), and a
+  chunk the game has waited on for 1.5 s is also requested on its own (a stalled phone connection once held
+  the music for two minutes).
+- Off by default (measured worse or no better in the game): IOP import cache + native libsd
+  (`?env=PS2X_IOP_IMPORT_CACHE=1&env=PS2X_IOP_LIBSD=1`), VU1 context fields in locals (`?vulocals=1`),
+  VU1 module groups per micro memory (`?vumodules=1`). The VU1 block cache key now includes the
+  instructions the compiler reads outside the block (stale code could be reused).
 - Diagnostics: `?vustats=1&chain=0` (VU1 block statistics), `?env=NAME=value` (environment
   variables), `Module._ps2xSpu2Dump()` (last 8 s of SPU2 inputs and output).
 - EE scheduler: idle-loop sleep with time flowing in 1 ms steps, vblank rebase after stalls.

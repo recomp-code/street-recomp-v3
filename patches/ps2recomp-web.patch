@@ -234,7 +234,7 @@ index 8de31d8..e0e61bd 100644
          [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
          [[nodiscard]] std::span<uint8_t> ramMutable() noexcept { return m_ram; } // native HLE routines
 diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
-index 1bbdb22..9b9bbc4 100644
+index 1bbdb22..efb5ed3 100644
 --- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
 +++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
 @@ -3,10 +3,13 @@
@@ -251,7 +251,7 @@ index 1bbdb22..9b9bbc4 100644
  
  namespace ps2x::iop
  {
-@@ -60,600 +63,87 @@ namespace ps2x::iop
+@@ -60,600 +63,92 @@ namespace ps2x::iop
      }
  }
  
@@ -422,7 +422,10 @@ index 1bbdb22..9b9bbc4 100644
 -        case kRegStatx: return core.statx;
 -        default: return raw(offset);
 -        }
-+        return ps2x::spu2::read(now(), phys);
++        const uint16_t value = ps2x::spu2::read(now(), phys);
++        if (m_trace)
++            m_trace->push_back({phys, value, false, m_clock ? *m_clock : 0u});
++        return value;
      }
  
      void Spu2::write16(uint32_t phys, uint16_t value)
@@ -518,6 +521,8 @@ index 1bbdb22..9b9bbc4 100644
 -        case kRegStatx: core.statx = value; break;
 -        default: break;
 -        }
++        if (m_trace)
++            m_trace->push_back({phys, value, true, m_clock ? *m_clock : 0u});
 +        ps2x::spu2::write(now(), phys, value);
      }
  
@@ -892,16 +897,16 @@ index 1bbdb22..9b9bbc4 100644
              m_statIrqs = 0u;
              m_statPeak = 0;
 diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
-index be7a058..279b497 100644
+index be7a058..61e8c46 100644
 --- a/ps2xIOP/src/emulator/core/iop_spu2.h
 +++ b/ps2xIOP/src/emulator/core/iop_spu2.h
-@@ -1,117 +1,51 @@
+@@ -1,117 +1,64 @@
  #pragma once
  
 -#include <array>
  #include <cstdint>
 -#include <deque>
--#include <vector>
+ #include <vector>
  
  namespace ps2x::iop::detail
  {
@@ -927,6 +932,17 @@ index be7a058..279b497 100644
 +        void reset(uint8_t *iopRam = nullptr);
 +        // The IOP clock, read at each register access and DMA so the SPU2 catches up first.
 +        void setClock(const uint64_t *iopCycle) noexcept { m_clock = iopCycle; }
++
++        // Register accesses as they happen (value and IOP cycle), while a trace is set (the IOP's
++        // HLE verify mode compares a native routine's accesses with the interpreted ones).
++        struct Access
++        {
++            uint32_t phys;
++            uint16_t value;
++            bool write;
++            uint64_t cycle;
++        };
++        void setTrace(std::vector<Access> *trace) noexcept { m_trace = trace; }
  
          [[nodiscard]] static bool contains(uint32_t phys) noexcept { return phys >= kBase && phys < kEnd; }
          uint16_t read16(uint32_t phys);
@@ -960,8 +976,7 @@ index be7a058..279b497 100644
 -            Sustain,
 -            Release,
 -        };
-+        [[nodiscard]] uint32_t now() const noexcept { return m_clock ? static_cast<uint32_t>(*m_clock) : 0u; }
- 
+-
 -        struct Voice
 -        {
 -            uint16_t volL = 0;
@@ -973,7 +988,8 @@ index be7a058..279b497 100644
 -            uint32_t lsa = 0;
 -            uint32_t nax = 0;
 -            bool lsaWritten = false;
--
++        [[nodiscard]] uint32_t now() const noexcept { return m_clock ? static_cast<uint32_t>(*m_clock) : 0u; }
+ 
 -            Phase phase = Phase::Off;
 -            int32_t env = 0;
 -            int32_t envDelay = 0;
@@ -1024,6 +1040,7 @@ index be7a058..279b497 100644
 -        bool m_cycleInitialized = false;
 -        std::vector<int16_t> m_outBlock;
 +        const uint64_t *m_clock = nullptr;
++        std::vector<Access> *m_trace = nullptr;
          uint64_t m_statSamples = 0u;
 -        uint32_t m_statKeyOns = 0u;
 -        uint32_t m_statDmaBytes = 0u;
@@ -1984,11 +2001,175 @@ index 0000000..2f99b0d
 +#endif
 +
 +#endif
+diff --git a/ps2xIOP/src/emulator/imports/iop_imports.cpp b/ps2xIOP/src/emulator/imports/iop_imports.cpp
+index f13267f..b070211 100644
+--- a/ps2xIOP/src/emulator/imports/iop_imports.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_imports.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstdlib>
+ #include <utility>
+ 
+ namespace ps2x::iop::detail
+@@ -43,9 +44,60 @@ namespace ps2x::iop::detail
+     void IopImportRegistry::reset()
+     {
+         m_libraries.clear();
++        m_decoded.clear();
++        ++m_generation;
++    }
++
++    IopImportRegistry::CachedImport *IopImportRegistry::decodeCached(uint32_t pc) const
++    {
++        const uint32_t word0 = m_memory.read32(pc);
++        if (word0 != 0x03E00008u)
++            return nullptr;
++        const uint32_t word1 = m_memory.read32(pc + 4u);
++        if ((word1 & 0xFFFF0000u) != 0x24000000u)
++            return nullptr;
++        // PS2X_IOP_IMPORT_CACHE=1 turns the cache on. Off by default: with it (and the native libsd)
++        // the intro video's game thread went from ~20% to ~90% and the sound repeated blocks.
++        static const bool s_cache = []
++        {
++            const char *value = std::getenv("PS2X_IOP_IMPORT_CACHE");
++            return value && value[0] == '1';
++        }();
++        if (!s_cache)
++        {
++            static CachedImport s_uncached;
++            uint32_t table = 0u;
++            const auto call = decodeAt(pc, &table);
++            if (!call)
++                return nullptr;
++            s_uncached = CachedImport{word0, word1, table, 0u, 0u, *call, 0u, 0u};
++            return &s_uncached;
++        }
++        if (auto cached = m_decoded.find(pc); cached != m_decoded.end())
++        {
++            CachedImport &entry = cached->second;
++            if (entry.stubWord0 == word0 && entry.stubWord1 == word1 && m_memory.read32(entry.table) == kImportMagic &&
++                m_memory.read32(entry.table + 12u) == entry.tableName0 && m_memory.read32(entry.table + 16u) == entry.tableName1)
++                return &entry;
++            m_decoded.erase(cached);
++        }
++        uint32_t table = 0u;
++        const auto call = decodeAt(pc, &table);
++        if (!call)
++            return nullptr;
++        if (m_decoded.size() > 4096u)
++            m_decoded.clear();
++        CachedImport &entry = m_decoded[pc];
++        entry = CachedImport{word0, word1, table, m_memory.read32(table + 12u), m_memory.read32(table + 16u), *call, 0u, 0u};
++        return &entry;
+     }
+ 
+     std::optional<IopImportCall> IopImportRegistry::decode(uint32_t pc) const
++    {
++        return decodeAt(pc, nullptr);
++    }
++
++    std::optional<IopImportCall> IopImportRegistry::decodeAt(uint32_t pc, uint32_t *tableOut) const
+     {
+         if (m_memory.read32(pc) != 0x03E00008u)
+             return std::nullopt;
+@@ -89,6 +141,8 @@ namespace ps2x::iop::detail
+             }
+             if (valid)
+             {
++                if (tableOut)
++                    *tableOut = table;
+                 return IopImportCall{
+                     trimLibraryName(name),
+                     static_cast<uint16_t>(delay & 0xFFFFu),
+@@ -101,6 +155,7 @@ namespace ps2x::iop::detail
+ 
+     bool IopImportRegistry::registerExportTable(uint32_t address)
+     {
++        ++m_generation;
+         const uint32_t physical = IopMemory::physicalAddress(address);
+         if (physical + 20u > IopMemory::RamSize ||
+             m_memory.read32(physical) != kExportMagic)
+@@ -129,6 +184,7 @@ namespace ps2x::iop::detail
+ 
+     bool IopImportRegistry::releaseExportTable(uint32_t address)
+     {
++        ++m_generation;
+         return m_libraries.erase(IopMemory::physicalAddress(address)) != 0u;
+     }
+ 
+@@ -184,6 +240,7 @@ namespace ps2x::iop::detail
+ 
+     void IopImportRegistry::eraseRange(uint32_t base, uint32_t size)
+     {
++        ++m_generation;
+         for (auto library = m_libraries.begin(); library != m_libraries.end();)
+         {
+             if (library->first >= base && library->first < base + size)
+diff --git a/ps2xIOP/src/emulator/imports/iop_imports.h b/ps2xIOP/src/emulator/imports/iop_imports.h
+index cae8d91..5ff0c36 100644
+--- a/ps2xIOP/src/emulator/imports/iop_imports.h
++++ b/ps2xIOP/src/emulator/imports/iop_imports.h
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include <unordered_map>
++
+ #include <cstddef>
+ #include <cstdint>
+ #include <map>
+@@ -26,6 +28,25 @@ namespace ps2x::iop::detail
+ 
+         void reset();
+         [[nodiscard]] std::optional<IopImportCall> decode(uint32_t pc) const;
++
++        // An import stub at pc, decoded once: the IOP calls the same stubs tens of thousands of
++        // times a second (the sound driver's libsd calls for every voice), and decode() scans the
++        // module's import table and builds the library name each time. Checked against the stub's
++        // two words and its table header on every use, so changed code is decoded again.
++        struct CachedImport
++        {
++            uint32_t stubWord0 = 0;
++            uint32_t stubWord1 = 0;
++            uint32_t table = 0;
++            uint32_t tableName0 = 0;
++            uint32_t tableName1 = 0;
++            IopImportCall call;
++            uint32_t guestTarget = 0;      // set by the caller once it jumped into a guest library
++            uint32_t targetGeneration = 0; // generation() when guestTarget was set
++        };
++        [[nodiscard]] CachedImport *decodeCached(uint32_t pc) const;
++        // Changes whenever export tables are registered or released (guest targets go stale).
++        [[nodiscard]] uint32_t generation() const noexcept { return m_generation; }
+         [[nodiscard]] bool registerExportTable(uint32_t address);
+         [[nodiscard]] bool releaseExportTable(uint32_t address);
+         [[nodiscard]] uint32_t findTable(std::string_view library, std::optional<uint16_t> version = std::nullopt) const;
+@@ -43,8 +64,11 @@ namespace ps2x::iop::detail
+         };
+ 
+         [[nodiscard]] const ExportLibrary *findLibrary(std::string_view name, std::optional<uint16_t> version) const;
++        [[nodiscard]] std::optional<IopImportCall> decodeAt(uint32_t pc, uint32_t *tableOut) const;
+ 
+         IopMemory &m_memory;
+         std::map<uint32_t, ExportLibrary> m_libraries;
++        uint32_t m_generation = 1;
++        mutable std::unordered_map<uint32_t, CachedImport> m_decoded;
+     };
+ }
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index 423e0f0..f6fe2b8 100644
+index 423e0f0..5967477 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
-@@ -148,6 +148,8 @@ namespace ps2x::iop::detail
+@@ -28,6 +28,7 @@ uint64_t g_iopStatRunCalls = 0;    // runCycles() calls
+ uint64_t g_iopStatEeCalls = 0;     // runEeCycles() calls (one per EE checkpoint)
+ 
+ #include <algorithm>
++#include <array>
+ #include <chrono>
+ #include <unordered_map>
+ #include <vector>
+@@ -148,6 +149,8 @@ namespace ps2x::iop::detail
              nextModuleId = 1;
              moduleCursor = kModuleLoadBase;
              totalCycles = 0;
@@ -1997,8 +2178,625 @@ index 423e0f0..f6fe2b8 100644
              totalInstructions = 0;
              eeCycleCarry = 0;
              activeCpu = nullptr;
-@@ -713,9 +715,9 @@ namespace ps2x::iop::detail
+@@ -272,6 +275,20 @@ namespace ps2x::iop::detail
+             Missing,
+         };
+ 
++        // Libraries dispatchImport handles natively (it reaches imports.resolve only for the rest,
++        // and for their ordinals it doesn't implement)
++        static bool isHleLibrary(const std::string &library)
++        {
++            static constexpr std::string_view kHle[] = {
++                "cdvdman", "dmacman", "heaplib", "intrman", "ioman", "loadcore", "modload",
++                "secrman", "sifcmd", "sifman", "stdio", "sysclib", "sysmem", "thbase",
++                "thevent", "thmsgbx", "threadman", "thsemap", "timrman", "vblank"};
++            for (const std::string_view name : kHle)
++                if (iequals(library, name))
++                    return true;
++            return false;
++        }
++
+         ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
+         {
+             const uint32_t a0 = cpu.gpr[4];
+@@ -616,6 +633,191 @@ namespace ps2x::iop::detail
+             return true;
+         }
+ 
++        // libsd accessors (hle::LibsdRoutine), called from an import stub whose guest target is
++        // known: run natively with the guest's exact effects. Each SPU2 register access happens
++        // at the IOP cycle the interpreter would reach it (the SPU2 catches up to that cycle), and
++        // the call is charged the instructions the guest path takes. PS2X_IOP_HLE=0 runs the
++        // guest code; PS2X_IOP_HLE=verify runs it too and compares the result (v0) with the
++        // native one computed beforehand (setters: the register address; reads at the call cycle).
++        struct LibsdVerify
++        {
++            bool active = false;
++            uint32_t ra = 0;
++            uint32_t sp = 0;
++            uint32_t expected = 0;
++            uint32_t expectedA0 = 0;
++            uint32_t expectedA1 = 0;
++            hle::LibsdRoutine routine = hle::LibsdRoutine::None;
++            uint64_t checked[5] = {};
++            uint64_t mismatched[5] = {}; // registers/addresses (must stay 0)
++            uint64_t readsLater[5] = {}; // getters: the guest read the register later (timing)
++        } libsdVerify;
++        struct LibsdTargets
++        {
++            uint32_t generation = 0;
++            struct Entry
++            {
++                hle::LibsdRoutine routine;
++                uint32_t table; // register table pointer array
++                uint32_t high;  // what the relocated lui loads
++            };
++            std::unordered_map<uint32_t, Entry> routines;
++        } libsdTargets;
++        uint64_t libsdNativeCalls = 0;
++
++        static int libsdHleMode()
++        {
++            static const int mode = []
++            {
++                const char *only = std::getenv("PS2X_IOP_LIBSD"); // PS2X_IOP_LIBSD=1 turns them on (off
++                if (!(only && only[0] == '1'))                    // by default: see iop_imports.cpp)
++                    return 0;
++                const char *env = std::getenv("PS2X_IOP_HLE");
++                if (env && env[0] == '0')
++                    return 0;
++                if (env && std::strcmp(env, "verify") == 0)
++                    return 2;
++                return 1;
++            }();
++            return mode;
++        }
++
++        // Runs routine with a0/a1 from cpu; apply = false computes v0 only (no register writes,
++        // SPU2 reads at the current cycle). Returns the instructions the guest path executes.
++        uint32_t libsdExecute(CpuState &cpu, hle::LibsdRoutine routine, uint32_t table, uint32_t high, bool apply, uint32_t &result,
++                             uint32_t *finalA0 = nullptr, uint32_t *finalA1 = nullptr)
++        {
++            struct Bus
++            {
++                IopMemory &memory;
++                uint64_t &cycles;
++                uint64_t start; // the routine's first instruction runs at this cycle
++                bool apply;
++                uint32_t lw(uint32_t address) { return memory.read32(address); }
++                uint32_t io16(uint32_t address, uint32_t index)
++                {
++                    if (apply)
++                        cycles = start + index;
++                    return memory.read16(address);
++                }
++                void io16(uint32_t address, uint16_t value, uint32_t index)
++                {
++                    if (!apply)
++                        return;
++                    cycles = start + index;
++                    memory.write16(address, value);
++                }
++            } bus{memory, totalCycles, totalCycles, apply};
++            struct
++            {
++                std::array<uint32_t, 32> gpr;
++                uint32_t hi, lo;
++            } regs{cpu.gpr, cpu.hi, cpu.lo};
++            const uint32_t count = hle::libsdRun(routine, regs, bus, table, high, 0u);
++            result = regs.gpr[2];
++            if (finalA0)
++                *finalA0 = regs.gpr[4];
++            if (finalA1)
++                *finalA1 = regs.gpr[5];
++            if (apply)
++            {
++                cpu.gpr = regs.gpr;
++                cpu.hi = regs.hi;
++                cpu.lo = regs.lo;
++                totalCycles = bus.start + count;
++            }
++            return count;
++        }
++
++        bool runLibsdHle(CpuState &cpu, uint32_t target)
++        {
++            const int mode = libsdHleMode();
++            if (mode == 0 || libsdVerify.active)
++                return false;
++            if (libsdTargets.generation != imports.generation())
++            {
++                libsdTargets.routines.clear();
++                libsdTargets.generation = imports.generation();
++            }
++            auto known = libsdTargets.routines.find(target);
++            if (known == libsdTargets.routines.end())
++            {
++                uint32_t table = 0, high = 0;
++                const hle::LibsdRoutine routine = hle::libsdRoutineAt(memory.ram().data(), target, table, high);
++                known = libsdTargets.routines.emplace(target, LibsdTargets::Entry{routine, table, high}).first;
++                if (routine != hle::LibsdRoutine::None)
++                {
++                    char line[96];
++                    std::snprintf(line, sizeof(line), "[IOP] native libsd routine %d at 0x%X (table 0x%X)",
++                                  static_cast<int>(routine), target, table);
++                    log(LogLevel::Info, line);
++                }
++            }
++            const hle::LibsdRoutine routine = known->second.routine;
++            if (routine == hle::LibsdRoutine::None)
++                return false;
++            const uint32_t table = known->second.table;
++            const uint32_t high = known->second.high;
++            if (mode == 2)
++            {
++                // Let the guest run; compare its v0 with the native result at its return
++                uint32_t expected = 0;
++                libsdExecute(cpu, routine, table, high, false, expected, &libsdVerify.expectedA0, &libsdVerify.expectedA1);
++                libsdVerify.active = true;
++                libsdVerify.ra = cpu.gpr[31];
++                libsdVerify.sp = cpu.gpr[29];
++                libsdVerify.expected = expected;
++                libsdVerify.routine = routine;
++                return false;
++            }
++            // The stub (jr ra; li zero, n) counts as one instruction, then the routine's
++            ++totalInstructions;
++            ++totalCycles;
++            uint32_t result = 0;
++            const uint32_t count = libsdExecute(cpu, routine, table, high, true, result);
++            totalInstructions += count;
++            cpu.pc = cpu.gpr[31];
++            cpu.branchPending = false;
++            ++libsdNativeCalls;
++            return true;
++        }
++
++        void finishLibsdVerify(const CpuState &cpu)
++        {
++            libsdVerify.active = false;
++            const int r = static_cast<int>(libsdVerify.routine);
++            ++libsdVerify.checked[r];
++            const bool getter = libsdVerify.routine == hle::LibsdRoutine::GetParam || libsdVerify.routine == hle::LibsdRoutine::GetAddr;
++            // a0/a1 end up holding the register address (or derived values) in every routine
++            const bool registersMatch = cpu.gpr[4] == libsdVerify.expectedA0 && cpu.gpr[5] == libsdVerify.expectedA1;
++            const bool resultMatch = cpu.gpr[2] == libsdVerify.expected;
++            const bool mismatch = !registersMatch || (!getter && !resultMatch);
++            if (mismatch)
++                ++libsdVerify.mismatched[r];
++            else if (!resultMatch)
++                ++libsdVerify.readsLater[r];
++            static uint32_t s_reports = 0;
++            uint64_t total = 0;
++            for (uint64_t value : libsdVerify.checked)
++                total += value;
++            if ((mismatch && s_reports < 40u) || total % 50000u == 1u)
++            {
++                if (mismatch)
++                    ++s_reports;
++                char line[320];
++                std::snprintf(line, sizeof(line),
++                              "[IOP hle verify] libsd %s: a0 %08x/%08x a1 %08x/%08x v0 %08x/%08x (guest/native); checked set/get param %llu/%llu, set/get addr %llu/%llu; "
++                              "mismatched %llu/%llu/%llu/%llu; getter read later %llu/%llu",
++                              mismatch ? "MISMATCH" : "ok", cpu.gpr[4], libsdVerify.expectedA0, cpu.gpr[5], libsdVerify.expectedA1, cpu.gpr[2], libsdVerify.expected,
++                              (unsigned long long)libsdVerify.checked[1], (unsigned long long)libsdVerify.checked[2],
++                              (unsigned long long)libsdVerify.checked[3], (unsigned long long)libsdVerify.checked[4],
++                              (unsigned long long)libsdVerify.mismatched[1], (unsigned long long)libsdVerify.mismatched[2],
++                              (unsigned long long)libsdVerify.mismatched[3], (unsigned long long)libsdVerify.mismatched[4],
++                              (unsigned long long)libsdVerify.readsLater[2], (unsigned long long)libsdVerify.readsLater[4]);
++                log(LogLevel::Info, line);
++            }
++        }
++
+         void finishEaMixerVerify()
+         {
+             eaMixerVerify.active = false;
+@@ -654,6 +856,350 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
++        // Native EA voice loop body (hle::eaVoiceIteration), one voice per call from the loop
++        // head; iterations that call the driver's 0x54F88 stay interpreted. Every SPU2 access
++        // happens at the IOP cycle the interpreter reaches it, and the iteration is charged the
++        // instructions the guest path takes. An interrupt the interpreter would take inside the
++        // iteration (SPU2/DMA completion found by the per-instruction service) is taken after it.
++        // PS2X_IOP_EAVOICES=0 (or PS2X_IOP_HLE=0) runs the guest code; PS2X_IOP_HLE=verify runs
++        // it too, recording its SPU2 accesses, and then replays the native iteration on the entry
++        // state: registers, the memory it reads and writes (the whole RAM every 256 checks) and
++        // the SPU2 accesses with their values and cycles must come out identical.
++        struct EaVoiceTargets
++        {
++            uint32_t generation = 0;
++            bool ready = false;
++            uint32_t target[4] = {}; // the libsd routines its stubs reach
++            hle::EaVoiceLibsd libsd{};
++            uint64_t native = 0, driver = 0;
++        } eaVoice;
++        struct EaVoiceVerify
++        {
++            bool active = false;
++            bool foreign = false; // other code ran inside the interpreted iteration
++            bool full = false;
++            const CpuState *cpu = nullptr;
++            CpuState entry{};
++            uint64_t startCycles = 0, startInstructions = 0;
++            struct Range
++            {
++                uint32_t address, size, offset; // physical, into bytes
++            };
++            std::vector<Range> ranges;
++            std::vector<uint8_t> bytes;
++            std::vector<uint8_t> ram; // full entry RAM (every 256 checks)
++            std::vector<Spu2::Access> trace;
++            uint64_t checked = 0, mismatched = 0, foreignChecks = 0, driver = 0;
++            uint32_t reports = 0;
++        } eaVoiceVerify;
++
++        static int eaVoiceMode()
++        {
++            static const int mode = []
++            {
++                const char *only = std::getenv("PS2X_IOP_EAVOICES");
++                if (only && only[0] == '0')
++                    return 0;
++                const char *env = std::getenv("PS2X_IOP_HLE");
++                if (env && env[0] == '0')
++                    return 0;
++                if (env && std::strcmp(env, "verify") == 0)
++                    return 2;
++                return 1;
++            }();
++            return mode;
++        }
++
++        // The loop and the four libsd routines it reaches through its import stubs, word for word.
++        bool eaVoiceReady()
++        {
++            const uint8_t *ram = memory.ram().data();
++            if (eaVoice.generation != imports.generation())
++            {
++                eaVoice.generation = imports.generation();
++                eaVoice.ready = false;
++                if (!hle::eaVoiceLoopMatches(ram))
++                    return false;
++                bool ok = true;
++                for (int i = 0; i < 4 && ok; ++i)
++                {
++                    const auto call = imports.decode(hle::kEaVoiceStubs[i]);
++                    ok = call && iequals(call->library, "libsd") && call->ordinal == hle::kEaVoiceStubExports[i];
++                    const uint32_t target = ok ? imports.resolve(call->library, call->ordinal, call->version) : 0u;
++                    eaVoice.target[i] = target;
++                    ok = ok && target != 0u &&
++                         hle::libsdRoutineAt(ram, target, eaVoice.libsd.table[i], eaVoice.libsd.high[i]) == hle::kEaVoiceStubRoutines[i];
++                }
++                eaVoice.ready = ok;
++                char line[128];
++                std::snprintf(line, sizeof(line), "[IOP] EA voice loop at 0x%X: %s (libsd table 0x%X)", hle::kEaVoiceLoopAddress,
++                              ok ? (eaVoiceMode() == 2 ? "verifying" : "native") : "libsd not as expected, interpreted", eaVoice.libsd.table[0]);
++                log(LogLevel::Info, line);
++            }
++            return eaVoice.ready;
++        }
++
++        // Guest machine for hle::eaVoiceIteration: the IOP itself (SPU2 accesses at their cycle).
++        struct EaVoiceBus
++        {
++            IopMemory &memory;
++            uint64_t &cycles;
++            uint64_t start;
++            uint32_t lw(uint32_t address) { return memory.read32(address); }
++            uint32_t lhu(uint32_t address) { return memory.read16(address); }
++            uint32_t lbu(uint32_t address) { return memory.read8(address); }
++            void sw(uint32_t address, uint32_t value) { memory.write32(address, value); }
++            void sh(uint32_t address, uint16_t value) { memory.write16(address, value); }
++            void sb(uint32_t address, uint8_t value) { memory.write8(address, value); }
++            uint32_t io16(uint32_t address, uint32_t index)
++            {
++                cycles = start + index;
++                return memory.read16(address);
++            }
++            void io16(uint32_t address, uint16_t value, uint32_t index)
++            {
++                cycles = start + index;
++                memory.write16(address, value);
++            }
++        };
++
++        bool runEaVoiceHle(CpuState &cpu)
++        {
++            const int mode = eaVoiceMode();
++            if (mode == 0 || eaVoiceVerify.active || cpu.branchPending || cpu.pendingLoad)
++                return false;
++            const uint8_t *ram = memory.ram().data();
++            if (!eaVoiceReady())
++                return false;
++            if (cpu.gpr[19] == 0u) // each call of the update: the code is still the same
++            {
++                bool same = hle::eaVoiceLoopMatches(ram);
++                for (int i = 0; i < 4 && same; ++i)
++                {
++                    uint32_t table = 0, high = 0;
++                    same = hle::libsdRoutineAt(ram, eaVoice.target[i], table, high) == hle::kEaVoiceStubRoutines[i] &&
++                           table == eaVoice.libsd.table[i];
++                }
++                if (!same)
++                {
++                    eaVoice.generation = 0; // look again
++                    return false;
++                }
++            }
++            const uint32_t sp = cpu.gpr[29];
++            const uint32_t s1 = memory.read32(sp + 0x20u) + hle::kEaVoiceShadow;
++            const uint32_t slot = memory.read32(sp + 0x1Cu);
++            if (cpu.gpr[19] >= 48u || ((cpu.gpr[16] | sp | s1 | slot) & 3u) != 0u)
++                return false;
++            EaVoiceBus bus{memory, totalCycles, totalCycles};
++            if (hle::eaVoiceCallsDriver(cpu, bus))
++            {
++                ++(mode == 2 ? eaVoiceVerify.driver : eaVoice.driver);
++                return false;
++            }
++            if (mode == 2)
++            {
++                startEaVoiceVerify(cpu, s1, slot);
++                return false; // the interpreter runs it
++            }
++            const uint64_t start = totalCycles;
++            const uint32_t count = hle::eaVoiceIteration(cpu, bus, eaVoice.libsd);
++            totalCycles = start + count;
++            totalInstructions += count;
++            cpu.branchPending = false;
++            if (++eaVoice.native % 500000u == 0u)
++            {
++                char line[128];
++                std::snprintf(line, sizeof(line), "[IOP] EA voice loop: %llu voices native, %llu interpreted (driver call)",
++                              (unsigned long long)eaVoice.native, (unsigned long long)eaVoice.driver);
++                log(LogLevel::Info, line);
++            }
++            return true;
++        }
++
++        void startEaVoiceVerify(const CpuState &cpu, uint32_t s1, uint32_t slot)
++        {
++            EaVoiceVerify &v = eaVoiceVerify;
++            v.active = true;
++            v.foreign = false;
++            v.cpu = &cpu;
++            v.entry = cpu;
++            v.startCycles = totalCycles;
++            v.startInstructions = totalInstructions;
++            v.ranges.clear();
++            v.bytes.clear();
++            // What the iteration reads: its record, shadow, flag bytes, stack slots, libsd's table
++            // (its own words, the slot and NAX state words it writes are compared after)
++            const auto keep = [&](uint32_t address, uint32_t size)
++            {
++                const uint32_t phys = IopMemory::physicalAddress(address);
++                v.ranges.push_back({phys, size, static_cast<uint32_t>(v.bytes.size())});
++                for (uint32_t i = 0; i < size; ++i)
++                    v.bytes.push_back(memory.read8(phys + i));
++            };
++            keep(cpu.gpr[16], 8u);
++            keep(s1, 8u);
++            keep(cpu.gpr[30] - 1u, 2u);
++            keep(cpu.gpr[29] + 0x10u, 0x14u);
++            keep(eaVoice.libsd.table[0], 0x400u);
++            keep(slot, 4u);
++            keep(hle::kEaVoiceState + memory.read32(cpu.gpr[29] + 0x20u) + 0x3Cu, 4u);
++            v.full = v.checked % 256u == 0u;
++            if (v.full)
++                v.ram.assign(memory.ram().begin(), memory.ram().end());
++            v.trace.clear();
++            memory.spu2().setTrace(&v.trace);
++        }
++
++        // Replays the native iteration on the entry state, SPU2 reads answered from the trace.
++        struct EaVoiceReplayBus
++        {
++            EaVoiceVerify &v;
++            uint64_t start;
++            size_t next = 0;
++            std::vector<std::pair<uint32_t, uint8_t>> writes;
++            bool outside = false; // read memory it was not expected to
++            std::string problem;
++            uint8_t byte(uint32_t address)
++            {
++                const uint32_t phys = IopMemory::physicalAddress(address);
++                for (auto it = writes.rbegin(); it != writes.rend(); ++it)
++                    if (it->first == phys)
++                        return it->second;
++                for (const EaVoiceVerify::Range &range : v.ranges)
++                    if (phys >= range.address && phys - range.address < range.size)
++                        return v.bytes[range.offset + (phys - range.address)];
++                outside = true;
++                return 0u;
++            }
++            void put(uint32_t address, uint32_t value, uint32_t size)
++            {
++                const uint32_t phys = IopMemory::physicalAddress(address);
++                for (uint32_t i = 0; i < size; ++i)
++                    writes.emplace_back(phys + i, static_cast<uint8_t>(value >> (8u * i)));
++            }
++            uint32_t lw(uint32_t a) { return byte(a) | byte(a + 1u) << 8 | byte(a + 2u) << 16 | static_cast<uint32_t>(byte(a + 3u)) << 24; }
++            uint32_t lhu(uint32_t a) { return byte(a) | byte(a + 1u) << 8; }
++            uint32_t lbu(uint32_t a) { return byte(a); }
++            void sw(uint32_t a, uint32_t value) { put(a, value, 4u); }
++            void sh(uint32_t a, uint16_t value) { put(a, value, 2u); }
++            void sb(uint32_t a, uint8_t value) { put(a, value, 1u); }
++            const Spu2::Access *access(uint32_t address, bool write, uint32_t index)
++            {
++                const uint32_t phys = IopMemory::physicalAddress(address);
++                const Spu2::Access *recorded = next < v.trace.size() ? &v.trace[next] : nullptr;
++                ++next;
++                if (problem.empty() && (!recorded || recorded->phys != phys || recorded->write != write || recorded->cycle != start + index))
++                {
++                    char line[160];
++                    std::snprintf(line, sizeof(line), "SPU2 %s %X at +%u, guest %s %X at +%lld", write ? "write" : "read", phys, index,
++                                  recorded ? (recorded->write ? "write" : "read") : "nothing", recorded ? recorded->phys : 0u,
++                                  recorded ? static_cast<long long>(recorded->cycle - start) : -1ll);
++                    problem = line;
++                }
++                return recorded;
++            }
++            uint32_t io16(uint32_t address, uint32_t index)
++            {
++                const Spu2::Access *recorded = access(address, false, index);
++                return recorded ? recorded->value : 0u;
++            }
++            void io16(uint32_t address, uint16_t value, uint32_t index)
++            {
++                const Spu2::Access *recorded = access(address, true, index);
++                if (problem.empty() && recorded && recorded->value != value)
++                {
++                    char line[96];
++                    std::snprintf(line, sizeof(line), "SPU2 write %X = %04x at +%u, guest wrote %04x", recorded->phys, value, index, recorded->value);
++                    problem = line;
++                }
++            }
++        };
++
++        void finishEaVoiceVerify(const CpuState &cpu)
++        {
++            EaVoiceVerify &v = eaVoiceVerify;
++            v.active = false;
++            memory.spu2().setTrace(nullptr);
++            EaVoiceReplayBus bus{v, v.startCycles};
++            CpuState native = v.entry;
++            const uint32_t count = hle::eaVoiceIteration(native, bus, eaVoice.libsd);
++            std::string problem = bus.problem;
++            const auto fail = [&](const char *what)
++            {
++                if (problem.empty())
++                    problem = what;
++            };
++            if (count == 0u)
++                fail("native would call the driver");
++            if (bus.outside)
++                fail("native read memory outside the snapshot");
++            if (bus.next != v.trace.size())
++            {
++                char line[96];
++                std::snprintf(line, sizeof(line), "native made %zu SPU2 accesses, guest %zu", bus.next, v.trace.size());
++                fail(line);
++            }
++            for (uint32_t i = 0; i < 32u && problem.empty(); ++i)
++                if (native.gpr[i] != cpu.gpr[i])
++                {
++                    char line[96];
++                    std::snprintf(line, sizeof(line), "r%u %08x, guest %08x", i, native.gpr[i], cpu.gpr[i]);
++                    fail(line);
++                }
++            if (native.hi != cpu.hi || native.lo != cpu.lo || native.pc != cpu.pc)
++                fail("hi/lo/pc differ");
++            if (!v.foreign && (totalCycles - v.startCycles != count || totalInstructions - v.startInstructions != count))
++            {
++                char line[96];
++                std::snprintf(line, sizeof(line), "native %u cycles, guest %llu", count, (unsigned long long)(totalCycles - v.startCycles));
++                fail(line);
++            }
++            const uint8_t *ram = memory.ram().data();
++            for (const auto &[phys, value] : bus.writes)
++                if (problem.empty() && bus.byte(phys) != ram[phys])
++                {
++                    char line[96];
++                    std::snprintf(line, sizeof(line), "byte %X = %02x, guest %02x", phys, bus.byte(phys), ram[phys]);
++                    fail(line);
++                }
++            const auto written = [&](uint32_t phys)
++            {
++                for (const auto &entry : bus.writes)
++                    if (entry.first == phys)
++                        return true;
++                return false;
++            };
++            for (const EaVoiceVerify::Range &range : v.ranges)
++                for (uint32_t i = 0; i < range.size && problem.empty(); ++i)
++                    if (!written(range.address + i) && ram[range.address + i] != v.bytes[range.offset + i])
++                        fail("guest changed a byte native left alone");
++            if (v.full)
++                for (uint32_t i = 0; i < IopMemory::RamSize && problem.empty(); ++i)
++                    if (ram[i] != v.ram[i] && !written(i))
++                    {
++                        char line[96];
++                        std::snprintf(line, sizeof(line), "guest changed %X (native did not)", i);
++                        fail(line);
++                    }
++            ++v.checked;
++            if (v.foreign)
++                ++v.foreignChecks;
++            const bool mismatch = !problem.empty() && !v.foreign;
++            if (mismatch)
++                ++v.mismatched;
++            if ((!problem.empty() && v.reports < 40u) || v.checked % 20000u == 1u)
++            {
++                if (!problem.empty())
++                    ++v.reports;
++                char line[320];
++                std::snprintf(line, sizeof(line), "[IOP hle verify] EA voice %u (s3 %u): %s%s; totals %llu checked, %llu mismatched, %llu with other code inside, %llu left to the guest (driver call)",
++                              v.entry.gpr[19], v.entry.gpr[19], problem.empty() ? "ok" : (v.foreign ? "differs (other code ran inside): " : "MISMATCH: "), problem.c_str(),
++                              (unsigned long long)v.checked, (unsigned long long)v.mismatched, (unsigned long long)v.foreignChecks, (unsigned long long)v.driver);
++                log(LogLevel::Info, line);
++            }
++        }
++
+         bool step(CpuState &cpu)
+         {
+             if (cpu.stopped)
+@@ -672,7 +1218,11 @@ namespace ps2x::iop::detail
+                 return false;
+             }
+             if (checkInterrupt(cpu))
++            {
++                if (eaVoiceVerify.active)
++                    eaVoiceVerify.foreign = true;
+                 return true;
++            }
+             if (!traceReturns.empty())
+             {
+                 if (const auto pending = traceReturns.find(cpu.pc); pending != traceReturns.end())
+@@ -689,8 +1239,23 @@ namespace ps2x::iop::detail
+                 return true;
+             if (eaMixerVerify.active && cpu.pc == eaMixerVerify.ra && cpu.gpr[29] == eaMixerVerify.sp)
+                 finishEaMixerVerify();
++            if (libsdVerify.active && cpu.pc == libsdVerify.ra && cpu.gpr[29] == libsdVerify.sp)
++                finishLibsdVerify(cpu);
++            if (eaVoiceVerify.active)
++            {
++                if ((cpu.pc == hle::kEaVoiceLoopAddress || cpu.pc == hle::kEaVoiceLoopExit) && &cpu == eaVoiceVerify.cpu &&
++                    cpu.gpr[29] == eaVoiceVerify.entry.gpr[29] && !cpu.branchPending)
++                    finishEaVoiceVerify(cpu);
++                else if (totalCycles - eaVoiceVerify.startCycles > 4000000u) // never came back (thread gone)
++                {
++                    eaVoiceVerify.active = false;
++                    memory.spu2().setTrace(nullptr);
++                }
++            }
++            if (cpu.pc == hle::kEaVoiceLoopAddress && runEaVoiceHle(cpu))
++                return true;
+ 
+-            if (const auto import = imports.decode(cpu.pc))
++            if (IopImportRegistry::CachedImport *cachedImport = imports.decodeCached(cpu.pc))
+             {
+                 // PS2X_IOP_IMPORT_TRACE=1: log every import call (HLE or guest library) with its
+                 // arguments and result, up to 20000 lines.
+@@ -711,11 +1276,33 @@ namespace ps2x::iop::detail
+                         s_traceHi = 0xFFFFFFFFu;
+                     return true;
                  }();
++                // A guest library already reached from this stub: straight there
++                if (!s_traceImports && cachedImport->guestTarget != 0u && cachedImport->targetGeneration == imports.generation())
++                {
++                    if (runLibsdHle(cpu, cachedImport->guestTarget))
++                        return true;
++                    ++totalInstructions;
++                    ++totalCycles;
++                    cpu.pc = cachedImport->guestTarget;
++                    cpu.branchPending = false;
++                    return true;
++                }
++                const IopImportCall importCall = cachedImport->call; // dispatching may load modules (and drop the cache)
++                const IopImportCall *import = &importCall;
++                const uint32_t stubPc = cpu.pc;
                  const uint32_t traceArgs[4] = {cpu.gpr[4], cpu.gpr[5], cpu.gpr[6], cpu.gpr[7]};
                  const uint32_t traceRa = cpu.gpr[31];
 -                const uint64_t importStart = __rdtsc();
@@ -2006,10 +2804,27 @@ index 423e0f0..f6fe2b8 100644
                  const ImportDisposition disposition = dispatchImport(*import, cpu);
 -                g_iopStatImportTicks += __rdtsc() - importStart;
 +                g_iopStatImportTicks += ps2xStatTicks() - importStart;
++                if (disposition == ImportDisposition::JumpToGuest && !isHleLibrary(import->library))
++                {
++                    if (IopImportRegistry::CachedImport *again = imports.decodeCached(stubPc))
++                    {
++                        again->guestTarget = cpu.pc;
++                        again->targetGeneration = imports.generation();
++                    }
++                }
                  // PS2X_IOP_IMPORT_TRACE_SKIP="thbase,thevent": libraries left out of the trace.
                  static const std::string s_traceSkip = []
                  {
-@@ -802,6 +804,10 @@ namespace ps2x::iop::detail
+@@ -761,6 +1348,8 @@ namespace ps2x::iop::detail
+         {
+             CpuState *previous = activeCpu;
+             activeCpu = &cpu;
++            if (eaVoiceVerify.active && &cpu != eaVoiceVerify.cpu)
++                eaVoiceVerify.foreign = true;
+             const uint64_t start = totalInstructions;
+             // PS2X_IOP_PC_STATS=1: sample the IOP pc every 1024 instructions, print the hottest
+             // addresses every 5 s (which IRX code keeps the IOP busy).
+@@ -802,6 +1391,10 @@ namespace ps2x::iop::detail
                  }
                  if (!step(cpu))
                      break;
@@ -2020,7 +2835,7 @@ index 423e0f0..f6fe2b8 100644
                  if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                      servicePendingDmaInterrupts();
                  if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
-@@ -976,10 +982,19 @@ namespace ps2x::iop::detail
+@@ -976,10 +1569,19 @@ namespace ps2x::iop::detail
          // interrupt (line 9), delivered through the same path as the SPU2 DMA interrupts.
          void serviceSpu2()
          {
@@ -2040,7 +2855,7 @@ index 423e0f0..f6fe2b8 100644
          }
  
          // DEV9 (network adapter): received frames and register writes raise the SPEED interrupt
-@@ -1029,15 +1044,22 @@ namespace ps2x::iop::detail
+@@ -1029,15 +1631,22 @@ namespace ps2x::iop::detail
          {
              try
              {
@@ -2066,7 +2881,7 @@ index 423e0f0..f6fe2b8 100644
                      }
                      servicePendingDmaInterrupts();
                      servicePendingGuestCallbacks();
-@@ -1059,9 +1081,9 @@ namespace ps2x::iop::detail
+@@ -1059,9 +1668,9 @@ namespace ps2x::iop::detail
                          continue;
                      }
                      const uint64_t before = totalCycles;
@@ -2078,7 +2893,7 @@ index 423e0f0..f6fe2b8 100644
                      kernel.endTimeslice(*next, kThreadReturnSentinel);
                      if (totalCycles == before)
                          ++totalCycles;
-@@ -1221,6 +1243,9 @@ namespace ps2x::iop::detail
+@@ -1221,6 +1830,9 @@ namespace ps2x::iop::detail
          uint32_t nextModuleId = 1;
          uint32_t moduleCursor = kModuleLoadBase;
          uint64_t totalCycles = 0;
@@ -2088,7 +2903,7 @@ index 423e0f0..f6fe2b8 100644
          uint64_t totalInstructions = 0;
          uint64_t eeCycleCarry = 0;
          CpuState *activeCpu = nullptr;
-@@ -1296,9 +1321,9 @@ namespace ps2x::iop::detail
+@@ -1296,9 +1908,9 @@ namespace ps2x::iop::detail
          const uint64_t iopCycles = total / 8u;
          m_impl->eeCycleCarry = total % 8u;
          ++g_iopStatRunCalls;
@@ -2100,12 +2915,501 @@ index 423e0f0..f6fe2b8 100644
      }
  
      RpcResult IopEmulator::handleRpc(const RpcRequest &request)
+diff --git a/ps2xIOP/src/emulator/iop_hle_routines.h b/ps2xIOP/src/emulator/iop_hle_routines.h
+index ed38992..cc6c45a 100644
+--- a/ps2xIOP/src/emulator/iop_hle_routines.h
++++ b/ps2xIOP/src/emulator/iop_hle_routines.h
+@@ -7,6 +7,7 @@
+ 
+ #include <cstdint>
+ #include <cstring>
++#include <iterator>
+ 
+ namespace ps2x::iop::detail::hle
+ {
+@@ -124,4 +125,476 @@ namespace ps2x::iop::detail::hle
+             }
+         }
+     }
++
++    // NBA Street V3's libsd.irx (loaded at 0x47500): the parameter/address accessors EA's sound
++    // driver calls for every voice on every update (~90% of the IOP's time went to them and to
++    // their caller). Signature words exclude the relocated lui/lw pair that loads the register
++    // table pointer; the table address is read back from those two instructions.
++    enum class LibsdRoutine : uint8_t
++    {
++        None,
++        SetParam, // sceSdSetParam, export 5
++        GetParam, // sceSdGetParam, export 6
++        SetAddr,  // sceSdSetAddr, export 9
++        GetAddr,  // sceSdGetAddr, export 10
++    };
++    struct LibsdRoutineInfo
++    {
++        LibsdRoutine routine;
++        uint32_t address;
++        uint32_t luiAddress; // lui (relocated high half of the register table)
++        uint32_t lwAddress;  // lw (relocated low half)
++        const GuestWord *signature;
++        size_t signatureWords;
++    };
++    constexpr GuestWord kLibsdSetParamSignature[] = {
++        {0x4AB60u, 0x30860001u}, {0x4AB64u, 0x30830080u}, {0x4AB68u, 0x0003182Bu}, {0x4AB6Cu, 0x00031140u}, {0x4AB70u, 0x00431023u}, {0x4AB74u, 0x00021080u}, {0x4AB78u, 0x00431023u}, {0x4AB7Cu, 0x000210C0u}, {0x4AB80u, 0x24030400u}, {0x4AB84u, 0x00621823u}, {0x4AB88u, 0x00C30018u}, {0x4AB8Cu, 0x00041182u}, {0x4AB90u, 0x304203FCu}, {0x4AB94u, 0x3084003Eu}, {0x4AB98u, 0x000420C0u}, {0x4ABA0u, 0x00220821u}, {0x4ABA8u, 0x00003812u}, {0x4ABACu, 0x00471021u}, {0x4ABB0u, 0x00441021u}, {0x4ABB4u, 0x03E00008u}, {0x4ABB8u, 0xA4450000u}};
++    constexpr GuestWord kLibsdGetParamSignature[] = {
++        {0x4ABBCu, 0x30850001u}, {0x4ABC0u, 0x30830080u}, {0x4ABC4u, 0x0003182Bu}, {0x4ABC8u, 0x00031140u}, {0x4ABCCu, 0x00431023u}, {0x4ABD0u, 0x00021080u}, {0x4ABD4u, 0x00431023u}, {0x4ABD8u, 0x000210C0u}, {0x4ABDCu, 0x24030400u}, {0x4ABE0u, 0x00621823u}, {0x4ABE4u, 0x00A30018u}, {0x4ABE8u, 0x00041182u}, {0x4ABECu, 0x304203FCu}, {0x4ABF0u, 0x3084003Eu}, {0x4ABF4u, 0x000420C0u}, {0x4ABFCu, 0x00220821u}, {0x4AC04u, 0x00003012u}, {0x4AC08u, 0x00461021u}, {0x4AC0Cu, 0x00822021u}, {0x4AC10u, 0x94820000u}, {0x4AC14u, 0x03E00008u}, {0x4AC18u, 0x00000000u}};
++    constexpr GuestWord kLibsdSetAddrSignature[] = {
++        {0x4AC8Cu, 0x00A03021u}, {0x4AC90u, 0x00041182u}, {0x4AC94u, 0x304203FCu}, {0x4AC98u, 0x30830001u}, {0x4ACA0u, 0x00A22821u}, {0x4ACA8u, 0x00031A80u}, {0x4ACACu, 0x00A32821u}, {0x4ACB0u, 0x3083003Eu}, {0x4ACB4u, 0x00031040u}, {0x4ACB8u, 0x00431021u}, {0x4ACBCu, 0x00021040u}, {0x4ACC0u, 0x00A22821u}, {0x4ACC4u, 0x00061442u}, {0x4ACC8u, 0x3084FF00u}, {0x4ACCCu, 0xA4A20000u}, {0x4ACD0u, 0x24021D00u}, {0x4ACD4u, 0x10820004u}, {0x4ACD8u, 0x24A50002u}, {0x4ACDCu, 0x00061042u}, {0x4ACE0u, 0x3042FFF8u}, {0x4ACE4u, 0xA4A20000u}, {0x4ACE8u, 0x03E00008u}, {0x4ACECu, 0x00000000u}};
++    constexpr GuestWord kLibsdGetAddrSignature[] = {
++        {0x4ACF0u, 0x3C070001u}, {0x4ACF4u, 0x00041182u}, {0x4ACF8u, 0x304203FCu}, {0x4ACFCu, 0x30830001u}, {0x4AD00u, 0x00031A80u}, {0x4AD08u, 0x00A22821u}, {0x4AD10u, 0x34E7FFFFu}, {0x4AD14u, 0x00A32821u}, {0x4AD18u, 0x3083003Eu}, {0x4AD1Cu, 0x00031040u}, {0x4AD20u, 0x00431021u}, {0x4AD24u, 0x00021040u}, {0x4AD28u, 0x00A22821u}, {0x4AD2Cu, 0x94A20000u}, {0x4AD30u, 0x3084FF00u}, {0x4AD34u, 0x00023440u}, {0x4AD38u, 0x24021D00u}, {0x4AD3Cu, 0x10820012u}, {0x4AD40u, 0x00000000u}, {0x4AD44u, 0x94A20002u}, {0x4AD48u, 0x00000000u}, {0x4AD4Cu, 0x00023840u}, {0x4AD50u, 0x24022100u}, {0x4AD54u, 0x10820003u}, {0x4AD58u, 0x24022200u}, {0x4AD5Cu, 0x1482000Au}, {0x4AD60u, 0x00000000u}, {0x4AD64u, 0x94A20000u}, {0x4AD68u, 0x94A30002u}, {0x4AD6Cu, 0x00021440u}, {0x4AD70u, 0x14C20003u}, {0x4AD74u, 0x00031840u}, {0x4AD78u, 0x14E30003u}, {0x4AD7Cu, 0x00000000u}, {0x4AD80u, 0x00403021u}, {0x4AD84u, 0x00603821u}, {0x4AD88u, 0x03E00008u}, {0x4AD8Cu, 0x00C71025u}};
++    constexpr LibsdRoutineInfo kLibsdRoutines[] = {
++        {LibsdRoutine::SetParam, 0x4AB60u, 0x4AB9Cu, 0x4ABA4u, kLibsdSetParamSignature, std::size(kLibsdSetParamSignature)},
++        {LibsdRoutine::GetParam, 0x4ABBCu, 0x4ABF8u, 0x4AC00u, kLibsdGetParamSignature, std::size(kLibsdGetParamSignature)},
++        {LibsdRoutine::SetAddr, 0x4AC8Cu, 0x4AC9Cu, 0x4ACA4u, kLibsdSetAddrSignature, std::size(kLibsdSetAddrSignature)},
++        {LibsdRoutine::GetAddr, 0x4ACF0u, 0x4AD04u, 0x4AD0Cu, kLibsdGetAddrSignature, std::size(kLibsdGetAddrSignature)},
++    };
++
++    // The routine at a guest address (None unless every signature word matches and the relocated
++    // pair is still a lui/lw of the expected registers); table = the register table pointer array.
++    inline LibsdRoutine libsdRoutineAt(const uint8_t *ram, uint32_t address, uint32_t &table, uint32_t &high)
++    {
++        const auto word = [ram](uint32_t at)
++        {
++            uint32_t value;
++            std::memcpy(&value, ram + (at & 0x1FFFFFu), sizeof(value));
++            return value;
++        };
++        for (const LibsdRoutineInfo &info : kLibsdRoutines)
++        {
++            if ((address & 0x1FFFFFu) != info.address)
++                continue;
++            for (size_t i = 0; i < info.signatureWords; ++i)
++                if (word(info.signature[i].address) != info.signature[i].value)
++                    return LibsdRoutine::None;
++            const uint32_t lui = word(info.luiAddress);
++            const uint32_t lw = word(info.lwAddress);
++            if ((lui & 0xFFE00000u) != 0x3C000000u || (lw & 0xFC000000u) != 0x8C000000u)
++                return LibsdRoutine::None;
++            high = (lui & 0xFFFFu) << 16;
++            table = high + static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(lw & 0xFFFFu)));
++            return info.routine;
++        }
++        return LibsdRoutine::None;
++    }
++
++    // The four libsd routines above, generic over the machine they run on. Regs has gpr[32], hi
++    // and lo; Bus has lw(address) for RAM and io16(address, index) / io16(address, value, index)
++    // for the routine's one register access per half word, index = how many instructions of the
++    // caller's sequence (base + the routine's own) ran before it, i.e. the IOP cycle it happens
++    // at relative to the caller's start. Returns the instructions the guest routine executes.
++    template <class Regs, class Bus>
++    uint32_t libsdRun(LibsdRoutine routine, Regs &c, Bus &bus, uint32_t table, uint32_t high, uint32_t base)
++    {
++        auto &r = c.gpr;
++        uint32_t a0 = r[4];
++        const auto stride = [&](uint32_t core)
++        {
++            // v1 = 0x400 - 984 * (a0 & 0x80 != 0); hi:lo = core * v1
++            const uint32_t f = (a0 & 0x80u) ? 1u : 0u;
++            r[2] = ((((f << 5) - f) << 2) - f) << 3;
++            r[3] = 0x400u - r[2];
++            const int64_t product = static_cast<int64_t>(static_cast<int32_t>(core)) * static_cast<int32_t>(r[3]);
++            c.lo = static_cast<uint32_t>(product);
++            c.hi = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32);
++        };
++        switch (routine)
++        {
++        case LibsdRoutine::SetParam:
++            r[6] = a0 & 1u;
++            stride(r[6]);
++            r[2] = (a0 >> 6) & 0x3FCu;
++            r[4] = (a0 & 0x3Eu) << 3;
++            r[1] = high + r[2]; // at: the lui's half + index, as in the guest
++            r[2] = bus.lw(table + r[2]);
++            r[7] = c.lo;
++            r[2] = r[2] + r[7] + r[4];
++            bus.io16(r[2], static_cast<uint16_t>(r[5]), base + 22u);
++            return 23u;
++        case LibsdRoutine::GetParam:
++            r[5] = a0 & 1u;
++            stride(r[5]);
++            r[2] = (a0 >> 6) & 0x3FCu;
++            r[4] = (a0 & 0x3Eu) << 3;
++            r[1] = high + r[2];
++            r[2] = bus.lw(table + r[2]);
++            r[6] = c.lo;
++            r[2] += r[6];
++            r[4] += r[2];
++            r[2] = bus.io16(r[4], base + 21u);
++            return 24u;
++        case LibsdRoutine::SetAddr:
++        {
++            r[6] = r[5];
++            r[2] = (a0 >> 6) & 0x3FCu;
++            r[3] = a0 & 1u;
++            r[5] = bus.lw(table + r[2]);
++            r[3] <<= 10;
++            r[5] += r[3];
++            r[3] = a0 & 0x3Eu;
++            r[2] = ((r[3] << 1) + r[3]) << 1;
++            r[5] += r[2];
++            r[2] = r[6] >> 17;
++            r[4] = a0 & 0xFF00u;
++            bus.io16(r[5], static_cast<uint16_t>(r[2]), base + 16u);
++            r[2] = 0x1D00u;
++            const uint32_t reg = r[5];
++            r[5] += 2u;
++            if (r[4] == 0x1D00u)
++                return 22u;
++            r[2] = (r[6] >> 1) & 0xFFF8u;
++            bus.io16(reg + 2u, static_cast<uint16_t>(r[2]), base + 22u);
++            return 25u;
++        }
++        case LibsdRoutine::GetAddr:
++        {
++            r[7] = 0x1FFFFu;
++            r[2] = (a0 >> 6) & 0x3FCu;
++            r[3] = (a0 & 1u) << 10;
++            r[5] = bus.lw(table + r[2]) + r[3];
++            r[3] = a0 & 0x3Eu;
++            r[2] = ((r[3] << 1) + r[3]) << 1;
++            r[5] += r[2];
++            r[2] = bus.io16(r[5], base + 15u);
++            r[4] = a0 & 0xFF00u;
++            r[6] = r[2] << 17;
++            uint32_t count = 23u;
++            if (r[4] != 0x1D00u)
++            {
++                r[2] = bus.io16(r[5] + 2u, base + 21u);
++                r[7] = r[2] << 1;
++                uint32_t reread = 0; // index of the second read (0: none)
++                if (r[4] == 0x2100u)
++                    reread = 27u;
++                else if (r[4] == 0x2200u)
++                    reread = 29u;
++                else
++                    count = 31u;
++                if (reread != 0u)
++                {
++                    const uint32_t first = bus.io16(r[5], base + reread) << 17;
++                    const uint32_t second = bus.io16(r[5] + 2u, base + reread + 1u) << 1;
++                    r[2] = first;
++                    r[3] = second;
++                    if (r[6] != first || r[7] != second)
++                    {
++                        if (r[6] != first)
++                        {
++                            r[6] = first;
++                            r[7] = second;
++                        }
++                        count = reread + 9u;
++                    }
++                    else
++                        count = reread + 11u;
++                }
++            }
++            r[2] = r[6] | r[7];
++            return count;
++        }
++        case LibsdRoutine::None:
++            break;
++        }
++        return 0u;
++    }
++
++    // NBA Street V3's EA sound driver (snddrv.irx at 0x4CF00): the per-voice body of its update
++    // (0x55738-0x55A68, 48 voices a call; ~half the IOP's time in a match). For voice s3 it
++    // compares the wanted state (record at s0, 8 bytes: start address/flags, pitch, volume L/R)
++    // with the shadow of what the SPU2 has (s1), writes what changed through libsd
++    // (sceSdSetParam/GetParam/SetAddr/GetAddr), accumulates key-on (0x10/0x14(sp)) and key-off
++    // (s6/s7) bits, and reads the voice's NAX back. Iterations whose volume byte changed (or
++    // flagged in fp) call the driver's own 0x54F88: those are left to the interpreter.
++    constexpr uint32_t kEaVoiceLoopAddress = 0x00055738u;
++    constexpr uint32_t kEaVoiceLoopExit = 0x00055A6Cu;
++    constexpr uint32_t kEaVoiceLoopEnd = 0x00055A6Cu; // signature: [address, end)
++    // The libsd import stubs it calls (jr ra; addiu zero, zero, export).
++    constexpr uint32_t kEaVoiceStubs[4] = {0x000575FCu, 0x00057604u, 0x00057614u, 0x0005761Cu};
++    constexpr LibsdRoutine kEaVoiceStubRoutines[4] = {LibsdRoutine::SetParam, LibsdRoutine::GetParam, LibsdRoutine::SetAddr, LibsdRoutine::GetAddr};
++    constexpr uint32_t kEaVoiceStubExports[4] = {5u, 6u, 9u, 10u};
++    constexpr uint32_t kEaVoiceShadow = 0x0005DDB8u; // + 0x20(sp): the SPU2-side copy of each voice
++    constexpr uint32_t kEaVoiceState = 0x0005E038u;  // + 0x20(sp) + 0x3C: last record word written
++    // Every word of the loop as relocated at 0x4CF00 (jal/j targets included).
++    constexpr uint32_t kEaVoiceLoopWords[] = {
++        0x3C022AAAu, 0x3442AAABu, 0x02620018u, 0x0000A021u, 0x00131FC3u, 0x3C050006u, 0x8FA60020u, 0x00001010u,
++        0x00021083u, 0x00431023u, 0x00022040u, 0x00822021u, 0x000420C0u, 0x02642023u, 0x00042040u, 0x2A630018u,
++        0x38630001u, 0x24A2DDB8u, 0x00C28821u, 0x96050004u, 0x96220004u, 0x00000000u, 0x10A20007u, 0x00839025u,
++        0x36440200u, 0x0C015D7Fu, 0x3084FFFFu, 0x96020004u, 0x00000000u, 0xA6220004u, 0x82030006u, 0x82220006u,
++        0x00000000u, 0x14620005u, 0x00000000u, 0x93C2FFFFu, 0x00000000u, 0x10400005u, 0x00000000u, 0x02002021u,
++        0x02602821u, 0x0C0153E2u, 0x00003021u, 0x82030007u, 0x82220007u, 0x00000000u, 0x14620005u, 0x02002021u,
++        0x93C20000u, 0x00000000u, 0x10400004u, 0x00000000u, 0x02602821u, 0x0C0153E2u, 0x24060001u, 0x8E050000u,
++        0x8E220000u, 0x00000000u, 0x10A20072u, 0x3C02007Fu, 0x3442FFFFu, 0x00A21024u, 0x1040005Du, 0xAFA20018u,
++        0x36440500u, 0x0C015D81u, 0x3084FFFFu, 0x14400046u, 0x36442040u, 0x8FA50018u, 0x0C015D85u, 0x3084FFFFu,
++        0x36442140u, 0x3084FFFFu, 0x0C015D85u, 0x24055000u, 0x36440300u, 0x3084FFFFu, 0x0C015D7Fu, 0x2405000Fu,
++        0x36440400u, 0x3084FFFFu, 0x0C015D7Fu, 0x24050005u, 0x82030006u, 0x00000000u, 0x04600005u, 0x3244FFFFu,
++        0x000311C0u, 0x00431021u, 0x0801562Cu, 0x3045FFFFu, 0x000311C0u, 0x30457F80u, 0x0C015D7Fu, 0x00000000u,
++        0x92020006u, 0x36430100u, 0xA3C0FFFFu, 0xA2220006u, 0x82050007u, 0x00000000u, 0x04A00005u, 0x3064FFFFu,
++        0x000511C0u, 0x00451021u, 0x0801563Cu, 0x3045FFFFu, 0x000511C0u, 0x30457F80u, 0x0C015D7Fu, 0x24140001u,
++        0x24050000u, 0x24040001u, 0x00133680u, 0x04C10004u, 0x00000000u, 0x02641804u, 0x10000007u, 0x00001021u,
++        0x10C00004u, 0x02651804u, 0x00133023u, 0x00C43006u, 0x00661825u, 0x02641004u, 0x8FA60010u, 0x8FA70014u,
++        0x92040007u, 0x00C23025u, 0x00E33825u, 0xAFA60010u, 0xAFA70014u, 0xA3C00000u, 0xA2240007u, 0x8E020000u,
++        0x0801567Bu, 0xAE220000u, 0x24070000u, 0x24060001u, 0x00132680u, 0x04810004u, 0x00000000u, 0x02661804u,
++        0x10000007u, 0x00001021u, 0x10800004u, 0x02671804u, 0x00132023u, 0x00862006u, 0x00641825u, 0x02661004u,
++        0x02C2B025u, 0x02E3B825u, 0x0801567Bu, 0x24140001u, 0x24070000u, 0x24060001u, 0x00132680u, 0x04810004u,
++        0x00000000u, 0x02661804u, 0x10000007u, 0x00001021u, 0x10800004u, 0x02671804u, 0x00132023u, 0x00862006u,
++        0x00641825u, 0x02661004u, 0x02C2B025u, 0x02E3B825u, 0xAE250000u, 0x36442240u, 0x3084FFFFu, 0x3C070006u,
++        0x24E7E038u, 0x8FA50020u, 0x8E030000u, 0x00E51021u, 0x0C015D87u, 0xAC43003Cu, 0x8FA6001Cu, 0x12800004u,
++        0xACC20000u, 0x8FA70018u, 0x08015690u, 0xACC70000u, 0x2C425040u, 0x10400004u, 0x00000000u, 0x8FA2001Cu,
++        0x00000000u, 0xAC400000u, 0x27DE0002u, 0x26100008u, 0x26730001u, 0x2A620030u, 0x8FA3001Cu, 0x8FA40020u,
++        0x24630008u, 0x24840008u, 0xAFA3001Cu, 0x1440FF34u, 0xAFA40020u};
++    static_assert(std::size(kEaVoiceLoopWords) == (kEaVoiceLoopEnd - kEaVoiceLoopAddress) / 4u);
++
++    inline bool eaVoiceLoopMatches(const uint8_t *ram)
++    {
++        return std::memcmp(ram + kEaVoiceLoopAddress, kEaVoiceLoopWords, sizeof(kEaVoiceLoopWords)) == 0;
++    }
++
++    struct EaVoiceLibsd
++    {
++        uint32_t table[4]; // per kEaVoiceStubRoutines entry: libsd's register table and lui half
++        uint32_t high[4];
++    };
++
++    // True when the iteration at the loop head calls the driver's 0x54F88 (left to the guest).
++    template <class Regs, class Bus>
++    bool eaVoiceCallsDriver(const Regs &c, Bus &bus)
++    {
++        const uint32_t s0 = c.gpr[16], fp = c.gpr[30];
++        const uint32_t s1 = bus.lw(c.gpr[29] + 0x20u) + kEaVoiceShadow;
++        const auto s8 = [&](uint32_t address) { return static_cast<int8_t>(bus.lbu(address)); };
++        return s8(s0 + 6u) != s8(s1 + 6u) || bus.lbu(fp - 1u) != 0u || s8(s0 + 7u) != s8(s1 + 7u) || bus.lbu(fp) != 0u;
++    }
++
++    // One iteration from the loop head, with the guest's exact effects on registers (pc ends at
++    // the next head or kEaVoiceLoopExit), memory and SPU2 (Bus::io16 index = cycle offset from the
++    // head). Bus also has lbu/lhu/sb/sh/sw. Returns the instructions the interpreter executes, 0
++    // (nothing done) if the iteration calls the driver.
++    template <class Regs, class Bus>
++    uint32_t eaVoiceIteration(Regs &c, Bus &bus, const EaVoiceLibsd &libsd)
++    {
++        if (eaVoiceCallsDriver(c, bus))
++            return 0u;
++        enum : uint32_t { v0 = 2, v1 = 3, a0 = 4, a1 = 5, a2 = 6, a3 = 7, s0 = 16, s1 = 17, s2 = 18, s3 = 19, s4 = 20, s6 = 22, s7 = 23, sp = 29, fp = 30, ra = 31 };
++        auto &r = c.gpr;
++        uint32_t n = 0;
++        const auto call = [&](int which, uint32_t returnAddress, uint32_t before)
++        {
++            // jal + delay slot + the stub's own instruction, then the routine
++            r[ra] = returnAddress;
++            n += before;
++            n += libsdRun(kEaVoiceStubRoutines[which], c, bus, libsd.table[which], libsd.high[which], n);
++        };
++        const auto sext8 = [](uint32_t value) { return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(value))); };
++        // v1:v0 = 1 << s3 as a 64-bit mask; one, zero and shift are the registers the guest uses
++        const auto bit64 = [&](uint32_t one, uint32_t zero, uint32_t shift)
++        {
++            r[zero] = 0u;
++            r[one] = 1u;
++            r[shift] = r[s3] << 26;
++            n += 5u;
++            const uint32_t k = r[s3] & 31u;
++            if (static_cast<int32_t>(r[shift]) < 0)
++            {
++                r[v1] = r[one] << k;
++                r[v0] = 0u;
++                n += 3u;
++                return;
++            }
++            r[v1] = r[zero] << k;
++            n += 2u;
++            if (r[shift] != 0u)
++            {
++                r[shift] = 0u - r[s3];
++                r[shift] = r[one] >> (r[shift] & 31u);
++                r[v1] |= r[shift];
++                n += 3u;
++            }
++            r[v0] = r[one] << k;
++            n += 1u;
++        };
++
++        // 0x55738: s2 = SPU2 voice number ((s3 % 24) << 1 | core), s1 = shadow entry
++        r[v0] = 0x2AAAAAABu;
++        const int64_t product = static_cast<int64_t>(static_cast<int32_t>(r[s3])) * 0x2AAAAAABll;
++        c.lo = static_cast<uint32_t>(product);
++        c.hi = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32);
++        r[s4] = 0u;
++        r[v1] = static_cast<uint32_t>(static_cast<int32_t>(r[s3]) >> 31);
++        r[a1] = 0x00060000u;
++        r[a2] = bus.lw(r[sp] + 0x20u);
++        r[v0] = static_cast<uint32_t>(static_cast<int32_t>(c.hi) >> 2) - r[v1];
++        r[a0] = ((r[v0] << 1) + r[v0]) << 3;
++        r[a0] = (r[s3] - r[a0]) << 1;
++        r[v1] = (static_cast<int32_t>(r[s3]) < 24 ? 1u : 0u) ^ 1u;
++        r[v0] = kEaVoiceShadow;
++        r[s1] = r[a2] + r[v0];
++        r[a1] = bus.lhu(r[s0] + 4u);
++        r[v0] = bus.lhu(r[s1] + 4u);
++        r[s2] = r[a0] | r[v1];
++        n = 24u;
++        if (r[a1] != r[v0])
++        {
++            // 0x55798: pitch
++            r[a0] = (r[s2] | 0x200u) & 0xFFFFu;
++            call(0, 0x000557A4u, 4u);
++            r[v0] = bus.lhu(r[s0] + 4u);
++            bus.sh(r[s1] + 4u, static_cast<uint16_t>(r[v0]));
++            n += 3u;
++        }
++        // 0x557B0 / 0x557E4: volume bytes unchanged and not flagged (else: eaVoiceCallsDriver)
++        r[v1] = sext8(bus.lbu(r[s0] + 7u));
++        r[v0] = sext8(bus.lbu(r[s1] + 7u));
++        r[a0] = r[s0];
++        r[v0] = bus.lbu(r[fp]);
++        n += 18u;
++        // 0x55814: start address / key state
++        r[a1] = bus.lw(r[s0]);
++        const bool same = r[a1] == bus.lw(r[s1]);
++        r[v0] = 0x007F0000u;
++        n += 5u;
++        if (!same)
++        {
++            r[v0] = r[a1] & 0x007FFFFFu;
++            bus.sw(r[sp] + 0x18u, r[v0]);
++            n += 4u;
++            if (r[v0] != 0u)
++            {
++                // 0x55838: ENVX
++                r[a0] = (r[s2] | 0x500u) & 0xFFFFu;
++                call(1, 0x00055844u, 4u);
++                const bool sounding = r[v0] != 0u;
++                r[a0] = r[s2] | 0x2040u;
++                n += 2u;
++                if (!sounding)
++                {
++                    // 0x5584C: new sample: SSA, LSA = 0x5000, ADSR 0x000F/0x0005, volumes; key on
++                    r[a1] = bus.lw(r[sp] + 0x18u);
++                    r[a0] &= 0xFFFFu;
++                    call(2, 0x00055858u, 4u);
++                    r[a0] = (r[s2] | 0x2140u) & 0xFFFFu;
++                    r[a1] = 0x5000u;
++                    call(2, 0x00055868u, 5u);
++                    r[a0] = (r[s2] | 0x300u) & 0xFFFFu;
++                    r[a1] = 0xFu;
++                    call(0, 0x00055878u, 5u);
++                    r[a0] = (r[s2] | 0x400u) & 0xFFFFu;
++                    r[a1] = 5u;
++                    call(0, 0x00055888u, 5u);
++                    const auto volume = [&](uint32_t reg)
++                    {
++                        // 0x55888 / 0x558C8: byte (signed) -> volume register value
++                        if (static_cast<int32_t>(r[reg]) >= 0)
++                        {
++                            r[v0] = (r[reg] << 7) + r[reg];
++                            r[a1] = r[v0] & 0xFFFFu;
++                            n += 4u;
++                        }
++                        else
++                        {
++                            r[v0] = r[reg] << 7;
++                            r[a1] = r[v0] & 0x7F80u;
++                            n += 2u;
++                        }
++                    };
++                    r[v1] = sext8(bus.lbu(r[s0] + 6u));
++                    r[a0] = r[s2] & 0xFFFFu;
++                    n += 4u;
++                    volume(v1);
++                    call(0, 0x000558B8u, 3u);
++                    r[v0] = bus.lbu(r[s0] + 6u);
++                    r[v1] = r[s2] | 0x100u;
++                    bus.sb(r[fp] - 1u, 0u);
++                    bus.sb(r[s1] + 6u, static_cast<uint8_t>(r[v0]));
++                    r[a1] = sext8(bus.lbu(r[s0] + 7u));
++                    r[a0] = r[v1] & 0xFFFFu;
++                    n += 8u;
++                    volume(a1);
++                    r[s4] = 1u;
++                    call(0, 0x000558F8u, 3u);
++                    bit64(a0, a1, a2);
++                    // 0x55930: key-on mask, shadow updated
++                    r[a2] = bus.lw(r[sp] + 0x10u) | r[v0];
++                    r[a3] = bus.lw(r[sp] + 0x14u) | r[v1];
++                    r[a0] = bus.lbu(r[s0] + 7u);
++                    bus.sw(r[sp] + 0x10u, r[a2]);
++                    bus.sw(r[sp] + 0x14u, r[a3]);
++                    bus.sb(r[fp], 0u);
++                    bus.sb(r[s1] + 7u, static_cast<uint8_t>(r[a0]));
++                    r[v0] = bus.lw(r[s0]);
++                    bus.sw(r[s1], r[v0]);
++                    n += 12u;
++                }
++                else
++                {
++                    // 0x55960: still sounding: key off first
++                    bit64(a2, a3, a0);
++                    r[s6] |= r[v0];
++                    r[s7] |= r[v1];
++                    r[s4] = 1u;
++                    n += 4u;
++                }
++            }
++            else
++            {
++                // 0x559A8: no sample: key off
++                bit64(a2, a3, a0);
++                r[s6] |= r[v0];
++                r[s7] |= r[v1];
++                bus.sw(r[s1], r[a1]);
++                n += 3u;
++            }
++        }
++        // 0x559EC: NAX read back
++        r[a0] = (r[s2] | 0x2240u) & 0xFFFFu;
++        r[a3] = kEaVoiceState;
++        r[a1] = bus.lw(r[sp] + 0x20u);
++        r[v1] = bus.lw(r[s0]);
++        r[v0] = r[a3] + r[a1];
++        bus.sw(r[v0] + 0x3Cu, r[v1]);
++        call(3, 0x00055A10u, 10u);
++        r[a2] = bus.lw(r[sp] + 0x1Cu);
++        bus.sw(r[a2], r[v0]);
++        n += 3u;
++        if (r[s4] != 0u)
++        {
++            r[a3] = bus.lw(r[sp] + 0x18u);
++            bus.sw(r[a2], r[a3]);
++            n += 3u;
++        }
++        else
++        {
++            r[v0] = r[v0] < 0x5040u ? 1u : 0u;
++            n += 3u;
++            if (r[v0] != 0u)
++            {
++                r[v0] = bus.lw(r[sp] + 0x1Cu);
++                bus.sw(r[v0], 0u);
++                n += 3u;
++            }
++        }
++        // 0x55A40: next voice
++        r[fp] += 2u;
++        r[s0] += 8u;
++        r[s3] += 1u;
++        r[v0] = static_cast<int32_t>(r[s3]) < 48 ? 1u : 0u;
++        r[v1] = bus.lw(r[sp] + 0x1Cu) + 8u;
++        r[a0] = bus.lw(r[sp] + 0x20u) + 8u;
++        bus.sw(r[sp] + 0x1Cu, r[v1]);
++        bus.sw(r[sp] + 0x20u, r[a0]);
++        n += 11u;
++        c.pc = r[v0] ? kEaVoiceLoopAddress : kEaVoiceLoopExit;
++        return n;
++    }
+ }
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/ADSR.cpp b/ps2xIOP/src/emulator/spu2/SPU2/ADSR.cpp
 new file mode 100644
-index 0000000..3f3c77a
+index 0000000..9aac67e
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/ADSR.cpp
-@@ -0,0 +1,182 @@
+@@ -0,0 +1,193 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -2144,6 +3448,12 @@ index 0000000..3f3c77a
 +	CachedPhases[PHASE_RELEASE].Shift = ReleaseShift;
 +	CachedPhases[PHASE_RELEASE].Step = -8;
 +	CachedPhases[PHASE_RELEASE].Target = 0;
++
++	for (auto& p : CachedPhases)
++	{
++		p.CounterIncX = (0x8000u >> std::max(0, p.Shift - 11)) ^ 0x8000u;
++		p.LevelInc = p.Step << std::max(0, 11 - p.Shift);
++	}
 +}
 +
 +bool V_ADSR::Calculate(int voiceidx)
@@ -2153,8 +3463,8 @@ index 0000000..3f3c77a
 +	auto& p = CachedPhases[Phase]; // ps2recomp: [] instead of at() (no bounds-check throw path)
 +
 +	// maybe not correct for the "infinite" settings
-+	u32 counter_inc = 0x8000 >> std::max(0, p.Shift - 11);
-+	s32 level_inc = p.Step << std::max(0, 11 - p.Shift);
++	u32 counter_inc = p.CounterIncX ^ 0x8000u;
++	s32 level_inc = p.LevelInc;
 +
 +	if (p.Exp)
 +	{
@@ -2215,20 +3525,8 @@ index 0000000..3f3c77a
 +	}
 +}
 +
-+void V_VolumeSlide::RegSet(u16 src)
++void V_VolumeSlide::UpdateRate()
 +{
-+	Reg_VOL = src;
-+	if (!Enable)
-+	{
-+		Value = SignExtend16(src << 1);
-+	}
-+}
-+
-+void V_VolumeSlide::Update()
-+{
-+	if (!Enable)
-+		return;
-+
 +	s32 step_size = 7 - Step;
 +
 +	if (Decr)
@@ -2236,8 +3534,25 @@ index 0000000..3f3c77a
 +		step_size = ~step_size;
 +	}
 +
-+	u32 counter_inc = 0x8000 >> std::max(0, Shift - 11);
-+	s32 level_inc = step_size << std::max(0, 11 - Shift);
++	RateCounterInc = 0x8000 >> std::max(0, Shift - 11);
++	RateLevelInc = step_size << std::max(0, 11 - Shift);
++	RateMinOne = Step != 3 && Shift != 0x1f;
++}
++
++void V_VolumeSlide::RegSet(u16 src)
++{
++	Reg_VOL = src;
++	UpdateRate();
++	if (!Enable)
++	{
++		Value = SignExtend16(src << 1);
++	}
++}
++
++void V_VolumeSlide::Slide()
++{
++	u32 counter_inc = RateCounterInc;
++	s32 level_inc = RateLevelInc;
 +
 +	if (Exp)
 +	{
@@ -2254,7 +3569,7 @@ index 0000000..3f3c77a
 +
 +	// Allow counter_inc to be zero only in when all bits
 +	// of the rate field are set
-+	if (Step != 3 && Shift != 0x1f)
++	if (RateMinOne)
 +	{
 +		counter_inc = std::max<u32>(1, counter_inc);
 +	}
@@ -2943,10 +4258,10 @@ index 0000000..833873d
 \ No newline at end of file
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/Mixer.cpp b/ps2xIOP/src/emulator/spu2/SPU2/Mixer.cpp
 new file mode 100644
-index 0000000..eeb6883
+index 0000000..4ba0f38
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/Mixer.cpp
-@@ -0,0 +1,620 @@
+@@ -0,0 +1,669 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -2957,6 +4272,16 @@ index 0000000..eeb6883
 +#include "SPU2/interpolate_table.h"
 +
 +#include "common/Assertions.h"
++
++#ifdef __wasm_simd128__
++#include <wasm_simd128.h>
++#endif
++
++// ps2recomp: either core's address IRQ enabled (the per-voice IRQ address checks are skipped otherwise)
++static __forceinline bool AnyIrqEnabled()
++{
++	return Cores[0].IRQEnable | Cores[1].IRQEnable;
++}
 +
 +// LOOP/END sets the ENDX bit and sets NAX to LSA, and the voice is muted if LOOP is not set
 +// LOOP seems to only have any effect on the block with LOOP/END set, where it prevents muting the voice
@@ -3029,7 +4354,7 @@ index 0000000..eeb6883
 +	// Important!  Both cores signal IRQ when an address is read, regardless of
 +	// which core actually reads the address.
 +
-+	for (int i = 0; i < 2; i++)
++	for (int i = 0; AnyIrqEnabled() && i < 2; i++)
 +	{
 +		if (Cores[i].IRQEnable && (vc.NextA == Cores[i].IRQA))
 +		{
@@ -3093,10 +4418,23 @@ index 0000000..eeb6883
 +
 +	// Get the sample index for NextA, we have to subtract 1 to ignore the loop header
 +	int sampleIdx = ((vc.NextA % pcm_WordsPerBlock) - 1) * 4;
++#ifdef __wasm_simd128__
++	// ps2recomp: DecPosWrite moves in steps of 4 from 0, so the 4 slots never wrap; slot 0 is also
++	// copied to the mirror (see V_Voice::DecodeFifo)
++	const u32 slot = vc.DecPosWrite % 32;
++	const v128_t decoded = wasm_i32x4_load16x4(&vc.SBuffer[sampleIdx]);
++	wasm_v128_store(&vc.DecodeFifo[slot], decoded);
++	if (slot == 0)
++		wasm_v128_store(&vc.DecodeFifo[32], decoded);
++#else
 +	for (int i = 0; i < 4; i++)
 +	{
-+		vc.DecodeFifo[(vc.DecPosWrite + i) % 32] = vc.SBuffer[sampleIdx + i];
++		const u32 slot = (vc.DecPosWrite + i) % 32;
++		vc.DecodeFifo[slot] = vc.SBuffer[sampleIdx + i];
++		if (slot < 3)
++			vc.DecodeFifo[32 + slot] = vc.SBuffer[sampleIdx + i]; // ps2recomp: mirror (see V_Voice)
 +	}
++#endif
 +}
 +
 +/////////////////////////////////////////////////////////////////////////////////////////
@@ -3126,7 +4464,7 @@ index 0000000..eeb6883
 +{
 +	V_Voice& vc(thiscore.Voices[voiceidx]);
 +
-+	for (int i = 0; i < 2; i++)
++	for (int i = 0; AnyIrqEnabled() && i < 2; i++)
 +		if (Cores[i].IRQEnable && Cores[i].IRQA == (vc.NextA & 0xFFFF8))
 +			SetIrqCall(i);
 +
@@ -3240,6 +4578,16 @@ index 0000000..eeb6883
 +	V_Voice& vc(thiscore.Voices[voiceidx]);
 +
 +	int phase = (vc.SP & 0x0ff0) >> 4;
++#ifdef __wasm_simd128__
++	// ps2recomp: the 4 taps at once (same per-tap products and shifts; the FIFO is mirrored so the
++	// taps are contiguous)
++	const v128_t taps = wasm_v128_load(&vc.DecodeFifo[vc.DecPosRead % 32]);
++	const v128_t coefs = wasm_i32x4_load16x4(interpTable[phase].data());
++	const v128_t products = wasm_i32x4_shr(wasm_i32x4_mul(coefs, taps), 15);
++	const v128_t pairs = wasm_i32x4_add(products, wasm_i32x4_shuffle(products, products, 2, 3, 0, 1));
++	const v128_t sum = wasm_i32x4_add(pairs, wasm_i32x4_shuffle(pairs, pairs, 1, 0, 3, 2));
++	return wasm_i32x4_extract_lane(sum, 0);
++#endif
 +	s32 out = 0;
 +	out += (interpTable[phase][0] * vc.DecodeFifo[(vc.DecPosRead + 0) % 32]) >> 15;
 +	out += (interpTable[phase][1] * vc.DecodeFifo[(vc.DecPosRead + 1) % 32]) >> 15;
@@ -3303,7 +4651,7 @@ index 0000000..eeb6883
 +static __forceinline void spu2M_WriteFast(u32 addr, s16 value)
 +{
 +	// Fixes some of the oldest hangs in pcsx2's history! :p
-+	for (int i = 0; i < 2; i++)
++	for (int i = 0; AnyIrqEnabled() && i < 2; i++)
 +	{
 +		if (Cores[i].IRQEnable && Cores[i].IRQA == addr)
 +		{
@@ -3374,6 +4722,22 @@ index 0000000..eeb6883
 +static __forceinline void MixCoreVoices(VoiceMixSet& dest, const uint coreidx)
 +{
 +	V_Core& thiscore(Cores[coreidx]);
++
++#ifdef __wasm_simd128__
++	// ps2recomp: dry L/R and wet L/R accumulated as one vector (gates are DryL, DryR, WetL, WetR)
++	v128_t acc = wasm_i32x4_make(dest.Dry.Left, dest.Dry.Right, dest.Wet.Left, dest.Wet.Right);
++	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
++	{
++		StereoOut32 VVal(MixVoice(coreidx, voiceidx));
++		const v128_t value = wasm_i32x4_make(VVal.Left, VVal.Right, VVal.Left, VVal.Right);
++		acc = wasm_i32x4_add(acc, wasm_v128_and(value, wasm_v128_load(&thiscore.VoiceGates[voiceidx])));
++	}
++	dest.Dry.Left = wasm_i32x4_extract_lane(acc, 0);
++	dest.Dry.Right = wasm_i32x4_extract_lane(acc, 1);
++	dest.Wet.Left = wasm_i32x4_extract_lane(acc, 2);
++	dest.Wet.Right = wasm_i32x4_extract_lane(acc, 3);
++	return;
++#endif
 +
 +	for (uint voiceidx = 0; voiceidx < V_Core::NumVoices; ++voiceidx)
 +	{
@@ -4395,10 +5759,10 @@ index 0000000..8ca900b
 +MULTI_ISA_UNSHARED_END
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/defs.h b/ps2xIOP/src/emulator/spu2/SPU2/defs.h
 new file mode 100644
-index 0000000..3e240bc
+index 0000000..e27e55e
 --- /dev/null
 +++ b/ps2xIOP/src/emulator/spu2/SPU2/defs.h
-@@ -0,0 +1,627 @@
+@@ -0,0 +1,648 @@
 +// SPDX-FileCopyrightText: 2002-2026 PCSX2 Dev Team
 +// SPDX-License-Identifier: GPL-3.0+
 +
@@ -4527,15 +5891,29 @@ index 0000000..3e240bc
 +	u32 Counter;
 +	s32 Value;
 +
++	// ps2recomp: Slide()'s values that depend only on the register (set with it: RegSet, constructor)
++	u32 RateCounterInc;
++	s32 RateLevelInc;
++	bool RateMinOne;
++
 +public:
 +	V_VolumeSlide() = default;
 +	V_VolumeSlide(s16 regval, s32 fullvol)
 +		: Reg_VOL(regval)
 +		, Value(fullvol)
 +	{
++		UpdateRate();
 +	}
 +
-+	void Update();
++	void UpdateRate();
++
++	// ps2recomp: the sweep is rare; testing Enable inline saves a call per voice and sample
++	__forceinline void Update()
++	{
++		if (Enable)
++			Slide();
++	}
++	void Slide();
 +	void RegSet(u16 src); // used to set the volume from a register source
 +
 +#ifdef PCSX2_DEVBUILD
@@ -4613,6 +5991,11 @@ index 0000000..3e240bc
 +		u8 Shift;
 +		s8 Step;
 +		s32 Target;
++		// ps2recomp: Calculate()'s increments before the exponential adjustments; the counter
++		// increment is kept XOR 0x8000 so that a cache never filled (all zero) gives the same
++		// values as computing them from its zero fields
++		u32 CounterIncX;
++		s32 LevelInc;
 +	};
 +
 +	std::array<CachedADSR, ADSR_PHASES> CachedPhases;
@@ -4665,7 +6048,9 @@ index 0000000..3e240bc
 +	s16* SBuffer;
 +
 +	// Each voice has a buffer of decoded samples
-+	s32 DecodeFifo[32];
++	// ps2recomp: entries 32-34 mirror 0-2, so the 4 interpolation taps are always contiguous
++	// (35 is padding for a 4-wide store)
++	s32 DecodeFifo[32 + 4];
 +	u32 DecPosWrite;
 +	u32 DecPosRead;
 +
@@ -8051,19 +9436,91 @@ index 31a296b..f3532df 100644
      std::deque<EeEvent> m_events;
      std::vector<ScheduledEvent> m_deadlines;
      std::deque<GuestInvocation> m_pendingInvocations;
+diff --git a/ps2xRuntime/include/runtime/ps2_byte_span.h b/ps2xRuntime/include/runtime/ps2_byte_span.h
+new file mode 100644
+index 0000000..0fbb16b
+--- /dev/null
++++ b/ps2xRuntime/include/runtime/ps2_byte_span.h
+@@ -0,0 +1,13 @@
++#pragma once
++
++#include <cstdint>
++
++namespace ps2_gsdump
++{
++    // A piece of a stream (e.g. one part of a DMA chain, read in place).
++    struct Span
++    {
++        const uint8_t *data;
++        uint32_t size;
++    };
++}
+diff --git a/ps2xRuntime/include/runtime/ps2_memory.h b/ps2xRuntime/include/runtime/ps2_memory.h
+index ea86a9c..31c6972 100644
+--- a/ps2xRuntime/include/runtime/ps2_memory.h
++++ b/ps2xRuntime/include/runtime/ps2_memory.h
+@@ -12,6 +12,7 @@
+ #include <mutex>
+ 
+ #include "gs/ps2_gif_arbiter.h"
++#include "runtime/ps2_byte_span.h"
+ #if defined(_MSC_VER)
+ #include <intrin.h>
+ #elif defined(USE_SSE2NEON)
+@@ -343,6 +344,8 @@ public:
+     void processVIF0Data(const uint8_t *data, uint32_t sizeBytes);
+     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
+     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
++    // A VIF1 stream given as pieces read in place (a DMA chain's tag halves and payloads)
++    void processVIF1Segments(const ps2_gsdump::Span *spans, size_t count);
+     void processPendingTransfers();
+     std::vector<uint32_t> consumeCompletedDmacCauses();
+ 
+@@ -411,12 +414,19 @@ public:
+     bool m_vif1PendingPath2DirectHl = false;
+     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
+ 
++    template <typename Source>
++    void processVIF1Source(const Source &source);
++
+     struct PendingTransfer
+     {
+         bool fromScratchpad = false;
+         uint32_t srcAddr = 0;
+         uint32_t qwc = 0;
+         std::vector<uint8_t> chainData;
++        // VIF1 chain read in place (remote VU): the pieces of the chain in RDRAM / scratchpad,
++        // decoded and forwarded before any guest code can change them (see writeIORegister)
++        std::vector<ps2_gsdump::Span> chainSpans;
++        uint32_t chainSpanBytes = 0;
+     };
+     std::vector<PendingTransfer> m_pendingGifTransfers;
+     std::vector<PendingTransfer> m_pendingVif0Transfers;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index f09ec48..3f282c3 100644
+index f09ec48..51c3332 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-@@ -10,6 +10,7 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
+@@ -9,7 +9,9 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
+ #include "../gs/gs_dump_writer.h"
  
  #include <algorithm>
++#include <unordered_map>
  #include <array>
 +#include <vector>
  #include <atomic>
  #include <chrono>
  #include <cstdio>
-@@ -462,6 +463,18 @@ void EeScheduler::requestStop()
+@@ -20,6 +22,9 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
+ #include <cstring>
+ #include <limits>
+ #include <sstream>
++#if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
++#endif
+ #include <stdexcept>
+ 
+ namespace
+@@ -462,6 +467,18 @@ void EeScheduler::requestStop()
      m_eventCv.notify_all();
  }
  
@@ -8082,7 +9539,7 @@ index f09ec48..3f282c3 100644
  void EeScheduler::postEvent(EeEvent event)
  {
      if (event.type == EeEventType::Stop)
-@@ -478,6 +491,37 @@ void EeScheduler::postEvent(EeEvent event)
+@@ -478,9 +495,64 @@ void EeScheduler::postEvent(EeEvent event)
      m_eventCv.notify_one();
  }
  
@@ -8117,10 +9574,105 @@ index f09ec48..3f282c3 100644
 +    g_eeIdleLoops.push_back({begin, end});
 +}
 +
++#if defined(__EMSCRIPTEN__)
++static double g_eeSlowLast = 0.0; // PS2X_EE_SLOW: end of the last measured stretch (sleeps don't count)
++#endif
++
  bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
  {
      accountCycles(cycles);
-@@ -541,6 +585,77 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
++#if defined(__EMSCRIPTEN__)
++    {
++        // PS2X_EE_SLOW=N (tests, e.g. ?env=PS2X_EE_SLOW=150): the game thread's work takes N% longer,
++        // to reproduce a phone's slow EE on a desktop. Only at slice ends, so the check stays cheap.
++        static const int s_eeSlowPercent = [] { const char *e = std::getenv("PS2X_EE_SLOW"); return e ? std::atoi(e) : 0; }();
++        if (s_eeSlowPercent > 0 && m_eeCycle >= m_sliceEndCycle)
++        {
++            const double now = emscripten_get_now();
++            const double busy = now - g_eeSlowLast;
++            if (g_eeSlowLast != 0.0 && busy < 50.0)
++            {
++                const double until = now + busy * s_eeSlowPercent / 100.0;
++                while (emscripten_get_now() < until)
++                {
++                }
++            }
++            g_eeSlowLast = emscripten_get_now();
++        }
++    }
++#endif
+ 
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+         m_stopRequested.load(std::memory_order_acquire))
+@@ -508,21 +580,66 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     // (it may be deferred, e.g. while an interrupt handler runs).
+     const int64_t hostDeadline = m_nextHostDeadlineRep.load(std::memory_order_acquire);
+     const uint64_t targetCycle = m_nextHostDeadlineCycle.load(std::memory_order_acquire);
++#if defined(__EMSCRIPTEN__)
++    const int64_t hostNow = std::chrono::steady_clock::now().time_since_epoch().count();
++    // On a slow host (phones) the game's own work takes longer than on a PS2. Jumping time in
++    // the middle of that work stretched it over most of the frame in emulated time, and the
++    // game's sound streamer fed the SPU2 late (repeated blocks, crackling in the menus). Outside
++    // the registered wait loops, time only jumps when it is far behind (20 ms): a short lag is
++    // made up in the wait loops, where the game is only waiting anyway.
++    // (PS2X_WARP_LAG_MS=N changes the margin, 0 jumps anywhere as before.)
++    static const int64_t s_warpLag = [] { const char *e = std::getenv("PS2X_WARP_LAG_MS"); return (e ? std::atoll(e) : 20ll) * 1000000ll; }();
++    auto warpLag = [this]() -> int64_t {
++        const GuestThread *thread = currentThread();
++        return thread != nullptr && eeIdleLoopAt(thread->activeContext().pc) ? 0 : s_warpLag;
++    };
++    if (hostDeadline != INT64_MAX && targetCycle > m_eeCycle && hostNow >= hostDeadline &&
++        (s_warpLag == 0 || hostNow >= hostDeadline + warpLag()))
++#else
+     if (hostDeadline != INT64_MAX && targetCycle > m_eeCycle &&
+         std::chrono::steady_clock::now().time_since_epoch().count() >= hostDeadline)
+-    {
++#endif
++    {
++#if defined(__EMSCRIPTEN__)
++        // In a wait loop the lag piled up by the game's work (8 ms and more per frame on phones)
++        // was made up in one jump: the IOP and the SPU2 ran through it with no EE code in between,
++        // so the sound streamer missed the driver's half-buffer swaps (5 ms) and the SPU2 played
++        // repeated blocks. Jump at most 1 ms at a time, so interrupts and the threads they wake
++        // run between steps (in a wait loop the next step comes right away). Outside wait loops time
++        // only jumps when far behind (above) and still does it at once.
++        // (PS2X_WARP_STEP_US=N changes the step, 0 jumps all at once.)
++        static const uint64_t s_warpStep = [] { const char *e = std::getenv("PS2X_WARP_STEP_US"); return (e ? std::strtoull(e, nullptr, 10) : 1000ull) * 294912ull / 1000ull; }();
++        uint64_t warp = std::min<uint64_t>(targetCycle - m_eeCycle, 0xFFFFFFFFull);
++        if (s_warpStep != 0u && currentThread() != nullptr && eeIdleLoopAt(currentThread()->activeContext().pc))
++            warp = std::min(warp, s_warpStep);
++#else
+         const uint64_t warp = std::min<uint64_t>(targetCycle - m_eeCycle, 0xFFFFFFFFull);
++#endif
+         {
+             static uint64_t s_warps = 0u, s_warpedCycles = 0u;
+             static auto s_lastReport = std::chrono::steady_clock::now();
+             ++s_warps;
+             s_warpedCycles += warp;
++            // Where the game was when time had to jump: loops spinning for an event (candidates for
++            // ps2xAddEeIdleLoop, which sleeps instead of burning a core)
++            static std::unordered_map<uint32_t, uint32_t> s_warpPcs;
++            if (const GuestThread *spinning = currentThread())
++                s_warpPcs[spinning->activeContext().pc]++;
+             const auto now = std::chrono::steady_clock::now();
+             if (now - s_lastReport >= std::chrono::seconds(5))
+             {
+                 std::cerr << "[sched:warp] warps=" << s_warps << " cycles=" << s_warpedCycles
+                           << " vsync=" << m_vsyncTick << " pendingInvocations=" << m_pendingInvocations.size()
+                           << " eeCycle=" << m_eeCycle << std::endl;
++                {
++                    std::vector<std::pair<uint32_t, uint32_t>> top(s_warpPcs.begin(), s_warpPcs.end());
++                    std::sort(top.begin(), top.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
++                    std::cerr << "[sched:warp] at pc";
++                    for (size_t i = 0; i < top.size() && i < 8u; ++i)
++                        std::cerr << " " << std::hex << top[i].first << std::dec << "=" << top[i].second;
++                    std::cerr << std::endl;
++                    s_warpPcs.clear();
++                }
+                 s_lastReport = now;
+                 s_warps = 0u;
+                 s_warpedCycles = 0u;
+@@ -541,6 +658,89 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return true;
      }
  
@@ -8163,8 +9715,17 @@ index f09ec48..3f282c3 100644
 +                // Time asleep in the game's frame waits: the rest is the game thread's load (game
 +                // code, IOP, sound); near 100% it can't keep up with the frame rate
 +                const double windowMs = std::chrono::duration<double, std::milli>(now - s_sleepReport).count();
++#if defined(__EMSCRIPTEN__)
++                // Of the busy time: waiting for room in the GS ring (the VU1 worker behind)
++                extern double g_ps2RingWaitMs;
++                std::printf("[sched] idle sleeps %u, %u woke >4 ms late (max %.0f ms); game thread %.0f%% busy (%.0f%% waiting for the GS ring)\n",
++                            s_sleeps, s_lateSleeps, s_maxLateMs, windowMs > 0.0 ? 100.0 * (1.0 - s_sleptMs / windowMs) : 0.0,
++                            windowMs > 0.0 ? 100.0 * g_ps2RingWaitMs / windowMs : 0.0);
++                g_ps2RingWaitMs = 0.0;
++#else
 +                std::printf("[sched] idle sleeps %u, %u woke >4 ms late (max %.0f ms); game thread %.0f%% busy\n", s_sleeps, s_lateSleeps,
 +                            s_maxLateMs, windowMs > 0.0 ? 100.0 * (1.0 - s_sleptMs / windowMs) : 0.0);
++#endif
 +                s_sleptMs = 0.0;
 +                if (s_sleeps >= 200u && s_lateSleeps * 20u > s_sleeps)
 +                {
@@ -8193,12 +9754,15 @@ index f09ec48..3f282c3 100644
 +            if (nextEvent != 0u && m_eeCycle >= nextEvent)
 +                break;
 +        }
++#if defined(__EMSCRIPTEN__)
++        g_eeSlowLast = 0.0;
++#endif
 +    }
 +
      renewTimeSlice();
      return false;
  }
-@@ -1946,9 +2061,9 @@ void EeScheduler::makeRunning(GuestThread &item)
+@@ -1946,9 +2146,9 @@ void EeScheduler::makeRunning(GuestThread &item)
          struct Slot { uint64_t ticks = 0; uint32_t entry = 0; int priority = 0; uint32_t switches = 0; };
          static Slot s_slots[256];
          static int s_lastId = -1;
@@ -8210,7 +9774,7 @@ index f09ec48..3f282c3 100644
          if (s_lastId >= 0)
              s_slots[s_lastId & 255].ticks += tsc - s_lastTsc;
          s_lastTsc = tsc;
-@@ -2206,11 +2321,17 @@ void EeScheduler::processDueDeadlines()
+@@ -2206,11 +2406,17 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -8230,7 +9794,7 @@ index f09ec48..3f282c3 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -2293,6 +2414,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -2293,6 +2499,22 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }
@@ -8575,7 +10139,7 @@ index 0e1a2ad..721e03b 100644
          }
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-index db0ff1d..7d536d1 100644
+index db0ff1d..711f690 100644
 --- a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 @@ -21,7 +21,7 @@
@@ -8587,7 +10151,7 @@ index db0ff1d..7d536d1 100644
  #include "ps2x/host_intrin.h"
  #include <cerrno>
  #include <chrono>
-@@ -36,10 +36,16 @@ extern char **environ;
+@@ -36,10 +36,18 @@ extern char **environ;
  #endif
  
  // The live ring to the PCSX2 GS host exists on Windows and on POSIX hosts with a futex-like wait.
@@ -8598,14 +10162,16 @@ index db0ff1d..7d536d1 100644
  #endif
  
 +#if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
 +// web/play_gs_host.cpp: starts the in-page GS host on the browser's main thread.
 +bool ps2xWebStartGsHost(ps2live::RingHeader *header);
++double g_ps2RingWaitMs = 0.0; // time the game thread waited for room in the GS ring (EeScheduler report)
 +#endif
 +
  // ps2_runtime.cpp, frame-budget report (PS2X_NBA_FRAME_LOG): time the game blocked on a full ring.
  extern uint64_t g_ps2StatRingWaitTicks;
  
-@@ -163,13 +169,13 @@ namespace ps2_gsdump
+@@ -163,13 +171,13 @@ namespace ps2_gsdump
                          if (hostGone())
                              return false;
                          SetEvent(dataEvent);
@@ -8621,7 +10187,7 @@ index db0ff1d..7d536d1 100644
                          continue;
                      }
                      const uint64_t offset = static_cast<uint64_t>(w) % capacity;
-@@ -192,6 +198,81 @@ namespace ps2_gsdump
+@@ -192,6 +200,83 @@ namespace ps2_gsdump
                      SetEvent(dataEvent);
              }
          };
@@ -8680,12 +10246,14 @@ index db0ff1d..7d536d1 100644
 +                        if (hostGone())
 +                            return false;
 +                        const uint64_t waitStart = ps2xStatTicks();
++                        const double waitStartMs = emscripten_get_now();
 +                        header->producerWaiting = 1u;
 +                        __atomic_thread_fence(__ATOMIC_SEQ_CST);
 +                        if (header->readPos == r)
 +                            ps2live::eventWait(&events->space, 20);
 +                        header->producerWaiting = 0u;
 +                        g_ps2StatRingWaitTicks += ps2xStatTicks() - waitStart;
++                        g_ps2RingWaitMs += emscripten_get_now() - waitStartMs;
 +                        continue;
 +                    }
 +                    const uint64_t offset = static_cast<uint64_t>(w) % capacity;
@@ -8703,7 +10271,7 @@ index db0ff1d..7d536d1 100644
  #elif defined(__APPLE__) || defined(__linux__)
          // POSIX version of the live ring above: shm_open mapping, events as shared words
          // (ps2live::eventSet/eventWait), the host started with posix_spawn.
-@@ -305,13 +386,13 @@ namespace ps2_gsdump
+@@ -305,13 +390,13 @@ namespace ps2_gsdump
                          if (hostGone())
                              return false;
                          ps2live::eventSet(&events->data);
@@ -8719,7 +10287,7 @@ index db0ff1d..7d536d1 100644
                          continue;
                      }
                      const uint64_t offset = static_cast<uint64_t>(w) % capacity;
-@@ -342,6 +423,11 @@ namespace ps2_gsdump
+@@ -342,6 +427,11 @@ namespace ps2_gsdump
  #if defined(PS2X_GS_LIVE_RING)
              LiveRing live;
              bool liveActive = false;
@@ -8731,7 +10299,7 @@ index db0ff1d..7d536d1 100644
  #endif
              bool headerWritten = false;
              bool finished = false;
-@@ -373,6 +459,22 @@ namespace ps2_gsdump
+@@ -373,6 +463,22 @@ namespace ps2_gsdump
                  if (size == 0)
                      return;
  #if defined(PS2X_GS_LIVE_RING)
@@ -8754,7 +10322,7 @@ index db0ff1d..7d536d1 100644
                  if (liveActive)
                  {
                      if (!live.write(static_cast<const uint8_t *>(data), size))
-@@ -410,7 +512,7 @@ namespace ps2_gsdump
+@@ -410,7 +516,7 @@ namespace ps2_gsdump
              void endPacket()
              {
  #if defined(PS2X_GS_LIVE_RING)
@@ -8763,7 +10331,7 @@ index db0ff1d..7d536d1 100644
                      live.signal();
  #endif
              }
-@@ -471,8 +573,16 @@ namespace ps2_gsdump
+@@ -471,8 +577,16 @@ namespace ps2_gsdump
              {
                  Writer &init = w;
  #if defined(PS2X_GS_LIVE_RING)
@@ -8781,6 +10349,61 @@ index db0ff1d..7d536d1 100644
                  {
                      if (init.live.open() && init.live.launchHost())
                      {
+@@ -778,6 +892,31 @@ namespace ps2_gsdump
+         w.endPacket();
+     }
+ 
++    void vif1(const Span *spans, size_t count)
++    {
++        uint64_t total = 0;
++        for (size_t i = 0; i < count; ++i)
++            total += spans[i].size;
++        // As vif1(data, size): whole words only
++        uint32_t sizeBytes = static_cast<uint32_t>(std::min<uint64_t>(total, 0xFFFFFFFFull)) & ~3u;
++        if (sizeBytes == 0u || !remoteVu())
++            return;
++        Writer &w = writer();
++        std::lock_guard<std::mutex> lock(w.mutex);
++        if (!w.usable())
++            return;
++        w.writeByte(kTypeLiveVif1);
++        w.writeWord(sizeBytes);
++        for (size_t i = 0; i < count && sizeBytes != 0u; ++i)
++        {
++            const uint32_t take = std::min(spans[i].size, sizeBytes);
++            if (take != 0u)
++                w.write(spans[i].data, take);
++            sizeBytes -= take;
++        }
++        w.endPacket();
++    }
++
+     void vif1Register(uint32_t address, uint32_t value)
+     {
+         if (!remoteVu())
+diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.h b/ps2xRuntime/src/lib/gs/gs_dump_writer.h
+index b82f22e..e68a685 100644
+--- a/ps2xRuntime/src/lib/gs/gs_dump_writer.h
++++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.h
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
++#include "runtime/ps2_byte_span.h"
++
++#include <cstddef>
+ #include <cstdint>
+ 
+ struct GSRegisters;
+@@ -36,6 +39,9 @@ namespace ps2_gsdump
+     // skipped. Default on in live mode; PS2X_REMOTE_VU=0 keeps VU1 local.
+     bool remoteVu();
+     void vif1(const uint8_t *data, uint32_t sizeBytes);
++    // The same packet from pieces (a DMA chain read in place): one VIF1 packet of their bytes in
++    // order, without gathering them first.
++    void vif1(const Span *spans, size_t count);
+     // A game write to a VIF1 register the host's VIF1 must see (FBRST, ERR, MARK).
+     void vif1Register(uint32_t address, uint32_t value);
+     void vsync(const GSRegisters &regs, int field);
 diff --git a/ps2xRuntime/src/lib/gs/ps2_live_ring.h b/ps2xRuntime/src/lib/gs/ps2_live_ring.h
 index 7532552..b8c6172 100644
 --- a/ps2xRuntime/src/lib/gs/ps2_live_ring.h
@@ -8813,10 +10436,31 @@ index 7532552..b8c6172 100644
          const timespec timeout{static_cast<time_t>(timeoutMs / 1000u), static_cast<long>(timeoutMs % 1000u) * 1000000l};
          syscall(SYS_futex, word, FUTEX_WAIT, 0, &timeout, nullptr, 0);
 diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
-index e493c89..2c27875 100644
+index e493c89..aaae6a6 100644
 --- a/ps2xRuntime/src/lib/ps2_memory.cpp
 +++ b/ps2xRuntime/src/lib/ps2_memory.cpp
-@@ -1570,7 +1570,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -552,11 +552,17 @@ void PS2Memory::resetEeTimers() noexcept
+ 
+ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
+ {
+-    // Charged after every few guest instructions: batch into 512-cycle steps (~1.7 us of EE
+-    // time) instead of a hash lookup and 64-bit divisions per timer each time.
++    // Charged after every few guest instructions: batch into steps (512 cycles, ~1.7 us of EE
++    // time; 2048 on the web, ~7 us: phones are short of game-thread time) instead of a hash
++    // lookup and 64-bit divisions per timer each time.
++#if defined(__EMSCRIPTEN__)
++    constexpr uint64_t kTimerBatchCycles = 2048u;
++#else
++    constexpr uint64_t kTimerBatchCycles = 512u;
++#endif
+     static uint64_t s_pendingCycles = 0u;
+     s_pendingCycles += eeCycles;
+-    if (s_pendingCycles < 512u)
++    if (s_pendingCycles < kTimerBatchCycles)
+     {
+         return 0u;
+     }
+@@ -1570,7 +1576,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                      // tag, so the game's end-of-frame wait (0x003E1910) times out and its thread
                      // falls into an endless error loop that eats the EE's time.
                      const int kMaxChainTags = 1 << 20;
@@ -8825,16 +10469,42 @@ index e493c89..2c27875 100644
                      std::vector<uint8_t> chainBuf = takeChainBuffer(); // recycled: pages already mapped
                      // Chains are rebuilt every frame with similar sizes: start at the size of
                      // the last one instead of growing (and copying) tag by tag.
-@@ -1773,7 +1773,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1582,11 +1588,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     // below copies them in one go into a buffer of the exact size, prefetching the
+                     // pieces ahead: the payloads are ~4000 small scattered reads per frame (3+ MB),
+                     // and copying them tag by tag while walking ran at memory latency.
+-                    struct ChainSegment
+-                    {
+-                        const uint8_t *data;
+-                        uint32_t size;
+-                    };
++                    using ChainSegment = ps2_gsdump::Span;
+                     static thread_local std::vector<ChainSegment> chainSegments;
+                     chainSegments.clear();
+ 
+@@ -1772,8 +1774,20 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                             std::fprintf(stderr, "[dma] ch=0x%X longest chain so far: %d tags\n", channelBase, tagsProcessed);
                          }
                      }
++                    // Remote VU (the GS host runs VIF1): the VIF1 chain is decoded and forwarded from
++                    // its pieces in place (processPendingTransfers, right below, before any guest
++                    // code can change them) instead of being gathered into chainBuf first.
++                    const bool vif1InPlace = channelBase == 0x10009000u && ps2_gsdump::remoteVu();
++                    size_t inPlaceBytes = 0;
++                    if (vif1InPlace)
++                    {
++                        for (const ChainSegment &seg : chainSegments)
++                            inPlaceBytes += seg.size;
++                        g_ps2StatChainBytes += inPlaceBytes;
++                    }
++                    else
                      {
 -                        const uint64_t copyStart = __rdtsc();
 +                        const uint64_t copyStart = ps2xStatTicks();
                          size_t total = 0;
                          for (const ChainSegment &seg : chainSegments)
                              total += seg.size;
-@@ -1790,10 +1790,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+@@ -1790,10 +1804,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                              const ChainSegment &seg = chainSegments[i];
                              chainBuf.insert(chainBuf.end(), seg.data, seg.data + seg.size);
                          }
@@ -8847,6 +10517,80 @@ index e493c89..2c27875 100644
                      g_ps2StatChainTags += static_cast<uint64_t>(tagsProcessed);
                      if (tagsProcessed >= kMaxChainTags)
                      {
+@@ -1809,7 +1823,19 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
+                     m_ioRegisters[channelBase + 0x00] = chcr;
+ 
+-                    s_lastChainBytes = std::clamp<size_t>(chainBuf.size() + chainBuf.size() / 4u, 4096u, 16u * 1024u * 1024u);
++                    if (vif1InPlace)
++                    {
++                        recycleChainBuffer(std::move(chainBuf));
++                        if (inPlaceBytes != 0u)
++                        {
++                            PendingTransfer pt;
++                            pt.chainSpans.assign(chainSegments.begin(), chainSegments.end());
++                            pt.chainSpanBytes = static_cast<uint32_t>(std::min<size_t>(inPlaceBytes, 0xFFFFFFFFu));
++                            m_pendingVif1Transfers.push_back(std::move(pt));
++                        }
++                    }
++                    else
++                        s_lastChainBytes = std::clamp<size_t>(chainBuf.size() + chainBuf.size() / 4u, 4096u, 16u * 1024u * 1024u);
+                     if (!chainBuf.empty())
+                     {
+                         PendingTransfer pt;
+@@ -2091,7 +2117,51 @@ void PS2Memory::processPendingTransfers()
+     bool vif1Stalled = !g_vif1StalledChain.empty();
+     for (auto &p : m_pendingVif1Transfers)
+     {
+-        if (!p.chainData.empty())
++        if (p.chainSpanBytes != 0u)
++        {
++            // A chain read in place: copied only when (or what) VIF1 can't decode now
++            const auto copySpans = [&](std::vector<uint8_t> &out, uint32_t from)
++            {
++                uint32_t pos = 0;
++                for (const ps2_gsdump::Span &span : p.chainSpans)
++                {
++                    const uint32_t end = pos + span.size;
++                    if (end > from)
++                    {
++                        const uint32_t skip = from > pos ? from - pos : 0u;
++                        out.insert(out.end(), span.data + skip, span.data + span.size);
++                    }
++                    pos = end;
++                }
++            };
++            if (vif1Stalled)
++            {
++                // VIF1 is still stalled on an earlier i-bit: queue behind it.
++                if (g_vif1StalledChain.empty())
++                    g_vif1StalledChain.clear();
++                copySpans(g_vif1StalledChain.data, 0u);
++                continue;
++            }
++            const uint32_t size = p.chainSpanBytes;
++            ps2_vif1_irq::setStallAllowed(true);
++            processVIF1Segments(p.chainSpans.data(), p.chainSpans.size());
++            ps2_vif1_irq::setStallAllowed(false);
++            uint32_t consumed = 0u;
++            if (ps2_vif1_irq::takeStall(consumed) && consumed < size)
++            {
++                recycleChainBuffer(std::move(g_vif1StalledChain.data));
++                g_vif1StalledChain.data = takeChainBuffer();
++                g_vif1StalledChain.data.reserve(size - consumed);
++                copySpans(g_vif1StalledChain.data, consumed);
++                g_vif1StalledChain.offset = 0;
++                vif1Stalled = true;
++                static int s_stallLogs = 0;
++                if (s_stallLogs++ < 20)
++                    std::fprintf(stderr, "[vif1:stall] code=0x%08X consumed=%u left=%zu\n", vif1_regs.code, consumed, g_vif1StalledChain.size());
++                vif1_regs.stat |= (1u << 10); // VIS: stalled by i-bit
++            }
++        }
++        else if (!p.chainData.empty())
+         {
+             if (vif1Stalled)
+             {
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
 index 5c92038..7e83d49 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
@@ -8944,10 +10688,53 @@ index aff25e6..1de2f76 100644
  }
  
 diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-index a857acc..8809d65 100644
+index a857acc..31aac30 100644
 --- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
 +++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
-@@ -368,8 +368,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -2,6 +2,7 @@
+ #include "runtime/ps2_memory.h"
+ #include "vif1_irq_queue.h"
+ #include "gs/gs_dump_writer.h"
++#include "vif1_source.h"
+ #include <algorithm>
+ #include "ps2x/host_intrin.h"
+ #include <cstdio>
+@@ -362,14 +363,43 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+ 
+ extern uint64_t g_ps2StatVif1Ticks; // ps2_runtime.cpp, frame-budget report
+ 
++namespace
++{
++    void forwardVif1(const ps2_vif1_source::Contiguous &src, uint32_t begin, uint32_t end)
++    {
++        ps2_gsdump::vif1(src.data + begin, end - begin);
++    }
++
++    void forwardVif1(const ps2_vif1_source::Segmented &src, uint32_t begin, uint32_t end)
++    {
++        static thread_local std::vector<ps2_gsdump::Span> spans;
++        spans.clear();
++        src.spans(begin, end, [](const ps2_gsdump::Span &span) { spans.push_back(span); });
++        ps2_gsdump::vif1(spans.data(), spans.size());
++    }
++}
++
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+ {
++    processVIF1Source(ps2_vif1_source::Contiguous{data, sizeBytes});
++}
++
++void PS2Memory::processVIF1Segments(const ps2_gsdump::Span *spans, size_t count)
++{
++    processVIF1Source(ps2_vif1_source::Segmented(spans, count));
++}
++
++// The VIF1 decoder, reading from a contiguous buffer or from a DMA chain in place (vif1_source.h).
++template <typename Source>
++void PS2Memory::processVIF1Source(const Source &src)
++{
++    const uint32_t sizeBytes = src.size();
+     if (sizeBytes == 0u)
          return;
      struct StatTimer
      {
@@ -8958,6 +10745,266 @@ index a857acc..8809d65 100644
      } statTimer;
  
      uint32_t pos = 0;
+@@ -388,7 +418,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         end = std::min(end, sizeBytes);
+         if (remoteVu && end > forwarded)
+         {
+-            ps2_gsdump::vif1(data + forwarded, end - forwarded);
++            forwardVif1(src, forwarded, end);
+             forwarded = end;
+         }
+     };
+@@ -411,15 +441,17 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             }
+ 
+             const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
+-            std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
+-            const uint64_t imageTag =
+-                static_cast<uint64_t>(chunkQw & 0x7FFFu) |
+-                ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
+-                (static_cast<uint64_t>(kGifFmtImage) << 58);
+-            std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
+-            std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
+-            if (!remoteVu)
++            if (!remoteVu) // remote VU: the host's VIF1 sends the image itself
++            {
++                std::vector<uint8_t> imagePacket(16u + static_cast<size_t>(chunkQw) * 16u, 0u);
++                const uint64_t imageTag =
++                    static_cast<uint64_t>(chunkQw & 0x7FFFu) |
++                    ((m_vif1PendingPath2ImageQwc == chunkQw) ? (1ull << 15) : 0ull) |
++                    (static_cast<uint64_t>(kGifFmtImage) << 58);
++                std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
++                src.copy(imagePacket.data() + 16u, pos, chunkQw * 16u);
+                 submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
++            }
+ 
+             pos += chunkQw * 16u;
+             m_vif1PendingPath2ImageQwc -= chunkQw;
+@@ -430,8 +462,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             continue;
+         }
+ 
+-        uint32_t cmd;
+-        memcpy(&cmd, data + pos, 4);
++        const uint32_t cmd = src.read32(pos);
+         pos += 4;
+ 
+         uint8_t opcode = (cmd >> 24) & 0x7F;
+@@ -553,9 +584,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         {
+             if (pos + 4 > sizeBytes)
+                 break;
+-            uint32_t maskValue = 0;
+-            std::memcpy(&maskValue, data + pos, sizeof(maskValue));
+-            vif1_regs.mask = maskValue;
++            vif1_regs.mask = src.read32(pos);
+             pos += 4;
+             continue;
+         }
+@@ -563,7 +592,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         {
+             if (pos + 16 > sizeBytes)
+                 break;
+-            std::memcpy(vif1_regs.row, data + pos, 16);
++            src.copy(vif1_regs.row, pos, 16);
+             pos += 16;
+             continue;
+         }
+@@ -571,7 +600,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+         {
+             if (pos + 16 > sizeBytes)
+                 break;
+-            std::memcpy(vif1_regs.col, data + pos, 16);
++            src.copy(vif1_regs.col, pos, 16);
+             pos += 16;
+             continue;
+         }
+@@ -587,7 +616,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
+                 if (pos + copyBytes <= sizeBytes)
+                 {
+-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
++                    src.copy(m_vu1Code + destAddr, pos, copyBytes);
+                     markVU1CodeModified();
+                 }
+             }
+@@ -609,10 +638,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             if (qwCount > 0)
+             {
+                 const bool directHl = (opcode == VIF_DIRECTHL);
++                const uint8_t *direct = src.ptr(pos, qwCount * 16u);
+                 if (!remoteVu)
+-                    submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
++                    submitGifPacket(GifPathId::Path2, direct, qwCount * 16, true, directHl);
+ 
+-                const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
++                const uint32_t pendingImageQw = pendingGifImageQwc(direct, qwCount * 16u);
+                 if (pendingImageQw != 0u)
+                 {
+                     m_vif1PendingPath2ImageQwc = pendingImageQw;
+@@ -687,7 +717,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+             // Remote VU: the host's VIF1 fills its own VU1 memory; only the size matters here.
+             if (!remoteVu && m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
+             {
+-                const uint8_t *srcBase = data + pos;
++                const uint8_t *srcBase = src.ptr(pos, totalBytes);
+                 uint32_t srcIndex = 0u;
+                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                 {
+@@ -897,3 +927,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+     // in the host's VIF1, which keeps that state).
+     forwardUpTo(sizeBytes);
+ }
++
++template void PS2Memory::processVIF1Source(const ps2_vif1_source::Contiguous &);
++template void PS2Memory::processVIF1Source(const ps2_vif1_source::Segmented &);
+diff --git a/ps2xRuntime/src/lib/vif1_source.h b/ps2xRuntime/src/lib/vif1_source.h
+new file mode 100644
+index 0000000..da296e1
+--- /dev/null
++++ b/ps2xRuntime/src/lib/vif1_source.h
+@@ -0,0 +1,141 @@
++#pragma once
++
++#include "gs/gs_dump_writer.h"
++
++#include <algorithm>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++// Where PS2Memory::processVIF1Data reads a VIF1 stream from: one contiguous buffer, or the pieces
++// of a DMA chain in place (tag upper halves and payloads in RDRAM / scratchpad), so a chain needs
++// no gathering copy before it is decoded and forwarded (see processVIF1Segments).
++namespace ps2_vif1_source
++{
++    using ByteSpan = ps2_gsdump::Span;
++
++    struct Contiguous
++    {
++        const uint8_t *data;
++        uint32_t sizeBytes;
++
++        uint32_t size() const { return sizeBytes; }
++        // Pointer to [pos, pos + length) (within size()).
++        const uint8_t *ptr(uint32_t pos, uint32_t) const { return data + pos; }
++        void copy(void *dst, uint32_t pos, uint32_t length) const { std::memcpy(dst, data + pos, length); }
++        uint32_t read32(uint32_t pos) const
++        {
++            uint32_t value;
++            std::memcpy(&value, data + pos, sizeof(value));
++            return value;
++        }
++        // Calls emit(span) for the bytes [begin, end), in order.
++        template <typename Emit>
++        void spans(uint32_t begin, uint32_t end, Emit &&emit) const
++        {
++            if (end > begin)
++                emit(ByteSpan{data + begin, end - begin});
++        }
++    };
++
++    // The concatenation of 'count' spans. Reads are sequential in practice: a cursor remembers the
++    // span of the last access.
++    class Segmented
++    {
++    public:
++        Segmented(const ByteSpan *spans, size_t count) : m_spans(spans), m_count(count)
++        {
++            m_starts.resize(count + 1u);
++            uint64_t total = 0;
++            for (size_t i = 0; i < count; ++i)
++            {
++                m_starts[i] = static_cast<uint32_t>(total);
++                total += spans[i].size;
++            }
++            m_size = total > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(total);
++            m_starts[count] = m_size;
++        }
++
++        uint32_t size() const { return m_size; }
++
++        const uint8_t *ptr(uint32_t pos, uint32_t length) const
++        {
++            const size_t i = locate(pos);
++            if (i < m_count && pos - m_starts[i] + length <= m_spans[i].size)
++                return m_spans[i].data + (pos - m_starts[i]);
++            // Crosses into the next span(s): a contiguous copy
++            m_scratch.resize(length);
++            copy(m_scratch.data(), pos, length);
++            return m_scratch.data();
++        }
++
++        void copy(void *dst, uint32_t pos, uint32_t length) const
++        {
++            uint8_t *out = static_cast<uint8_t *>(dst);
++            size_t i = locate(pos);
++            while (length != 0u && i < m_count)
++            {
++                const uint32_t offset = pos - m_starts[i];
++                const uint32_t take = std::min(length, m_spans[i].size - offset);
++                std::memcpy(out, m_spans[i].data + offset, take);
++                out += take;
++                pos += take;
++                length -= take;
++                ++i;
++            }
++        }
++
++        uint32_t read32(uint32_t pos) const
++        {
++            const size_t i = locate(pos);
++            if (i < m_count && pos - m_starts[i] + 4u <= m_spans[i].size)
++            {
++                uint32_t value;
++                std::memcpy(&value, m_spans[i].data + (pos - m_starts[i]), sizeof(value));
++                return value;
++            }
++            uint32_t value = 0;
++            copy(&value, pos, sizeof(value));
++            return value;
++        }
++
++        template <typename Emit>
++        void spans(uint32_t begin, uint32_t end, Emit &&emit) const
++        {
++            if (end <= begin)
++                return;
++            size_t i = locate(begin);
++            uint32_t pos = begin;
++            while (pos < end && i < m_count)
++            {
++                const uint32_t offset = pos - m_starts[i];
++                const uint32_t take = std::min(end - pos, m_spans[i].size - offset);
++                if (take != 0u)
++                    emit(ByteSpan{m_spans[i].data + offset, take});
++                pos += take;
++                ++i;
++            }
++        }
++
++    private:
++        // Index of the span holding byte pos (m_count when pos == size()).
++        size_t locate(uint32_t pos) const
++        {
++            size_t i = m_cursor;
++            if (i >= m_count || pos < m_starts[i])
++                i = 0;
++            while (i < m_count && pos >= m_starts[i + 1u])
++                ++i;
++            m_cursor = i;
++            return i;
++        }
++
++        const ByteSpan *m_spans;
++        size_t m_count;
++        uint32_t m_size = 0;
++        std::vector<uint32_t> m_starts;
++        mutable size_t m_cursor = 0;
++        mutable std::vector<uint8_t> m_scratch;
++    };
++}
 diff --git a/ps2xRuntime/src/main.cpp b/ps2xRuntime/src/main.cpp
 index 563bcbd..66ce2e9 100644
 --- a/ps2xRuntime/src/main.cpp
@@ -9010,10 +11057,10 @@ index 0000000..415e116
 +    0x000000401a006524ull,
 diff --git a/ps2xRuntime/web/library_fetch_stream.js b/ps2xRuntime/web/library_fetch_stream.js
 new file mode 100644
-index 0000000..ab13bcc
+index 0000000..190f160
 --- /dev/null
 +++ b/ps2xRuntime/web/library_fetch_stream.js
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,289 @@
 +/**
 + * WasmFS fetch backend for the game disc, replacing Emscripten's (src/lib/libwasmfs_fetch.js):
 + * the same on-demand HTTP Range reads, plus
@@ -9045,10 +11092,16 @@ index 0000000..ab13bcc
 +    // fetch() with a deadline and retries: on phones a request can stall for good (a dead
 +    // connection after a network change), and with no timeout the game waited on it forever
 +    // ("starting the game..." that never ends). A 404 is final; anything else is retried.
++    // The deadline is on progress, not on the whole request: a phone's connection can stall
++    // mid-transfer, and a whole-request deadline (19 s for a 1 MB chunk) let one stalled read
++    // hold the game's music for close to two minutes over its retries.
++    const STALL_MS = 6000;
 +    async function fetchRetry(url, init, expectBytes) {
 +      for (var attempt = 1; ; attempt++) {
 +        var abort = new AbortController();
-+        var timer = setTimeout(() => abort.abort(), 15000 + (expectBytes || 0) / 256); // + 4 s per MB
++        var timer = 0;
++        var stalled = () => { clearTimeout(timer); timer = setTimeout(() => abort.abort(), STALL_MS); };
++        stalled();
 +        try {
 +          // cache: 'no-store': the chunks are kept in Cache Storage already, and Chrome's HTTP
 +          // cache makes requests for one URL queue behind a single writer (up to 20 s each):
@@ -9057,14 +11110,30 @@ index 0000000..ab13bcc
 +          if (response.status === 404) throw response;
 +          if (!response.ok) throw new Error(`HTTP ${response.status}`);
 +          if (init.method === 'HEAD') return response;
-+          var bytes = new Uint8Array(await response.arrayBuffer());
-+          if (expectBytes && bytes.byteLength !== expectBytes) throw new Error(`short read ${bytes.byteLength}/${expectBytes}`);
++          var bytes;
++          if (response.body && expectBytes) {
++            // Read as it arrives: every piece pushes the stall deadline back
++            bytes = new Uint8Array(expectBytes);
++            var got = 0, reader = response.body.getReader();
++            for (;;) {
++              stalled();
++              var part = await reader.read();
++              if (part.done) break;
++              if (got + part.value.byteLength > expectBytes) throw new Error(`long read`);
++              bytes.set(part.value, got);
++              got += part.value.byteLength;
++            }
++            if (got !== expectBytes) throw new Error(`short read ${got}/${expectBytes}`);
++          } else {
++            bytes = new Uint8Array(await response.arrayBuffer());
++            if (expectBytes && bytes.byteLength !== expectBytes) throw new Error(`short read ${bytes.byteLength}/${expectBytes}`);
++          }
 +          return bytes;
 +        } catch (e) {
 +          if (e && e.status === 404) throw e;
 +          if (attempt >= 6) throw {status: 0};
-+          console.warn(`[disc] ${url.split('/').pop()}: ${e && e.name === 'AbortError' ? 'timed out' : e}; retrying (${attempt})`);
-+          await new Promise((r) => setTimeout(r, 500 * attempt));
++          err(`[disc] ${url.split('/').pop()}: ${e && e.name === 'AbortError' ? 'stalled' : e}; retrying (${attempt})`);
++          await new Promise((r) => setTimeout(r, 300 * attempt));
 +        } finally {
 +          clearTimeout(timer);
 +        }
@@ -9211,10 +11280,23 @@ index 0000000..ab13bcc
 +      if (ahead >= 2) requestChunks(info, last + 2, last + ahead);
 +      var waitStart = 0;
 +      for (var i = first; i <= last; i++) {
-+        if (!info.chunks.has(i)) {
++        var hedge = null, failure = null;
++        while (!info.chunks.has(i)) {
 +          waitStart ||= performance.now();
-+          await info.pending.get(i);
-+          if (!info.chunks.has(i)) requestChunks(info, i, i), await info.pending.get(i);
++          if (!info.pending.has(i)) requestChunks(info, i, i);
++          // The game is waiting on it: if it is slow (often inside a read-ahead request of
++          // several chunks, or on a connection that stalled), ask for this chunk alone as well,
++          // and take whichever answer comes first.
++          await Promise.race([info.pending.get(i).catch((e) => { failure = e; }), hedge || new Promise(() => {}),
++                              new Promise((r) => setTimeout(r, 1500))]);
++          if (failure && failure.status === 404) throw failure;
++          if (!info.chunks.has(i) && !hedge && performance.now() - waitStart >= 1500) {
++            let index = i;
++            var start = index * info.chunkSize, end = Math.min(start + info.chunkSize, info.size);
++            hedge = fetchRetry(info.url, {headers: {'Range': `bytes=${start}-${end - 1}`}}, end - start)
++              .then((chunk) => { if (!info.chunks.has(index)) info.chunks.set(index, chunk); })
++              .catch(() => {});
++          }
 +        }
 +      }
 +      if (waitStart) {
@@ -9308,10 +11390,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..aca8862
+index 0000000..4ef766c
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,1626 @@
+@@ -0,0 +1,1640 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -9575,6 +11657,12 @@ index 0000000..aca8862
 +	bool g_hd = true;     // HD texture pack (data/hd/): on unless <page>?hd=0 (start screen setting)
 +	bool g_halfRate = false; // picture at 30 fps (the game at 60): <page>?fps=30
 +	bool g_fsr = true;       // FSR 1 upscaling to the window: on unless <page>?fsr=0 (start screen setting)
++	// ?vulocals=1: VU1 context fields kept in wasm locals for whole functions. Off: measured slower in a
++	// match (VU1 worker ~50% vs ~36%: small blocks with many exits flush every written field at each)
++	bool g_vuContextLocals = false;
++	// ?vumodules=1: merge a micro memory image's VU1 blocks into one wasm instance. Off: 2.2x blocks/s in a
++	// bench but no gain in a match (VU1 ~36.5% vs ~36.8%, game thread higher)
++	bool g_vuModuleGroups = false;
 +	bool g_vuFlagAnalysis = true; // ?vuflags=0: VU1 flags maintained even when nothing reads them
 +	bool g_vuSuperblocks = true; // ?superblocks=0: one VU1 basic block per compiled function
 +	bool g_vuStats = false;  // ?vustats=1: VU1 block transition statistics (use with ?chain=0)
@@ -10648,6 +12736,12 @@ index 0000000..aca8862
 +			CVuExecutor::s_superblocks = g_vuSuperblocks;
 +			// Flags nothing in micro memory reads aren't maintained (?vuflags=0 keeps them all)
 +			CVuExecutor::s_flagAnalysis = g_vuFlagAnalysis;
++			// A micro memory image's blocks, once they stop changing, are merged into one wasm instance:
++			// chained jumps no longer cross instances (~18 ns each in Chrome, ~43 ns in Firefox)
++			CVuExecutor::s_moduleGroups = g_vuModuleGroups;
++			// VU1 context fields stay in wasm locals for a whole compiled function (CodeGen
++			// CacheContextInLocals) instead of being stored/reloaded around every block
++			Jitter::CCodeGen_Wasm::s_cacheContextInLocals = g_vuContextLocals;
 +			std::printf("[webgs] VU1 superblocks %s\n", g_vuSuperblocks ? "on" : "off");
 +			std::printf("[webgs] VU1 block chaining %s\n", (chainParam == 0) ? "off" : tailCalls ? "with tail calls" : "through the dispatcher");
 +		}
@@ -10871,6 +12965,8 @@ index 0000000..aca8862
 +		g_debug = EM_ASM_INT({ return new URLSearchParams(location.search).has('debug') ? 1 : 0; }) != 0;
 +		g_hd = EM_ASM_INT({ return new URLSearchParams(location.search).get('hd') === '0' ? 0 : 1; }) != 0;
 +		g_fsr = EM_ASM_INT({ return new URLSearchParams(location.search).get('fsr') === '0' ? 0 : 1; }) != 0;
++		g_vuContextLocals = EM_ASM_INT({ return new URLSearchParams(location.search).get('vulocals') === '1' ? 1 : 0; }) != 0;
++		g_vuModuleGroups = EM_ASM_INT({ return new URLSearchParams(location.search).get('vumodules') === '1' ? 1 : 0; }) != 0;
 +		g_vuFlagAnalysis = EM_ASM_INT({ return new URLSearchParams(location.search).get('vuflags') === '0' ? 0 : 1; }) != 0;
 +		g_vuSuperblocks = EM_ASM_INT({ return new URLSearchParams(location.search).get('superblocks') === '0' ? 0 : 1; }) != 0;
 +		g_vuSlowPercent = EM_ASM_INT({ return parseInt(new URLSearchParams(location.search).get('vuslow') || '0', 10) || 0; });

@@ -186,6 +186,35 @@ nativo están dentro de `__EMSCRIPTEN__`.
   nativo de EA suma ~11,5k ciclos de golpe, y empezar cada tramo donde acabó el anterior adelantaba
   el IOP ~3%, así que el sonido de los vídeos se consumía más rápido de lo que llegaba y el driver
   repetía bloques (un zumbido de ~94 Hz).
+- Bucles de espera del juego que duermen en el navegador (`game/overrides/nba_street_v3_overrides.cpp`,
+  `ps2xAddEeIdleLoop`, solo web): la espera de fotograma en 0x3E3920 y la de vídeos/menús en 0x3E36F0
+  ("while (flag) { callback; 32 NOPs }"). Girar en esta última hacía que el tiempo emulado avanzara a
+  saltos en vídeos y menús, y el driver de sonido de EA repetía bloques (ruido); dormido, el tiempo
+  avanza en pasos de 1 ms. Vídeo de inicio: hilo del juego ~95% -> ~20%, bloques repetidos -> 0.
+- Los temporizadores del EE avanzan en pasos de 2048 ciclos en la web (512 en nativo).
+- Mezclador del SPU2 (código de PCSX2, `spu2/SPU2/Mixer.cpp`, `ADSR.cpp`): incrementos de barrido y ADSR
+  calculados al escribir el registro, sin comprobaciones de IRQ por voz cuando no hay IRQ activa,
+  interpolación y suma de puertas con SIMD: +24%, idéntico en 10M muestras estéreo y 220k lecturas.
+- Cadenas DMA de VIF1 (`ps2_memory.cpp`, `ps2_vif1_interpreter.cpp`, `vif1_source.h`): con la VU remota la
+  cadena se decodifica desde los trozos de RDRAM/scratchpad y se escribe en el anillo del GS sin la copia
+  intermedia; idéntico byte a byte en 1500 cadenas aleatorias.
+- Bucle de voces del driver de sonido de EA (`iop_hle_routines.h`, `hle::eaVoiceIteration`): el IOP lo
+  ejecuta en nativo (88% del tiempo del IOP), comprobado contra el intérprete en 1.14M voces;
+  `?env=PS2X_IOP_EAVOICES=0` lo desactiva.
+- Saltos de tiempo (`EeScheduler.cpp`, web): un evento atrasado hace saltar el tiempo emulado solo dentro de
+  los bucles de espera registrados del juego; en otro sitio solo con 20 ms de retraso
+  (`?env=PS2X_WARP_LAG_MS=N`, 0 = en cualquier sitio). En equipos lentos, saltar a mitad del trabajo del juego
+  retrasaba al hilo que alimenta el sonido (chasquidos en los menús). En los bucles de espera el salto va de
+  1 ms en 1 ms (`?env=PS2X_WARP_STEP_US=N`, 0 = de golpe): un móvil recuperaba 8 ms de un salto, más que el
+  cambio de medio búfer del driver de sonido (5 ms). `?env=PS2X_EE_SLOW=N` hace el trabajo
+  del hilo del juego un N% más lento (simula un móvil).
+- Lectura del disco (`library_fetch_stream.js`): el plazo de cada petición es de progreso (6 s sin datos), y
+  un trozo que el juego lleva 1.5 s esperando se pide también por separado (una conexión trabada de un móvil
+  llegó a retener la música dos minutos).
+- Desactivado por defecto (en el juego medido peor o sin mejora): caché de llamadas del IOP + libsd nativa
+  (`?env=PS2X_IOP_IMPORT_CACHE=1&env=PS2X_IOP_LIBSD=1`), campos de la VU1 en locales (`?vulocals=1`),
+  grupos de módulos de la VU1 por microcódigo (`?vumodules=1`). La clave de la caché de bloques de la VU1
+  incluye ahora las instrucciones que el compilador lee fuera del bloque (podía reutilizar código viejo).
 - Diagnóstico: `?vustats=1&chain=0` (estadísticas de bloques de la VU1), `?env=NOMBRE=valor`
   (variables de entorno), `Module._ps2xSpu2Dump()` (últimos 8 s de entradas y salida del SPU2).
 - Planificador del EE: espera dormida con el tiempo avanzando en pasos de 1 ms, rebase del vblank

@@ -1,24 +1,60 @@
 diff --git a/Source/BasicBlock.cpp b/Source/BasicBlock.cpp
-index 4c460e6..f56d155 100644
+index 4c460e6..b12e3e2 100644
 --- a/Source/BasicBlock.cpp
 +++ b/Source/BasicBlock.cpp
-@@ -74,6 +74,10 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
+@@ -1,4 +1,7 @@
+ #include "BasicBlock.h"
++#ifdef __EMSCRIPTEN__
++#include "WasmModuleBuilder.h"
++#endif
+ #include "MemStream.h"
+ #include "offsetof_def.h"
+ #include "MipsJitter.h"
+@@ -74,6 +77,38 @@ void CBasicBlock::SetAotBlockOutputStream(Framework::CStdStream* outputStream)
  
  #endif
  
 +#ifdef __EMSCRIPTEN__
 +bool CBasicBlock::s_keepCode = false;
++
++//The blocks' functions become functions of one module (one instance), made from the modules they
++//were compiled to (kept with SetKeepModule): block chaining between them then stays within that
++//instance, much cheaper for browsers than jumping into other instances. False (and nothing
++//changed) if the modules can't be merged.
++bool CBasicBlock::GroupModules(const std::vector<CBasicBlock*>& blocks, uint32 group)
++{
++#ifndef AOT_USE_CACHE
++	std::vector<const std::vector<uint8>*> modules;
++	modules.reserve(blocks.size());
++	for(auto* block : blocks)
++	{
++		if(block->m_code.empty()) return false;
++		modules.push_back(&block->m_code);
++	}
++	std::vector<uint8> merged;
++	if(!CWasmModuleBuilder::MergeModules(modules, merged)) return false;
++	auto functions = CMemoryFunction::CreateGroup(merged.data(), merged.size(), static_cast<uint32>(blocks.size()));
++	for(size_t i = 0; i < blocks.size(); i++)
++	{
++		blocks[i]->m_function = std::move(functions[i]);
++		blocks[i]->m_moduleGroup = group;
++	}
++	return true;
++#else
++	return false;
++#endif
++}
 +#endif
 +
  void CBasicBlock::Compile()
  {
  #ifndef AOT_USE_CACHE
-@@ -99,6 +103,13 @@ void CBasicBlock::Compile()
+@@ -99,6 +134,13 @@ void CBasicBlock::Compile()
  	}
  
  	m_function = CMemoryFunction(stream.GetBuffer(), stream.GetSize());
 +#ifdef __EMSCRIPTEN__
-+	if(s_keepCode)
++	if(s_keepCode || m_keepModule)
 +	{
 +		auto bytes = reinterpret_cast<const uint8*>(stream.GetBuffer());
 +		m_code.assign(bytes, bytes + stream.GetSize());
@@ -27,7 +63,7 @@ index 4c460e6..f56d155 100644
  
  #ifdef VTUNE_ENABLED
  	if(iJIT_IsProfilingActive() == iJIT_SAMPLING_ON)
-@@ -306,6 +317,7 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+@@ -306,6 +348,7 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
  			}
  			jitter->EndIf();
  #endif
@@ -35,7 +71,7 @@ index 4c460e6..f56d155 100644
  		}
  	}
  	jitter->Else();
-@@ -324,10 +336,44 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
+@@ -324,10 +367,44 @@ void CBasicBlock::CompileEpilog(CMipsJitter* jitter, bool loopsOnItself)
  		}
  		jitter->EndIf();
  #endif
@@ -80,7 +116,7 @@ index 4c460e6..f56d155 100644
  void CBasicBlock::Execute()
  {
  	m_function(&m_context);
-@@ -453,6 +499,9 @@ void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
+@@ -453,6 +530,9 @@ void CBasicBlock::CopyFunctionFrom(const std::shared_ptr<CBasicBlock>& other)
  {
  #ifndef AOT_USE_CACHE
  	m_function = other->m_function.CreateInstance();
@@ -91,10 +127,10 @@ index 4c460e6..f56d155 100644
  #ifdef _DEBUG
  	std::copy(std::begin(other->m_linkBlock), std::end(other->m_linkBlock), m_linkBlock);
 diff --git a/Source/BasicBlock.h b/Source/BasicBlock.h
-index 56ef0ad..b9dbd73 100644
+index 56ef0ad..1da85bf 100644
 --- a/Source/BasicBlock.h
 +++ b/Source/BasicBlock.h
-@@ -1,138 +1,162 @@
+@@ -1,138 +1,179 @@
 -#pragma once
 -
 -#include "MIPS.h"
@@ -347,6 +383,21 @@ index 56ef0ad..b9dbd73 100644
 +	{
 +		return m_code;
 +	}
++	//Keep this block's module (set before Compile) so that it can be put in a group
++	void SetKeepModule(bool keepModule)
++	{
++		m_keepModule = keepModule;
++	}
++	bool HasModule() const
++	{
++		return !m_code.empty();
++	}
++	//0: the block has a module of its own
++	uint32 GetModuleGroup() const
++	{
++		return m_moduleGroup;
++	}
++	static bool GroupModules(const std::vector<CBasicBlock*>&, uint32);
 +#endif
 +
 +protected:
@@ -384,6 +435,8 @@ index 56ef0ad..b9dbd73 100644
 +	CMemoryFunction m_function;
 +#ifdef __EMSCRIPTEN__
 +	std::vector<uint8> m_code;
++	bool m_keepModule = false;
++	uint32 m_moduleGroup = 0;
 +#endif
 +#else
 +	void (*m_function)(void*);
@@ -1009,32 +1062,101 @@ index 052b681..f474dae 100644
  	struct BlockFmacPipelineInfo
  	{
 diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
-index 72e80fc..b923a68 100644
+index 72e80fc..6e62792 100644
 --- a/Source/ee/VuExecutor.cpp
 +++ b/Source/ee/VuExecutor.cpp
-@@ -2,6 +2,7 @@
+@@ -2,6 +2,9 @@
  #include "VuBasicBlock.h"
  #include "VUShared.h"
  #include "xxhash.h"
++#include <algorithm>
++#include <chrono>
 +#include <cstdio>
  
  // clang-format off
  const CVuExecutor::BLOCK_COMPILE_HINTS CVuExecutor::g_blockCompileHints[] =
-@@ -23,6 +24,8 @@ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
+@@ -21,8 +24,72 @@ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
+ 	m_blockNoClamping = std::move(blockNoClamping);
+ }
  
++int CVuExecutor::Execute(int cycles)
++{
++#ifdef __EMSCRIPTEN__
++	//Between Execute calls no block is running: their functions can be replaced
++	if(m_newActiveBlocks != 0)
++	{
++		m_quietExecutes++;
++		if(s_moduleGroups && m_chainEnabled && m_microMemoryHashValid &&
++		   ((m_quietExecutes >= s_moduleGroupQuiet) || (m_newActiveBlocks >= s_moduleGroupBlocks)))
++		{
++			GroupModules();
++		}
++	}
++#endif
++	return CGenericMipsExecutor::Execute(cycles);
++}
++
++#ifdef __EMSCRIPTEN__
++//The active blocks that aren't in a group yet, with the ones grouped before for this micro memory,
++//become functions of one new module (from the modules they were compiled to: nothing is compiled
++//again). Blocks in a group made for another micro memory (shared through m_cachedBlocks) stay there.
++void CVuExecutor::GroupModules()
++{
++	m_newActiveBlocks = 0;
++	m_quietExecutes = 0;
++	std::vector<CBasicBlock*> blocks;
++	bool hasNewBlock = false;
++	for(const auto& block : m_blocks)
++	{
++		if(!block->IsCompiled() || !block->HasModule()) continue;
++		if(!IsGroupedForThisMicroMemory(block.get())) continue;
++		hasNewBlock |= NeedsGroup(block.get());
++		blocks.push_back(block.get());
++	}
++	if(!hasNewBlock || (blocks.size() < 2)) return;
++	//Same order every time (m_blocks is unordered)
++	std::sort(blocks.begin(), blocks.end(), [](const CBasicBlock* lhs, const CBasicBlock* rhs) { return lhs->GetBeginAddress() < rhs->GetBeginAddress(); });
++	auto startTime = std::chrono::steady_clock::now();
++	uint32 newGroup = ++m_lastModuleGroup;
++	if(CBasicBlock::GroupModules(blocks, newGroup))
++	{
++		m_moduleGroups[m_microMemoryHash] = newGroup;
++		m_moduleGroupMicroMemories[newGroup] = m_microMemoryHash;
++		for(auto* block : blocks)
++			ChainBlockAdded(block);
++		s_moduleGroupStats.groups++;
++		s_moduleGroupStats.blocks += blocks.size();
++	}
++	else
++	{
++		s_moduleGroupStats.failed++;
++	}
++	s_moduleGroupStats.seconds += std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
++}
++#endif
++
  void CVuExecutor::Reset()
  {
++#ifdef __EMSCRIPTEN__
++	m_newActiveBlocks = 0;
++	m_quietExecutes = 0;
++	m_moduleGroups.clear();
++	m_moduleGroupMicroMemories.clear();
++#endif
 +	m_partitions.clear();
 +	m_microMemoryHashValid = false;
  	m_cachedBlocks.clear();
  	m_blockNoClamping.clear();
  	CGenericMipsExecutor::Reset();
-@@ -43,13 +46,15 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+@@ -43,13 +110,18 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
  	memcpy(&hash, &xxHash, sizeof(xxHash));
  	static_assert(sizeof(hash) == sizeof(xxHash));
  	auto blockKey = std::make_pair(hash, blockSizeByte);
-+	//Blocks compiled without some flags only fit micro memories that don't read them either
-+	auto cacheKey = std::make_pair(hash, blockSizeByte | (m_flagHints << 24));
++	//Blocks compiled without some flags only fit micro memories that don't read them either.
++	//The code also depends on a few instructions outside the range (see HashBlockSurroundings).
++	auto cacheHash = hash;
++	cacheHash.nD1 ^= HashBlockSurroundings(begin, end);
++	auto cacheKey = std::make_pair(cacheHash, blockSizeByte | (m_flagHints << 24));
  
  	//Don't use the cached blocks of we have a breakpoint in our block range.
  	bool hasBreakpoint = m_context.HasBreakpointInRange(begin, end);
@@ -1047,7 +1169,7 @@ index 72e80fc..b923a68 100644
  		//Check if we have a block that has the same contents and the same range.
  		for(auto blockIterator = beginBlockIterator; blockIterator != endBlockIterator; blockIterator++)
  		{
-@@ -64,7 +69,7 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+@@ -64,7 +136,7 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
  		{
  			auto result = std::make_shared<CVuBasicBlock>(context, begin, end, m_blockCategory);
  			result->CopyFunctionFrom(beginBlockIterator->second);
@@ -1056,11 +1178,14 @@ index 72e80fc..b923a68 100644
  			return result;
  		}
  	}
-@@ -84,19 +89,108 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+@@ -84,19 +156,170 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
  		result->AddBlockCompileHints(VUShared::COMPILEHINT_NO_CLAMPING);
  	}
  
 +	result->AddBlockCompileHints(m_flagHints);
++#ifdef __EMSCRIPTEN__
++	result->SetKeepModule(s_moduleGroups && m_chainEnabled); //For GroupModules
++#endif
  	result->Compile();
  	if(!hasBreakpoint)
  	{
@@ -1070,6 +1195,29 @@ index 72e80fc..b923a68 100644
  	return result;
  }
  
++//CVuBasicBlock's compilation also reads the instruction before the block (integer branch delay of a
++//branch at its start), the one after it (E bit in a delay slot) and the targets of B instructions
++//(B followed by a conditional branch in its delay slot): blocks with the same contents are only
++//shared where these are the same too.
++uint64 CVuExecutor::HashBlockSurroundings(uint32 begin, uint32 end) const
++{
++	std::vector<uint32> words;
++	auto add = [&](uint32 address) {
++		address &= m_addressMask;
++		words.push_back(m_context.m_pMemoryMap->GetInstruction(address));
++		words.push_back(m_context.m_pMemoryMap->GetInstruction(address + 4));
++	};
++	add(begin - 8);
++	add(end + 4);
++	for(uint32 address = begin; address < end; address += 8)
++	{
++		uint32 opcodeLo = m_context.m_pMemoryMap->GetInstruction(address);
++		if(((opcodeLo >> 25) & 0x7F) == 0x20) //B
++			add(address + VUShared::GetBranch(opcodeLo & 0x7FF) + 8);
++	}
++	return XXH3_64bits(words.data(), words.size() * sizeof(uint32));
++}
++
 +void CVuExecutor::ClearActiveBlocksInRange(uint32 start, uint32 end, bool executing)
 +{
 +	//Called before the new code is copied in: hashed again at the next partition
@@ -1104,13 +1252,49 @@ index 72e80fc..b923a68 100644
 +			{
 +				SetupBlockLinks(startAddress, known.endAddress, known.branchAddress);
 +			}
++			BlockActivated(known.block.get());
 +			return;
 +		}
 +	}
 +	PartitionNewFunction(startAddress, partitionKey);
++	BlockActivated(FindBlockStartingAt(startAddress));
++}
++
++#ifdef __EMSCRIPTEN__
++//Not in a group, or in one made for this micro memory
++bool CVuExecutor::IsGroupedForThisMicroMemory(CBasicBlock* block) const
++{
++	uint32 group = block->GetModuleGroup();
++	if(group == 0) return true;
++	auto microMemory = m_moduleGroupMicroMemories.find(group);
++	return (microMemory != std::end(m_moduleGroupMicroMemories)) && (microMemory->second == m_microMemoryHash);
++}
++
++//Not in the last group made for this micro memory (nor in a group of another one)
++bool CVuExecutor::NeedsGroup(CBasicBlock* block) const
++{
++	if(!IsGroupedForThisMicroMemory(block)) return false;
++	auto group = m_moduleGroups.find(m_microMemoryHash);
++	return (group == std::end(m_moduleGroups)) || (block->GetModuleGroup() != group->second);
++}
++#endif
++
++void CVuExecutor::BlockActivated(CBasicBlock* block)
++{
++#ifdef __EMSCRIPTEN__
++	if(NeedsGroup(block))
++	{
++		m_newActiveBlocks++;
++		m_quietExecutes = 0;
++	}
++#endif
 +}
 +
 +bool CVuExecutor::s_superblocks = true;
++bool CVuExecutor::s_moduleGroups = true;
++uint32 CVuExecutor::s_moduleGroupQuiet = 64;
++uint32 CVuExecutor::s_moduleGroupBlocks = 256;
++CVuExecutor::MODULE_GROUP_STATS CVuExecutor::s_moduleGroupStats;
 +bool CVuExecutor::s_flagAnalysis = true;
 +
 +//The MAC, status (sticky) and clip flags are pipelines the code maintains after every FMAC/CLIP
@@ -1169,7 +1353,7 @@ index 72e80fc..b923a68 100644
  	{
  		uint32 addrLo = address + 0;
  		uint32 addrHi = address + 4;
-@@ -105,18 +199,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+@@ -105,18 +328,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  		auto branchType = m_context.m_pArch->IsInstructionBranch(&m_context, addrLo, lowerOp);
  		if(upperOp & VUShared::VU_UPPEROP_BIT_E)
  		{
@@ -1203,7 +1387,7 @@ index 72e80fc..b923a68 100644
  			break;
  		}
  		else if(branchType == MIPS_BRANCH_NODELAY)
-@@ -125,6 +230,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+@@ -125,6 +359,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  			assert(false);
  		}
  	}
@@ -1233,7 +1417,7 @@ index 72e80fc..b923a68 100644
  	assert((endAddress - startAddress) <= MAX_BLOCK_SIZE);
  	CreateBlock(startAddress, endAddress);
  	auto block = static_cast<CVuBasicBlock*>(FindBlockStartingAt(startAddress));
-@@ -132,4 +260,10 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+@@ -132,4 +389,10 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  	{
  		SetupBlockLinks(startAddress, endAddress, branchAddress);
  	}
@@ -1245,10 +1429,18 @@ index 72e80fc..b923a68 100644
 +	m_partitions[partitionKey] = std::move(partition);
  }
 diff --git a/Source/ee/VuExecutor.h b/Source/ee/VuExecutor.h
-index e2b43c9..1888b3c 100644
+index e2b43c9..690ed6b 100644
 --- a/Source/ee/VuExecutor.h
 +++ b/Source/ee/VuExecutor.h
-@@ -14,7 +14,13 @@ public:
+@@ -1,6 +1,7 @@
+ #pragma once
+ 
+ #include <map>
++#include <unordered_map>
+ #include "../GenericMipsExecutor.h"
+ 
+ class CVuExecutor : public CGenericMipsExecutor<BlockLookupOneWay, 8>
+@@ -14,7 +15,29 @@ public:
  
  	void SetBlockNoClamping(BlockNoClampingSet);
  
@@ -1256,17 +1448,34 @@ index e2b43c9..1888b3c 100644
 +	static bool s_superblocks;
 +	//Flags that nothing in micro memory reads aren't maintained (?vuflags=0 turns it off)
 +	static bool s_flagAnalysis;
++	//WebAssembly with block chaining: once a micro memory's blocks stop changing, they're put
++	//together in one module (one instance), where chained jumps between them cost browsers far less
++	//than jumps between instances (?vumodules=0 turns it off). Regrouped after s_moduleGroupQuiet
++	//Execute calls without a new block, or once s_moduleGroupBlocks new blocks are waiting.
++	static bool s_moduleGroups;
++	static uint32 s_moduleGroupQuiet;
++	static uint32 s_moduleGroupBlocks;
++	struct MODULE_GROUP_STATS
++	{
++		uint64 groups = 0;      //modules made
++		uint64 blocks = 0;      //blocks put in them
++		uint64 failed = 0;      //groups that couldn't be made (blocks kept as they were)
++		double seconds = 0;     //time spent making them
++	};
++	static MODULE_GROUP_STATS s_moduleGroupStats;
 +
++	int Execute(int) override;
  	void Reset() override;
 +	void ClearActiveBlocksInRange(uint32, uint32, bool) override;
  
  protected:
  	typedef std::multimap<CachedBlockKey, BasicBlockPtr> CachedBlockMap;
-@@ -27,9 +33,39 @@ protected:
+@@ -27,9 +50,54 @@ protected:
  
  	BasicBlockPtr BlockFactory(CMIPS&, uint32, uint32) override;
  	void PartitionFunction(uint32) override;
 +	void PartitionNewFunction(uint32, const std::pair<uint64, uint32>&);
++	void BlockActivated(CBasicBlock*);
 +
 +	struct BLOCK_EXTENT
 +	{
@@ -1277,6 +1486,7 @@ index e2b43c9..1888b3c 100644
 +		bool stop = false;
 +	};
 +	BLOCK_EXTENT FindBlockExtent(uint32, uint32) const;
++	uint64 HashBlockSurroundings(uint32, uint32) const;
 +	uint32 ComputeFlagHints() const;
 +	uint32 m_flagHints = 0;
 +	enum
@@ -1301,6 +1511,19 @@ index e2b43c9..1888b3c 100644
 +	std::map<std::pair<uint64, uint32>, PARTITION> m_partitions;
 +	uint64 m_microMemoryHash = 0;
 +	bool m_microMemoryHashValid = false;
++
++#ifdef __EMSCRIPTEN__
++	void GroupModules();
++	uint32 m_newActiveBlocks = 0;  //blocks made active since the last GroupModules
++	uint32 m_quietExecutes = 0;    //Execute calls since a block was made active
++	uint32 m_lastModuleGroup = 0;
++	bool IsGroupedForThisMicroMemory(CBasicBlock*) const;
++	bool NeedsGroup(CBasicBlock*) const;
++	//The group made last for each micro memory (regrouped with that micro memory's new blocks), and
++	//the micro memory each group was made for
++	std::unordered_map<uint64, uint32> m_moduleGroups;
++	std::unordered_map<uint32, uint64> m_moduleGroupMicroMemories;
++#endif
  };
 diff --git a/Source/gs/GSH_OpenGL/CMakeLists.txt b/Source/gs/GSH_OpenGL/CMakeLists.txt
 index 0f89436..0dcec41 100644
