@@ -11390,10 +11390,10 @@ index 0000000..b5ea934
 +}
 diff --git a/ps2xRuntime/web/play_gs_host.cpp b/ps2xRuntime/web/play_gs_host.cpp
 new file mode 100644
-index 0000000..4ef766c
+index 0000000..f0cd657
 --- /dev/null
 +++ b/ps2xRuntime/web/play_gs_host.cpp
-@@ -0,0 +1,1640 @@
+@@ -0,0 +1,1647 @@
 +// GS host for the browser build: the consumer side of the live ring (gs_dump_writer.cpp) running
 +// on the page's main thread, drawing with the GS, VIF1/VU1 and GIF of the Play! emulator
 +// (https://github.com/jpd002/Play-, BSD-2-Clause): GSH_OpenGL on WebGL2, VU1 on Play!'s
@@ -11664,6 +11664,7 @@ index 0000000..4ef766c
 +	// bench but no gain in a match (VU1 ~36.5% vs ~36.8%, game thread higher)
 +	bool g_vuModuleGroups = false;
 +	bool g_vuFlagAnalysis = true; // ?vuflags=0: VU1 flags maintained even when nothing reads them
++	bool g_vuFlagTracking = true; // ?vuflagtrack=0: VU1 flag reads always scan the whole pipeline
 +	bool g_vuSuperblocks = true; // ?superblocks=0: one VU1 basic block per compiled function
 +	bool g_vuStats = false;  // ?vustats=1: VU1 block transition statistics (use with ?chain=0)
 +	int g_vuSlowPercent = 0; // ?vuslow=N: test aid, see RunVu1
@@ -12114,13 +12115,16 @@ index 0000000..4ef766c
 +
 +	void RunVu1(Host& h)
 +	{
-+		const double start = emscripten_get_now();
++		// The clock is a call out to JavaScript (~1.5% of the worker at a microprogram run's rate):
++		// timed only for the ?debug statistics, its only reader
++		const double start = g_debug ? emscripten_get_now() : 0.0;
 +		for(int i = 0; i < 100000 && h.vpu1->IsVuRunning(); i++)
 +		{
 +			h.vpu1->Execute(5000);
 +			h.vuSlices++;
 +		}
-+		h.vuMs += emscripten_get_now() - start;
++		if(g_debug)
++			h.vuMs += emscripten_get_now() - start;
 +		if(g_vuStats)
 +		{
 +			// ?vustats=1 (with ?chain=0): how VU1 blocks follow each other, for superblocks.
@@ -12736,6 +12740,8 @@ index 0000000..4ef766c
 +			CVuExecutor::s_superblocks = g_vuSuperblocks;
 +			// Flags nothing in micro memory reads aren't maintained (?vuflags=0 keeps them all)
 +			CVuExecutor::s_flagAnalysis = g_vuFlagAnalysis;
++			// Flag reads after a value queued in the same block read its slot directly (?vuflagtrack=0: scan)
++			VUShared::s_flagTracking = g_vuFlagTracking;
 +			// A micro memory image's blocks, once they stop changing, are merged into one wasm instance:
 +			// chained jumps no longer cross instances (~18 ns each in Chrome, ~43 ns in Firefox)
 +			CVuExecutor::s_moduleGroups = g_vuModuleGroups;
@@ -12968,6 +12974,7 @@ index 0000000..4ef766c
 +		g_vuContextLocals = EM_ASM_INT({ return new URLSearchParams(location.search).get('vulocals') === '1' ? 1 : 0; }) != 0;
 +		g_vuModuleGroups = EM_ASM_INT({ return new URLSearchParams(location.search).get('vumodules') === '1' ? 1 : 0; }) != 0;
 +		g_vuFlagAnalysis = EM_ASM_INT({ return new URLSearchParams(location.search).get('vuflags') === '0' ? 0 : 1; }) != 0;
++		g_vuFlagTracking = EM_ASM_INT({ return new URLSearchParams(location.search).get('vuflagtrack') === '0' ? 0 : 1; }) != 0;
 +		g_vuSuperblocks = EM_ASM_INT({ return new URLSearchParams(location.search).get('superblocks') === '0' ? 0 : 1; }) != 0;
 +		g_vuSlowPercent = EM_ASM_INT({ return parseInt(new URLSearchParams(location.search).get('vuslow') || '0', 10) || 0; });
 +		g_vuDump = EM_ASM_INT({ return new URLSearchParams(location.search).has('vudump') ? 1 : 0; }) != 0;
