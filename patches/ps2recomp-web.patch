@@ -234,7 +234,7 @@ index 8de31d8..e0e61bd 100644
          [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
          [[nodiscard]] std::span<uint8_t> ramMutable() noexcept { return m_ram; } // native HLE routines
 diff --git a/ps2xIOP/src/emulator/core/iop_spu2.cpp b/ps2xIOP/src/emulator/core/iop_spu2.cpp
-index 1bbdb22..9b9bbc4 100644
+index 1bbdb22..efb5ed3 100644
 --- a/ps2xIOP/src/emulator/core/iop_spu2.cpp
 +++ b/ps2xIOP/src/emulator/core/iop_spu2.cpp
 @@ -3,10 +3,13 @@
@@ -251,7 +251,7 @@ index 1bbdb22..9b9bbc4 100644
  
  namespace ps2x::iop
  {
-@@ -60,600 +63,87 @@ namespace ps2x::iop
+@@ -60,600 +63,92 @@ namespace ps2x::iop
      }
  }
  
@@ -422,7 +422,10 @@ index 1bbdb22..9b9bbc4 100644
 -        case kRegStatx: return core.statx;
 -        default: return raw(offset);
 -        }
-+        return ps2x::spu2::read(now(), phys);
++        const uint16_t value = ps2x::spu2::read(now(), phys);
++        if (m_trace)
++            m_trace->push_back({phys, value, false, m_clock ? *m_clock : 0u});
++        return value;
      }
  
      void Spu2::write16(uint32_t phys, uint16_t value)
@@ -518,6 +521,8 @@ index 1bbdb22..9b9bbc4 100644
 -        case kRegStatx: core.statx = value; break;
 -        default: break;
 -        }
++        if (m_trace)
++            m_trace->push_back({phys, value, true, m_clock ? *m_clock : 0u});
 +        ps2x::spu2::write(now(), phys, value);
      }
  
@@ -892,16 +897,16 @@ index 1bbdb22..9b9bbc4 100644
              m_statIrqs = 0u;
              m_statPeak = 0;
 diff --git a/ps2xIOP/src/emulator/core/iop_spu2.h b/ps2xIOP/src/emulator/core/iop_spu2.h
-index be7a058..279b497 100644
+index be7a058..61e8c46 100644
 --- a/ps2xIOP/src/emulator/core/iop_spu2.h
 +++ b/ps2xIOP/src/emulator/core/iop_spu2.h
-@@ -1,117 +1,51 @@
+@@ -1,117 +1,64 @@
  #pragma once
  
 -#include <array>
  #include <cstdint>
 -#include <deque>
--#include <vector>
+ #include <vector>
  
  namespace ps2x::iop::detail
  {
@@ -927,6 +932,17 @@ index be7a058..279b497 100644
 +        void reset(uint8_t *iopRam = nullptr);
 +        // The IOP clock, read at each register access and DMA so the SPU2 catches up first.
 +        void setClock(const uint64_t *iopCycle) noexcept { m_clock = iopCycle; }
++
++        // Register accesses as they happen (value and IOP cycle), while a trace is set (the IOP's
++        // HLE verify mode compares a native routine's accesses with the interpreted ones).
++        struct Access
++        {
++            uint32_t phys;
++            uint16_t value;
++            bool write;
++            uint64_t cycle;
++        };
++        void setTrace(std::vector<Access> *trace) noexcept { m_trace = trace; }
  
          [[nodiscard]] static bool contains(uint32_t phys) noexcept { return phys >= kBase && phys < kEnd; }
          uint16_t read16(uint32_t phys);
@@ -960,8 +976,7 @@ index be7a058..279b497 100644
 -            Sustain,
 -            Release,
 -        };
-+        [[nodiscard]] uint32_t now() const noexcept { return m_clock ? static_cast<uint32_t>(*m_clock) : 0u; }
- 
+-
 -        struct Voice
 -        {
 -            uint16_t volL = 0;
@@ -973,7 +988,8 @@ index be7a058..279b497 100644
 -            uint32_t lsa = 0;
 -            uint32_t nax = 0;
 -            bool lsaWritten = false;
--
++        [[nodiscard]] uint32_t now() const noexcept { return m_clock ? static_cast<uint32_t>(*m_clock) : 0u; }
+ 
 -            Phase phase = Phase::Off;
 -            int32_t env = 0;
 -            int32_t envDelay = 0;
@@ -1024,6 +1040,7 @@ index be7a058..279b497 100644
 -        bool m_cycleInitialized = false;
 -        std::vector<int16_t> m_outBlock;
 +        const uint64_t *m_clock = nullptr;
++        std::vector<Access> *m_trace = nullptr;
          uint64_t m_statSamples = 0u;
 -        uint32_t m_statKeyOns = 0u;
 -        uint32_t m_statDmaBytes = 0u;
@@ -2141,10 +2158,18 @@ index cae8d91..5ff0c36 100644
      };
  }
 diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
-index 423e0f0..a376a30 100644
+index 423e0f0..5967477 100644
 --- a/ps2xIOP/src/emulator/iop_emulator.cpp
 +++ b/ps2xIOP/src/emulator/iop_emulator.cpp
-@@ -148,6 +148,8 @@ namespace ps2x::iop::detail
+@@ -28,6 +28,7 @@ uint64_t g_iopStatRunCalls = 0;    // runCycles() calls
+ uint64_t g_iopStatEeCalls = 0;     // runEeCycles() calls (one per EE checkpoint)
+ 
+ #include <algorithm>
++#include <array>
+ #include <chrono>
+ #include <unordered_map>
+ #include <vector>
+@@ -148,6 +149,8 @@ namespace ps2x::iop::detail
              nextModuleId = 1;
              moduleCursor = kModuleLoadBase;
              totalCycles = 0;
@@ -2153,7 +2178,7 @@ index 423e0f0..a376a30 100644
              totalInstructions = 0;
              eeCycleCarry = 0;
              activeCpu = nullptr;
-@@ -272,6 +274,20 @@ namespace ps2x::iop::detail
+@@ -272,6 +275,20 @@ namespace ps2x::iop::detail
              Missing,
          };
  
@@ -2174,7 +2199,7 @@ index 423e0f0..a376a30 100644
          ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
          {
              const uint32_t a0 = cpu.gpr[4];
-@@ -616,6 +632,320 @@ namespace ps2x::iop::detail
+@@ -616,6 +633,191 @@ namespace ps2x::iop::detail
              return true;
          }
  
@@ -2232,173 +2257,44 @@ index 423e0f0..a376a30 100644
 +        uint32_t libsdExecute(CpuState &cpu, hle::LibsdRoutine routine, uint32_t table, uint32_t high, bool apply, uint32_t &result,
 +                             uint32_t *finalA0 = nullptr, uint32_t *finalA1 = nullptr)
 +        {
-+            const uint64_t start = totalCycles; // the routine's first instruction runs at this cycle
-+            const auto at = [&](uint32_t index)
++            struct Bus
 +            {
-+                if (apply)
-+                    totalCycles = start + index;
-+            };
-+            const auto entry = [&](uint32_t index) { return memory.read32(table + index); };
-+            uint32_t a0 = cpu.gpr[4], a1 = cpu.gpr[5], a2 = cpu.gpr[6], a3 = cpu.gpr[7];
-+            uint32_t v0 = 0, v1 = 0, at1 = cpu.gpr[1], hi = cpu.hi, lo = cpu.lo;
-+            uint32_t count = 0;
-+            const auto setStride = [&](uint32_t core, uint32_t flag)
-+            {
-+                // v1 = 0x400 - 984 * (a0 & 0x80 != 0); hi:lo = core * v1
-+                const uint32_t f = flag ? 1u : 0u;
-+                v0 = (((f << 5) - f) << 2) - f;
-+                v0 <<= 3;
-+                v1 = 0x400u - v0;
-+                const int64_t product = static_cast<int64_t>(static_cast<int32_t>(core)) * static_cast<int32_t>(v1);
-+                lo = static_cast<uint32_t>(product);
-+                hi = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32);
-+            };
-+            switch (routine)
-+            {
-+            case hle::LibsdRoutine::SetParam:
-+            {
-+                a2 = a0 & 1u;
-+                setStride(a2, a0 & 0x80u);
-+                v0 = (a0 >> 6) & 0x3FCu;
-+                a0 = (a0 & 0x3Eu) << 3;
-+                at1 = high + v0; // at = the lui's half + index, as in the guest
-+                v0 = entry(v0);
-+                a3 = lo;
-+                v0 = v0 + a3 + a0;
-+                at(22);
-+                if (apply)
-+                    memory.write16(v0, static_cast<uint16_t>(a1));
-+                result = v0;
-+                count = 23;
-+                break;
-+            }
-+            case hle::LibsdRoutine::GetParam:
-+            {
-+                a1 = a0 & 1u;
-+                setStride(a1, a0 & 0x80u);
-+                v0 = (a0 >> 6) & 0x3FCu;
-+                a0 = (a0 & 0x3Eu) << 3;
-+                at1 = high + v0;
-+                v0 = entry(v0);
-+                a2 = lo;
-+                v0 += a2;
-+                a0 += v0;
-+                at(21);
-+                v0 = memory.read16(a0);
-+                result = v0;
-+                count = 24;
-+                break;
-+            }
-+            case hle::LibsdRoutine::SetAddr:
-+            {
-+                a2 = a1;
-+                v0 = (a0 >> 6) & 0x3FCu;
-+                v1 = a0 & 1u;
-+                a1 = entry(v0);
-+                v1 <<= 10;
-+                a1 += v1;
-+                v1 = a0 & 0x3Eu;
-+                v0 = ((v1 << 1) + v1) << 1;
-+                a1 += v0;
-+                v0 = a2 >> 17;
-+                a0 &= 0xFF00u;
-+                at(16);
-+                if (apply)
-+                    memory.write16(a1, static_cast<uint16_t>(v0));
-+                v0 = 0x1D00u;
-+                const bool shortForm = a0 == v0;
-+                a1 += 2u;
-+                if (shortForm)
-+                    count = 22;
-+                else
++                IopMemory &memory;
++                uint64_t &cycles;
++                uint64_t start; // the routine's first instruction runs at this cycle
++                bool apply;
++                uint32_t lw(uint32_t address) { return memory.read32(address); }
++                uint32_t io16(uint32_t address, uint32_t index)
 +                {
-+                    v0 = (a2 >> 1) & 0xFFF8u;
-+                    at(22);
 +                    if (apply)
-+                        memory.write16(a1, static_cast<uint16_t>(v0));
-+                    count = 25;
++                        cycles = start + index;
++                    return memory.read16(address);
 +                }
-+                result = v0;
-+                break;
-+            }
-+            case hle::LibsdRoutine::GetAddr:
-+            {
-+                a3 = 0x1FFFFu;
-+                v0 = (a0 >> 6) & 0x3FCu;
-+                v1 = (a0 & 1u) << 10;
-+                a1 = entry(v0) + v1;
-+                v1 = a0 & 0x3Eu;
-+                v0 = ((v1 << 1) + v1) << 1;
-+                a1 += v0;
-+                at(15);
-+                v0 = memory.read16(a1);
-+                a0 &= 0xFF00u;
-+                a2 = v0 << 17;
-+                v0 = 0x1D00u;
-+                if (a0 == v0)
-+                    count = 23;
-+                else
++                void io16(uint32_t address, uint16_t value, uint32_t index)
 +                {
-+                    at(21);
-+                    v0 = memory.read16(a1 + 2u);
-+                    a3 = v0 << 1;
-+                    uint32_t reread = 0; // index of the second read (0: none)
-+                    if (a0 == 0x2100u)
-+                        reread = 27;
-+                    else if (a0 == 0x2200u)
-+                        reread = 29;
-+                    else
-+                    {
-+                        v0 = 0x2200u;
-+                        count = 31;
-+                    }
-+                    if (reread != 0u)
-+                    {
-+                        at(reread);
-+                        v0 = memory.read16(a1);
-+                        at(reread + 1u);
-+                        v1 = memory.read16(a1 + 2u);
-+                        v0 <<= 17;
-+                        v1 <<= 1;
-+                        if (a2 != v0)
-+                        {
-+                            a2 = v0;
-+                            a3 = v1;
-+                            count = reread + 9u;
-+                        }
-+                        else if (a3 != v1)
-+                            count = reread + 9u;
-+                        else
-+                        {
-+                            a2 = v0;
-+                            a3 = v1;
-+                            count = reread + 11u;
-+                        }
-+                    }
++                    if (!apply)
++                        return;
++                    cycles = start + index;
++                    memory.write16(address, value);
 +                }
-+                v0 = a2 | a3;
-+                result = v0;
-+                break;
-+            }
-+            case hle::LibsdRoutine::None:
-+                return 0;
-+            }
++            } bus{memory, totalCycles, totalCycles, apply};
++            struct
++            {
++                std::array<uint32_t, 32> gpr;
++                uint32_t hi, lo;
++            } regs{cpu.gpr, cpu.hi, cpu.lo};
++            const uint32_t count = hle::libsdRun(routine, regs, bus, table, high, 0u);
++            result = regs.gpr[2];
 +            if (finalA0)
-+                *finalA0 = a0;
++                *finalA0 = regs.gpr[4];
 +            if (finalA1)
-+                *finalA1 = a1;
++                *finalA1 = regs.gpr[5];
 +            if (apply)
 +            {
-+                cpu.gpr[1] = at1;
-+                cpu.gpr[2] = v0;
-+                cpu.gpr[3] = v1;
-+                cpu.gpr[4] = a0;
-+                cpu.gpr[5] = a1;
-+                cpu.gpr[6] = a2;
-+                cpu.gpr[7] = a3;
-+                cpu.hi = hi;
-+                cpu.lo = lo;
-+                totalCycles = start + count;
++                cpu.gpr = regs.gpr;
++                cpu.hi = regs.hi;
++                cpu.lo = regs.lo;
++                totalCycles = bus.start + count;
 +            }
 +            return count;
 +        }
@@ -2495,19 +2391,395 @@ index 423e0f0..a376a30 100644
          void finishEaMixerVerify()
          {
              eaMixerVerify.active = false;
-@@ -689,8 +1019,10 @@ namespace ps2x::iop::detail
+@@ -654,6 +856,350 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
++        // Native EA voice loop body (hle::eaVoiceIteration), one voice per call from the loop
++        // head; iterations that call the driver's 0x54F88 stay interpreted. Every SPU2 access
++        // happens at the IOP cycle the interpreter reaches it, and the iteration is charged the
++        // instructions the guest path takes. An interrupt the interpreter would take inside the
++        // iteration (SPU2/DMA completion found by the per-instruction service) is taken after it.
++        // PS2X_IOP_EAVOICES=0 (or PS2X_IOP_HLE=0) runs the guest code; PS2X_IOP_HLE=verify runs
++        // it too, recording its SPU2 accesses, and then replays the native iteration on the entry
++        // state: registers, the memory it reads and writes (the whole RAM every 256 checks) and
++        // the SPU2 accesses with their values and cycles must come out identical.
++        struct EaVoiceTargets
++        {
++            uint32_t generation = 0;
++            bool ready = false;
++            uint32_t target[4] = {}; // the libsd routines its stubs reach
++            hle::EaVoiceLibsd libsd{};
++            uint64_t native = 0, driver = 0;
++        } eaVoice;
++        struct EaVoiceVerify
++        {
++            bool active = false;
++            bool foreign = false; // other code ran inside the interpreted iteration
++            bool full = false;
++            const CpuState *cpu = nullptr;
++            CpuState entry{};
++            uint64_t startCycles = 0, startInstructions = 0;
++            struct Range
++            {
++                uint32_t address, size, offset; // physical, into bytes
++            };
++            std::vector<Range> ranges;
++            std::vector<uint8_t> bytes;
++            std::vector<uint8_t> ram; // full entry RAM (every 256 checks)
++            std::vector<Spu2::Access> trace;
++            uint64_t checked = 0, mismatched = 0, foreignChecks = 0, driver = 0;
++            uint32_t reports = 0;
++        } eaVoiceVerify;
++
++        static int eaVoiceMode()
++        {
++            static const int mode = []
++            {
++                const char *only = std::getenv("PS2X_IOP_EAVOICES");
++                if (only && only[0] == '0')
++                    return 0;
++                const char *env = std::getenv("PS2X_IOP_HLE");
++                if (env && env[0] == '0')
++                    return 0;
++                if (env && std::strcmp(env, "verify") == 0)
++                    return 2;
++                return 1;
++            }();
++            return mode;
++        }
++
++        // The loop and the four libsd routines it reaches through its import stubs, word for word.
++        bool eaVoiceReady()
++        {
++            const uint8_t *ram = memory.ram().data();
++            if (eaVoice.generation != imports.generation())
++            {
++                eaVoice.generation = imports.generation();
++                eaVoice.ready = false;
++                if (!hle::eaVoiceLoopMatches(ram))
++                    return false;
++                bool ok = true;
++                for (int i = 0; i < 4 && ok; ++i)
++                {
++                    const auto call = imports.decode(hle::kEaVoiceStubs[i]);
++                    ok = call && iequals(call->library, "libsd") && call->ordinal == hle::kEaVoiceStubExports[i];
++                    const uint32_t target = ok ? imports.resolve(call->library, call->ordinal, call->version) : 0u;
++                    eaVoice.target[i] = target;
++                    ok = ok && target != 0u &&
++                         hle::libsdRoutineAt(ram, target, eaVoice.libsd.table[i], eaVoice.libsd.high[i]) == hle::kEaVoiceStubRoutines[i];
++                }
++                eaVoice.ready = ok;
++                char line[128];
++                std::snprintf(line, sizeof(line), "[IOP] EA voice loop at 0x%X: %s (libsd table 0x%X)", hle::kEaVoiceLoopAddress,
++                              ok ? (eaVoiceMode() == 2 ? "verifying" : "native") : "libsd not as expected, interpreted", eaVoice.libsd.table[0]);
++                log(LogLevel::Info, line);
++            }
++            return eaVoice.ready;
++        }
++
++        // Guest machine for hle::eaVoiceIteration: the IOP itself (SPU2 accesses at their cycle).
++        struct EaVoiceBus
++        {
++            IopMemory &memory;
++            uint64_t &cycles;
++            uint64_t start;
++            uint32_t lw(uint32_t address) { return memory.read32(address); }
++            uint32_t lhu(uint32_t address) { return memory.read16(address); }
++            uint32_t lbu(uint32_t address) { return memory.read8(address); }
++            void sw(uint32_t address, uint32_t value) { memory.write32(address, value); }
++            void sh(uint32_t address, uint16_t value) { memory.write16(address, value); }
++            void sb(uint32_t address, uint8_t value) { memory.write8(address, value); }
++            uint32_t io16(uint32_t address, uint32_t index)
++            {
++                cycles = start + index;
++                return memory.read16(address);
++            }
++            void io16(uint32_t address, uint16_t value, uint32_t index)
++            {
++                cycles = start + index;
++                memory.write16(address, value);
++            }
++        };
++
++        bool runEaVoiceHle(CpuState &cpu)
++        {
++            const int mode = eaVoiceMode();
++            if (mode == 0 || eaVoiceVerify.active || cpu.branchPending || cpu.pendingLoad)
++                return false;
++            const uint8_t *ram = memory.ram().data();
++            if (!eaVoiceReady())
++                return false;
++            if (cpu.gpr[19] == 0u) // each call of the update: the code is still the same
++            {
++                bool same = hle::eaVoiceLoopMatches(ram);
++                for (int i = 0; i < 4 && same; ++i)
++                {
++                    uint32_t table = 0, high = 0;
++                    same = hle::libsdRoutineAt(ram, eaVoice.target[i], table, high) == hle::kEaVoiceStubRoutines[i] &&
++                           table == eaVoice.libsd.table[i];
++                }
++                if (!same)
++                {
++                    eaVoice.generation = 0; // look again
++                    return false;
++                }
++            }
++            const uint32_t sp = cpu.gpr[29];
++            const uint32_t s1 = memory.read32(sp + 0x20u) + hle::kEaVoiceShadow;
++            const uint32_t slot = memory.read32(sp + 0x1Cu);
++            if (cpu.gpr[19] >= 48u || ((cpu.gpr[16] | sp | s1 | slot) & 3u) != 0u)
++                return false;
++            EaVoiceBus bus{memory, totalCycles, totalCycles};
++            if (hle::eaVoiceCallsDriver(cpu, bus))
++            {
++                ++(mode == 2 ? eaVoiceVerify.driver : eaVoice.driver);
++                return false;
++            }
++            if (mode == 2)
++            {
++                startEaVoiceVerify(cpu, s1, slot);
++                return false; // the interpreter runs it
++            }
++            const uint64_t start = totalCycles;
++            const uint32_t count = hle::eaVoiceIteration(cpu, bus, eaVoice.libsd);
++            totalCycles = start + count;
++            totalInstructions += count;
++            cpu.branchPending = false;
++            if (++eaVoice.native % 500000u == 0u)
++            {
++                char line[128];
++                std::snprintf(line, sizeof(line), "[IOP] EA voice loop: %llu voices native, %llu interpreted (driver call)",
++                              (unsigned long long)eaVoice.native, (unsigned long long)eaVoice.driver);
++                log(LogLevel::Info, line);
++            }
++            return true;
++        }
++
++        void startEaVoiceVerify(const CpuState &cpu, uint32_t s1, uint32_t slot)
++        {
++            EaVoiceVerify &v = eaVoiceVerify;
++            v.active = true;
++            v.foreign = false;
++            v.cpu = &cpu;
++            v.entry = cpu;
++            v.startCycles = totalCycles;
++            v.startInstructions = totalInstructions;
++            v.ranges.clear();
++            v.bytes.clear();
++            // What the iteration reads: its record, shadow, flag bytes, stack slots, libsd's table
++            // (its own words, the slot and NAX state words it writes are compared after)
++            const auto keep = [&](uint32_t address, uint32_t size)
++            {
++                const uint32_t phys = IopMemory::physicalAddress(address);
++                v.ranges.push_back({phys, size, static_cast<uint32_t>(v.bytes.size())});
++                for (uint32_t i = 0; i < size; ++i)
++                    v.bytes.push_back(memory.read8(phys + i));
++            };
++            keep(cpu.gpr[16], 8u);
++            keep(s1, 8u);
++            keep(cpu.gpr[30] - 1u, 2u);
++            keep(cpu.gpr[29] + 0x10u, 0x14u);
++            keep(eaVoice.libsd.table[0], 0x400u);
++            keep(slot, 4u);
++            keep(hle::kEaVoiceState + memory.read32(cpu.gpr[29] + 0x20u) + 0x3Cu, 4u);
++            v.full = v.checked % 256u == 0u;
++            if (v.full)
++                v.ram.assign(memory.ram().begin(), memory.ram().end());
++            v.trace.clear();
++            memory.spu2().setTrace(&v.trace);
++        }
++
++        // Replays the native iteration on the entry state, SPU2 reads answered from the trace.
++        struct EaVoiceReplayBus
++        {
++            EaVoiceVerify &v;
++            uint64_t start;
++            size_t next = 0;
++            std::vector<std::pair<uint32_t, uint8_t>> writes;
++            bool outside = false; // read memory it was not expected to
++            std::string problem;
++            uint8_t byte(uint32_t address)
++            {
++                const uint32_t phys = IopMemory::physicalAddress(address);
++                for (auto it = writes.rbegin(); it != writes.rend(); ++it)
++                    if (it->first == phys)
++                        return it->second;
++                for (const EaVoiceVerify::Range &range : v.ranges)
++                    if (phys >= range.address && phys - range.address < range.size)
++                        return v.bytes[range.offset + (phys - range.address)];
++                outside = true;
++                return 0u;
++            }
++            void put(uint32_t address, uint32_t value, uint32_t size)
++            {
++                const uint32_t phys = IopMemory::physicalAddress(address);
++                for (uint32_t i = 0; i < size; ++i)
++                    writes.emplace_back(phys + i, static_cast<uint8_t>(value >> (8u * i)));
++            }
++            uint32_t lw(uint32_t a) { return byte(a) | byte(a + 1u) << 8 | byte(a + 2u) << 16 | static_cast<uint32_t>(byte(a + 3u)) << 24; }
++            uint32_t lhu(uint32_t a) { return byte(a) | byte(a + 1u) << 8; }
++            uint32_t lbu(uint32_t a) { return byte(a); }
++            void sw(uint32_t a, uint32_t value) { put(a, value, 4u); }
++            void sh(uint32_t a, uint16_t value) { put(a, value, 2u); }
++            void sb(uint32_t a, uint8_t value) { put(a, value, 1u); }
++            const Spu2::Access *access(uint32_t address, bool write, uint32_t index)
++            {
++                const uint32_t phys = IopMemory::physicalAddress(address);
++                const Spu2::Access *recorded = next < v.trace.size() ? &v.trace[next] : nullptr;
++                ++next;
++                if (problem.empty() && (!recorded || recorded->phys != phys || recorded->write != write || recorded->cycle != start + index))
++                {
++                    char line[160];
++                    std::snprintf(line, sizeof(line), "SPU2 %s %X at +%u, guest %s %X at +%lld", write ? "write" : "read", phys, index,
++                                  recorded ? (recorded->write ? "write" : "read") : "nothing", recorded ? recorded->phys : 0u,
++                                  recorded ? static_cast<long long>(recorded->cycle - start) : -1ll);
++                    problem = line;
++                }
++                return recorded;
++            }
++            uint32_t io16(uint32_t address, uint32_t index)
++            {
++                const Spu2::Access *recorded = access(address, false, index);
++                return recorded ? recorded->value : 0u;
++            }
++            void io16(uint32_t address, uint16_t value, uint32_t index)
++            {
++                const Spu2::Access *recorded = access(address, true, index);
++                if (problem.empty() && recorded && recorded->value != value)
++                {
++                    char line[96];
++                    std::snprintf(line, sizeof(line), "SPU2 write %X = %04x at +%u, guest wrote %04x", recorded->phys, value, index, recorded->value);
++                    problem = line;
++                }
++            }
++        };
++
++        void finishEaVoiceVerify(const CpuState &cpu)
++        {
++            EaVoiceVerify &v = eaVoiceVerify;
++            v.active = false;
++            memory.spu2().setTrace(nullptr);
++            EaVoiceReplayBus bus{v, v.startCycles};
++            CpuState native = v.entry;
++            const uint32_t count = hle::eaVoiceIteration(native, bus, eaVoice.libsd);
++            std::string problem = bus.problem;
++            const auto fail = [&](const char *what)
++            {
++                if (problem.empty())
++                    problem = what;
++            };
++            if (count == 0u)
++                fail("native would call the driver");
++            if (bus.outside)
++                fail("native read memory outside the snapshot");
++            if (bus.next != v.trace.size())
++            {
++                char line[96];
++                std::snprintf(line, sizeof(line), "native made %zu SPU2 accesses, guest %zu", bus.next, v.trace.size());
++                fail(line);
++            }
++            for (uint32_t i = 0; i < 32u && problem.empty(); ++i)
++                if (native.gpr[i] != cpu.gpr[i])
++                {
++                    char line[96];
++                    std::snprintf(line, sizeof(line), "r%u %08x, guest %08x", i, native.gpr[i], cpu.gpr[i]);
++                    fail(line);
++                }
++            if (native.hi != cpu.hi || native.lo != cpu.lo || native.pc != cpu.pc)
++                fail("hi/lo/pc differ");
++            if (!v.foreign && (totalCycles - v.startCycles != count || totalInstructions - v.startInstructions != count))
++            {
++                char line[96];
++                std::snprintf(line, sizeof(line), "native %u cycles, guest %llu", count, (unsigned long long)(totalCycles - v.startCycles));
++                fail(line);
++            }
++            const uint8_t *ram = memory.ram().data();
++            for (const auto &[phys, value] : bus.writes)
++                if (problem.empty() && bus.byte(phys) != ram[phys])
++                {
++                    char line[96];
++                    std::snprintf(line, sizeof(line), "byte %X = %02x, guest %02x", phys, bus.byte(phys), ram[phys]);
++                    fail(line);
++                }
++            const auto written = [&](uint32_t phys)
++            {
++                for (const auto &entry : bus.writes)
++                    if (entry.first == phys)
++                        return true;
++                return false;
++            };
++            for (const EaVoiceVerify::Range &range : v.ranges)
++                for (uint32_t i = 0; i < range.size && problem.empty(); ++i)
++                    if (!written(range.address + i) && ram[range.address + i] != v.bytes[range.offset + i])
++                        fail("guest changed a byte native left alone");
++            if (v.full)
++                for (uint32_t i = 0; i < IopMemory::RamSize && problem.empty(); ++i)
++                    if (ram[i] != v.ram[i] && !written(i))
++                    {
++                        char line[96];
++                        std::snprintf(line, sizeof(line), "guest changed %X (native did not)", i);
++                        fail(line);
++                    }
++            ++v.checked;
++            if (v.foreign)
++                ++v.foreignChecks;
++            const bool mismatch = !problem.empty() && !v.foreign;
++            if (mismatch)
++                ++v.mismatched;
++            if ((!problem.empty() && v.reports < 40u) || v.checked % 20000u == 1u)
++            {
++                if (!problem.empty())
++                    ++v.reports;
++                char line[320];
++                std::snprintf(line, sizeof(line), "[IOP hle verify] EA voice %u (s3 %u): %s%s; totals %llu checked, %llu mismatched, %llu with other code inside, %llu left to the guest (driver call)",
++                              v.entry.gpr[19], v.entry.gpr[19], problem.empty() ? "ok" : (v.foreign ? "differs (other code ran inside): " : "MISMATCH: "), problem.c_str(),
++                              (unsigned long long)v.checked, (unsigned long long)v.mismatched, (unsigned long long)v.foreignChecks, (unsigned long long)v.driver);
++                log(LogLevel::Info, line);
++            }
++        }
++
+         bool step(CpuState &cpu)
+         {
+             if (cpu.stopped)
+@@ -672,7 +1218,11 @@ namespace ps2x::iop::detail
+                 return false;
+             }
+             if (checkInterrupt(cpu))
++            {
++                if (eaVoiceVerify.active)
++                    eaVoiceVerify.foreign = true;
+                 return true;
++            }
+             if (!traceReturns.empty())
+             {
+                 if (const auto pending = traceReturns.find(cpu.pc); pending != traceReturns.end())
+@@ -689,8 +1239,23 @@ namespace ps2x::iop::detail
                  return true;
              if (eaMixerVerify.active && cpu.pc == eaMixerVerify.ra && cpu.gpr[29] == eaMixerVerify.sp)
                  finishEaMixerVerify();
 +            if (libsdVerify.active && cpu.pc == libsdVerify.ra && cpu.gpr[29] == libsdVerify.sp)
 +                finishLibsdVerify(cpu);
++            if (eaVoiceVerify.active)
++            {
++                if ((cpu.pc == hle::kEaVoiceLoopAddress || cpu.pc == hle::kEaVoiceLoopExit) && &cpu == eaVoiceVerify.cpu &&
++                    cpu.gpr[29] == eaVoiceVerify.entry.gpr[29] && !cpu.branchPending)
++                    finishEaVoiceVerify(cpu);
++                else if (totalCycles - eaVoiceVerify.startCycles > 4000000u) // never came back (thread gone)
++                {
++                    eaVoiceVerify.active = false;
++                    memory.spu2().setTrace(nullptr);
++                }
++            }
++            if (cpu.pc == hle::kEaVoiceLoopAddress && runEaVoiceHle(cpu))
++                return true;
  
 -            if (const auto import = imports.decode(cpu.pc))
 +            if (IopImportRegistry::CachedImport *cachedImport = imports.decodeCached(cpu.pc))
              {
                  // PS2X_IOP_IMPORT_TRACE=1: log every import call (HLE or guest library) with its
                  // arguments and result, up to 20000 lines.
-@@ -711,11 +1043,33 @@ namespace ps2x::iop::detail
+@@ -711,11 +1276,33 @@ namespace ps2x::iop::detail
                          s_traceHi = 0xFFFFFFFFu;
                      return true;
                  }();
@@ -2543,7 +2815,16 @@ index 423e0f0..a376a30 100644
                  // PS2X_IOP_IMPORT_TRACE_SKIP="thbase,thevent": libraries left out of the trace.
                  static const std::string s_traceSkip = []
                  {
-@@ -802,6 +1156,10 @@ namespace ps2x::iop::detail
+@@ -761,6 +1348,8 @@ namespace ps2x::iop::detail
+         {
+             CpuState *previous = activeCpu;
+             activeCpu = &cpu;
++            if (eaVoiceVerify.active && &cpu != eaVoiceVerify.cpu)
++                eaVoiceVerify.foreign = true;
+             const uint64_t start = totalInstructions;
+             // PS2X_IOP_PC_STATS=1: sample the IOP pc every 1024 instructions, print the hottest
+             // addresses every 5 s (which IRX code keeps the IOP busy).
+@@ -802,6 +1391,10 @@ namespace ps2x::iop::detail
                  }
                  if (!step(cpu))
                      break;
@@ -2554,7 +2835,7 @@ index 423e0f0..a376a30 100644
                  if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
                      servicePendingDmaInterrupts();
                  if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
-@@ -976,10 +1334,19 @@ namespace ps2x::iop::detail
+@@ -976,10 +1569,19 @@ namespace ps2x::iop::detail
          // interrupt (line 9), delivered through the same path as the SPU2 DMA interrupts.
          void serviceSpu2()
          {
@@ -2574,7 +2855,7 @@ index 423e0f0..a376a30 100644
          }
  
          // DEV9 (network adapter): received frames and register writes raise the SPEED interrupt
-@@ -1029,15 +1396,22 @@ namespace ps2x::iop::detail
+@@ -1029,15 +1631,22 @@ namespace ps2x::iop::detail
          {
              try
              {
@@ -2600,7 +2881,7 @@ index 423e0f0..a376a30 100644
                      }
                      servicePendingDmaInterrupts();
                      servicePendingGuestCallbacks();
-@@ -1059,9 +1433,9 @@ namespace ps2x::iop::detail
+@@ -1059,9 +1668,9 @@ namespace ps2x::iop::detail
                          continue;
                      }
                      const uint64_t before = totalCycles;
@@ -2612,7 +2893,7 @@ index 423e0f0..a376a30 100644
                      kernel.endTimeslice(*next, kThreadReturnSentinel);
                      if (totalCycles == before)
                          ++totalCycles;
-@@ -1221,6 +1595,9 @@ namespace ps2x::iop::detail
+@@ -1221,6 +1830,9 @@ namespace ps2x::iop::detail
          uint32_t nextModuleId = 1;
          uint32_t moduleCursor = kModuleLoadBase;
          uint64_t totalCycles = 0;
@@ -2622,7 +2903,7 @@ index 423e0f0..a376a30 100644
          uint64_t totalInstructions = 0;
          uint64_t eeCycleCarry = 0;
          CpuState *activeCpu = nullptr;
-@@ -1296,9 +1673,9 @@ namespace ps2x::iop::detail
+@@ -1296,9 +1908,9 @@ namespace ps2x::iop::detail
          const uint64_t iopCycles = total / 8u;
          m_impl->eeCycleCarry = total % 8u;
          ++g_iopStatRunCalls;
@@ -2635,7 +2916,7 @@ index 423e0f0..a376a30 100644
  
      RpcResult IopEmulator::handleRpc(const RpcRequest &request)
 diff --git a/ps2xIOP/src/emulator/iop_hle_routines.h b/ps2xIOP/src/emulator/iop_hle_routines.h
-index ed38992..cec0889 100644
+index ed38992..cc6c45a 100644
 --- a/ps2xIOP/src/emulator/iop_hle_routines.h
 +++ b/ps2xIOP/src/emulator/iop_hle_routines.h
 @@ -7,6 +7,7 @@
@@ -2646,7 +2927,7 @@ index ed38992..cec0889 100644
  
  namespace ps2x::iop::detail::hle
  {
-@@ -124,4 +125,68 @@ namespace ps2x::iop::detail::hle
+@@ -124,4 +125,476 @@ namespace ps2x::iop::detail::hle
              }
          }
      }
@@ -2713,6 +2994,414 @@ index ed38992..cec0889 100644
 +            return info.routine;
 +        }
 +        return LibsdRoutine::None;
++    }
++
++    // The four libsd routines above, generic over the machine they run on. Regs has gpr[32], hi
++    // and lo; Bus has lw(address) for RAM and io16(address, index) / io16(address, value, index)
++    // for the routine's one register access per half word, index = how many instructions of the
++    // caller's sequence (base + the routine's own) ran before it, i.e. the IOP cycle it happens
++    // at relative to the caller's start. Returns the instructions the guest routine executes.
++    template <class Regs, class Bus>
++    uint32_t libsdRun(LibsdRoutine routine, Regs &c, Bus &bus, uint32_t table, uint32_t high, uint32_t base)
++    {
++        auto &r = c.gpr;
++        uint32_t a0 = r[4];
++        const auto stride = [&](uint32_t core)
++        {
++            // v1 = 0x400 - 984 * (a0 & 0x80 != 0); hi:lo = core * v1
++            const uint32_t f = (a0 & 0x80u) ? 1u : 0u;
++            r[2] = ((((f << 5) - f) << 2) - f) << 3;
++            r[3] = 0x400u - r[2];
++            const int64_t product = static_cast<int64_t>(static_cast<int32_t>(core)) * static_cast<int32_t>(r[3]);
++            c.lo = static_cast<uint32_t>(product);
++            c.hi = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32);
++        };
++        switch (routine)
++        {
++        case LibsdRoutine::SetParam:
++            r[6] = a0 & 1u;
++            stride(r[6]);
++            r[2] = (a0 >> 6) & 0x3FCu;
++            r[4] = (a0 & 0x3Eu) << 3;
++            r[1] = high + r[2]; // at: the lui's half + index, as in the guest
++            r[2] = bus.lw(table + r[2]);
++            r[7] = c.lo;
++            r[2] = r[2] + r[7] + r[4];
++            bus.io16(r[2], static_cast<uint16_t>(r[5]), base + 22u);
++            return 23u;
++        case LibsdRoutine::GetParam:
++            r[5] = a0 & 1u;
++            stride(r[5]);
++            r[2] = (a0 >> 6) & 0x3FCu;
++            r[4] = (a0 & 0x3Eu) << 3;
++            r[1] = high + r[2];
++            r[2] = bus.lw(table + r[2]);
++            r[6] = c.lo;
++            r[2] += r[6];
++            r[4] += r[2];
++            r[2] = bus.io16(r[4], base + 21u);
++            return 24u;
++        case LibsdRoutine::SetAddr:
++        {
++            r[6] = r[5];
++            r[2] = (a0 >> 6) & 0x3FCu;
++            r[3] = a0 & 1u;
++            r[5] = bus.lw(table + r[2]);
++            r[3] <<= 10;
++            r[5] += r[3];
++            r[3] = a0 & 0x3Eu;
++            r[2] = ((r[3] << 1) + r[3]) << 1;
++            r[5] += r[2];
++            r[2] = r[6] >> 17;
++            r[4] = a0 & 0xFF00u;
++            bus.io16(r[5], static_cast<uint16_t>(r[2]), base + 16u);
++            r[2] = 0x1D00u;
++            const uint32_t reg = r[5];
++            r[5] += 2u;
++            if (r[4] == 0x1D00u)
++                return 22u;
++            r[2] = (r[6] >> 1) & 0xFFF8u;
++            bus.io16(reg + 2u, static_cast<uint16_t>(r[2]), base + 22u);
++            return 25u;
++        }
++        case LibsdRoutine::GetAddr:
++        {
++            r[7] = 0x1FFFFu;
++            r[2] = (a0 >> 6) & 0x3FCu;
++            r[3] = (a0 & 1u) << 10;
++            r[5] = bus.lw(table + r[2]) + r[3];
++            r[3] = a0 & 0x3Eu;
++            r[2] = ((r[3] << 1) + r[3]) << 1;
++            r[5] += r[2];
++            r[2] = bus.io16(r[5], base + 15u);
++            r[4] = a0 & 0xFF00u;
++            r[6] = r[2] << 17;
++            uint32_t count = 23u;
++            if (r[4] != 0x1D00u)
++            {
++                r[2] = bus.io16(r[5] + 2u, base + 21u);
++                r[7] = r[2] << 1;
++                uint32_t reread = 0; // index of the second read (0: none)
++                if (r[4] == 0x2100u)
++                    reread = 27u;
++                else if (r[4] == 0x2200u)
++                    reread = 29u;
++                else
++                    count = 31u;
++                if (reread != 0u)
++                {
++                    const uint32_t first = bus.io16(r[5], base + reread) << 17;
++                    const uint32_t second = bus.io16(r[5] + 2u, base + reread + 1u) << 1;
++                    r[2] = first;
++                    r[3] = second;
++                    if (r[6] != first || r[7] != second)
++                    {
++                        if (r[6] != first)
++                        {
++                            r[6] = first;
++                            r[7] = second;
++                        }
++                        count = reread + 9u;
++                    }
++                    else
++                        count = reread + 11u;
++                }
++            }
++            r[2] = r[6] | r[7];
++            return count;
++        }
++        case LibsdRoutine::None:
++            break;
++        }
++        return 0u;
++    }
++
++    // NBA Street V3's EA sound driver (snddrv.irx at 0x4CF00): the per-voice body of its update
++    // (0x55738-0x55A68, 48 voices a call; ~half the IOP's time in a match). For voice s3 it
++    // compares the wanted state (record at s0, 8 bytes: start address/flags, pitch, volume L/R)
++    // with the shadow of what the SPU2 has (s1), writes what changed through libsd
++    // (sceSdSetParam/GetParam/SetAddr/GetAddr), accumulates key-on (0x10/0x14(sp)) and key-off
++    // (s6/s7) bits, and reads the voice's NAX back. Iterations whose volume byte changed (or
++    // flagged in fp) call the driver's own 0x54F88: those are left to the interpreter.
++    constexpr uint32_t kEaVoiceLoopAddress = 0x00055738u;
++    constexpr uint32_t kEaVoiceLoopExit = 0x00055A6Cu;
++    constexpr uint32_t kEaVoiceLoopEnd = 0x00055A6Cu; // signature: [address, end)
++    // The libsd import stubs it calls (jr ra; addiu zero, zero, export).
++    constexpr uint32_t kEaVoiceStubs[4] = {0x000575FCu, 0x00057604u, 0x00057614u, 0x0005761Cu};
++    constexpr LibsdRoutine kEaVoiceStubRoutines[4] = {LibsdRoutine::SetParam, LibsdRoutine::GetParam, LibsdRoutine::SetAddr, LibsdRoutine::GetAddr};
++    constexpr uint32_t kEaVoiceStubExports[4] = {5u, 6u, 9u, 10u};
++    constexpr uint32_t kEaVoiceShadow = 0x0005DDB8u; // + 0x20(sp): the SPU2-side copy of each voice
++    constexpr uint32_t kEaVoiceState = 0x0005E038u;  // + 0x20(sp) + 0x3C: last record word written
++    // Every word of the loop as relocated at 0x4CF00 (jal/j targets included).
++    constexpr uint32_t kEaVoiceLoopWords[] = {
++        0x3C022AAAu, 0x3442AAABu, 0x02620018u, 0x0000A021u, 0x00131FC3u, 0x3C050006u, 0x8FA60020u, 0x00001010u,
++        0x00021083u, 0x00431023u, 0x00022040u, 0x00822021u, 0x000420C0u, 0x02642023u, 0x00042040u, 0x2A630018u,
++        0x38630001u, 0x24A2DDB8u, 0x00C28821u, 0x96050004u, 0x96220004u, 0x00000000u, 0x10A20007u, 0x00839025u,
++        0x36440200u, 0x0C015D7Fu, 0x3084FFFFu, 0x96020004u, 0x00000000u, 0xA6220004u, 0x82030006u, 0x82220006u,
++        0x00000000u, 0x14620005u, 0x00000000u, 0x93C2FFFFu, 0x00000000u, 0x10400005u, 0x00000000u, 0x02002021u,
++        0x02602821u, 0x0C0153E2u, 0x00003021u, 0x82030007u, 0x82220007u, 0x00000000u, 0x14620005u, 0x02002021u,
++        0x93C20000u, 0x00000000u, 0x10400004u, 0x00000000u, 0x02602821u, 0x0C0153E2u, 0x24060001u, 0x8E050000u,
++        0x8E220000u, 0x00000000u, 0x10A20072u, 0x3C02007Fu, 0x3442FFFFu, 0x00A21024u, 0x1040005Du, 0xAFA20018u,
++        0x36440500u, 0x0C015D81u, 0x3084FFFFu, 0x14400046u, 0x36442040u, 0x8FA50018u, 0x0C015D85u, 0x3084FFFFu,
++        0x36442140u, 0x3084FFFFu, 0x0C015D85u, 0x24055000u, 0x36440300u, 0x3084FFFFu, 0x0C015D7Fu, 0x2405000Fu,
++        0x36440400u, 0x3084FFFFu, 0x0C015D7Fu, 0x24050005u, 0x82030006u, 0x00000000u, 0x04600005u, 0x3244FFFFu,
++        0x000311C0u, 0x00431021u, 0x0801562Cu, 0x3045FFFFu, 0x000311C0u, 0x30457F80u, 0x0C015D7Fu, 0x00000000u,
++        0x92020006u, 0x36430100u, 0xA3C0FFFFu, 0xA2220006u, 0x82050007u, 0x00000000u, 0x04A00005u, 0x3064FFFFu,
++        0x000511C0u, 0x00451021u, 0x0801563Cu, 0x3045FFFFu, 0x000511C0u, 0x30457F80u, 0x0C015D7Fu, 0x24140001u,
++        0x24050000u, 0x24040001u, 0x00133680u, 0x04C10004u, 0x00000000u, 0x02641804u, 0x10000007u, 0x00001021u,
++        0x10C00004u, 0x02651804u, 0x00133023u, 0x00C43006u, 0x00661825u, 0x02641004u, 0x8FA60010u, 0x8FA70014u,
++        0x92040007u, 0x00C23025u, 0x00E33825u, 0xAFA60010u, 0xAFA70014u, 0xA3C00000u, 0xA2240007u, 0x8E020000u,
++        0x0801567Bu, 0xAE220000u, 0x24070000u, 0x24060001u, 0x00132680u, 0x04810004u, 0x00000000u, 0x02661804u,
++        0x10000007u, 0x00001021u, 0x10800004u, 0x02671804u, 0x00132023u, 0x00862006u, 0x00641825u, 0x02661004u,
++        0x02C2B025u, 0x02E3B825u, 0x0801567Bu, 0x24140001u, 0x24070000u, 0x24060001u, 0x00132680u, 0x04810004u,
++        0x00000000u, 0x02661804u, 0x10000007u, 0x00001021u, 0x10800004u, 0x02671804u, 0x00132023u, 0x00862006u,
++        0x00641825u, 0x02661004u, 0x02C2B025u, 0x02E3B825u, 0xAE250000u, 0x36442240u, 0x3084FFFFu, 0x3C070006u,
++        0x24E7E038u, 0x8FA50020u, 0x8E030000u, 0x00E51021u, 0x0C015D87u, 0xAC43003Cu, 0x8FA6001Cu, 0x12800004u,
++        0xACC20000u, 0x8FA70018u, 0x08015690u, 0xACC70000u, 0x2C425040u, 0x10400004u, 0x00000000u, 0x8FA2001Cu,
++        0x00000000u, 0xAC400000u, 0x27DE0002u, 0x26100008u, 0x26730001u, 0x2A620030u, 0x8FA3001Cu, 0x8FA40020u,
++        0x24630008u, 0x24840008u, 0xAFA3001Cu, 0x1440FF34u, 0xAFA40020u};
++    static_assert(std::size(kEaVoiceLoopWords) == (kEaVoiceLoopEnd - kEaVoiceLoopAddress) / 4u);
++
++    inline bool eaVoiceLoopMatches(const uint8_t *ram)
++    {
++        return std::memcmp(ram + kEaVoiceLoopAddress, kEaVoiceLoopWords, sizeof(kEaVoiceLoopWords)) == 0;
++    }
++
++    struct EaVoiceLibsd
++    {
++        uint32_t table[4]; // per kEaVoiceStubRoutines entry: libsd's register table and lui half
++        uint32_t high[4];
++    };
++
++    // True when the iteration at the loop head calls the driver's 0x54F88 (left to the guest).
++    template <class Regs, class Bus>
++    bool eaVoiceCallsDriver(const Regs &c, Bus &bus)
++    {
++        const uint32_t s0 = c.gpr[16], fp = c.gpr[30];
++        const uint32_t s1 = bus.lw(c.gpr[29] + 0x20u) + kEaVoiceShadow;
++        const auto s8 = [&](uint32_t address) { return static_cast<int8_t>(bus.lbu(address)); };
++        return s8(s0 + 6u) != s8(s1 + 6u) || bus.lbu(fp - 1u) != 0u || s8(s0 + 7u) != s8(s1 + 7u) || bus.lbu(fp) != 0u;
++    }
++
++    // One iteration from the loop head, with the guest's exact effects on registers (pc ends at
++    // the next head or kEaVoiceLoopExit), memory and SPU2 (Bus::io16 index = cycle offset from the
++    // head). Bus also has lbu/lhu/sb/sh/sw. Returns the instructions the interpreter executes, 0
++    // (nothing done) if the iteration calls the driver.
++    template <class Regs, class Bus>
++    uint32_t eaVoiceIteration(Regs &c, Bus &bus, const EaVoiceLibsd &libsd)
++    {
++        if (eaVoiceCallsDriver(c, bus))
++            return 0u;
++        enum : uint32_t { v0 = 2, v1 = 3, a0 = 4, a1 = 5, a2 = 6, a3 = 7, s0 = 16, s1 = 17, s2 = 18, s3 = 19, s4 = 20, s6 = 22, s7 = 23, sp = 29, fp = 30, ra = 31 };
++        auto &r = c.gpr;
++        uint32_t n = 0;
++        const auto call = [&](int which, uint32_t returnAddress, uint32_t before)
++        {
++            // jal + delay slot + the stub's own instruction, then the routine
++            r[ra] = returnAddress;
++            n += before;
++            n += libsdRun(kEaVoiceStubRoutines[which], c, bus, libsd.table[which], libsd.high[which], n);
++        };
++        const auto sext8 = [](uint32_t value) { return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(value))); };
++        // v1:v0 = 1 << s3 as a 64-bit mask; one, zero and shift are the registers the guest uses
++        const auto bit64 = [&](uint32_t one, uint32_t zero, uint32_t shift)
++        {
++            r[zero] = 0u;
++            r[one] = 1u;
++            r[shift] = r[s3] << 26;
++            n += 5u;
++            const uint32_t k = r[s3] & 31u;
++            if (static_cast<int32_t>(r[shift]) < 0)
++            {
++                r[v1] = r[one] << k;
++                r[v0] = 0u;
++                n += 3u;
++                return;
++            }
++            r[v1] = r[zero] << k;
++            n += 2u;
++            if (r[shift] != 0u)
++            {
++                r[shift] = 0u - r[s3];
++                r[shift] = r[one] >> (r[shift] & 31u);
++                r[v1] |= r[shift];
++                n += 3u;
++            }
++            r[v0] = r[one] << k;
++            n += 1u;
++        };
++
++        // 0x55738: s2 = SPU2 voice number ((s3 % 24) << 1 | core), s1 = shadow entry
++        r[v0] = 0x2AAAAAABu;
++        const int64_t product = static_cast<int64_t>(static_cast<int32_t>(r[s3])) * 0x2AAAAAABll;
++        c.lo = static_cast<uint32_t>(product);
++        c.hi = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32);
++        r[s4] = 0u;
++        r[v1] = static_cast<uint32_t>(static_cast<int32_t>(r[s3]) >> 31);
++        r[a1] = 0x00060000u;
++        r[a2] = bus.lw(r[sp] + 0x20u);
++        r[v0] = static_cast<uint32_t>(static_cast<int32_t>(c.hi) >> 2) - r[v1];
++        r[a0] = ((r[v0] << 1) + r[v0]) << 3;
++        r[a0] = (r[s3] - r[a0]) << 1;
++        r[v1] = (static_cast<int32_t>(r[s3]) < 24 ? 1u : 0u) ^ 1u;
++        r[v0] = kEaVoiceShadow;
++        r[s1] = r[a2] + r[v0];
++        r[a1] = bus.lhu(r[s0] + 4u);
++        r[v0] = bus.lhu(r[s1] + 4u);
++        r[s2] = r[a0] | r[v1];
++        n = 24u;
++        if (r[a1] != r[v0])
++        {
++            // 0x55798: pitch
++            r[a0] = (r[s2] | 0x200u) & 0xFFFFu;
++            call(0, 0x000557A4u, 4u);
++            r[v0] = bus.lhu(r[s0] + 4u);
++            bus.sh(r[s1] + 4u, static_cast<uint16_t>(r[v0]));
++            n += 3u;
++        }
++        // 0x557B0 / 0x557E4: volume bytes unchanged and not flagged (else: eaVoiceCallsDriver)
++        r[v1] = sext8(bus.lbu(r[s0] + 7u));
++        r[v0] = sext8(bus.lbu(r[s1] + 7u));
++        r[a0] = r[s0];
++        r[v0] = bus.lbu(r[fp]);
++        n += 18u;
++        // 0x55814: start address / key state
++        r[a1] = bus.lw(r[s0]);
++        const bool same = r[a1] == bus.lw(r[s1]);
++        r[v0] = 0x007F0000u;
++        n += 5u;
++        if (!same)
++        {
++            r[v0] = r[a1] & 0x007FFFFFu;
++            bus.sw(r[sp] + 0x18u, r[v0]);
++            n += 4u;
++            if (r[v0] != 0u)
++            {
++                // 0x55838: ENVX
++                r[a0] = (r[s2] | 0x500u) & 0xFFFFu;
++                call(1, 0x00055844u, 4u);
++                const bool sounding = r[v0] != 0u;
++                r[a0] = r[s2] | 0x2040u;
++                n += 2u;
++                if (!sounding)
++                {
++                    // 0x5584C: new sample: SSA, LSA = 0x5000, ADSR 0x000F/0x0005, volumes; key on
++                    r[a1] = bus.lw(r[sp] + 0x18u);
++                    r[a0] &= 0xFFFFu;
++                    call(2, 0x00055858u, 4u);
++                    r[a0] = (r[s2] | 0x2140u) & 0xFFFFu;
++                    r[a1] = 0x5000u;
++                    call(2, 0x00055868u, 5u);
++                    r[a0] = (r[s2] | 0x300u) & 0xFFFFu;
++                    r[a1] = 0xFu;
++                    call(0, 0x00055878u, 5u);
++                    r[a0] = (r[s2] | 0x400u) & 0xFFFFu;
++                    r[a1] = 5u;
++                    call(0, 0x00055888u, 5u);
++                    const auto volume = [&](uint32_t reg)
++                    {
++                        // 0x55888 / 0x558C8: byte (signed) -> volume register value
++                        if (static_cast<int32_t>(r[reg]) >= 0)
++                        {
++                            r[v0] = (r[reg] << 7) + r[reg];
++                            r[a1] = r[v0] & 0xFFFFu;
++                            n += 4u;
++                        }
++                        else
++                        {
++                            r[v0] = r[reg] << 7;
++                            r[a1] = r[v0] & 0x7F80u;
++                            n += 2u;
++                        }
++                    };
++                    r[v1] = sext8(bus.lbu(r[s0] + 6u));
++                    r[a0] = r[s2] & 0xFFFFu;
++                    n += 4u;
++                    volume(v1);
++                    call(0, 0x000558B8u, 3u);
++                    r[v0] = bus.lbu(r[s0] + 6u);
++                    r[v1] = r[s2] | 0x100u;
++                    bus.sb(r[fp] - 1u, 0u);
++                    bus.sb(r[s1] + 6u, static_cast<uint8_t>(r[v0]));
++                    r[a1] = sext8(bus.lbu(r[s0] + 7u));
++                    r[a0] = r[v1] & 0xFFFFu;
++                    n += 8u;
++                    volume(a1);
++                    r[s4] = 1u;
++                    call(0, 0x000558F8u, 3u);
++                    bit64(a0, a1, a2);
++                    // 0x55930: key-on mask, shadow updated
++                    r[a2] = bus.lw(r[sp] + 0x10u) | r[v0];
++                    r[a3] = bus.lw(r[sp] + 0x14u) | r[v1];
++                    r[a0] = bus.lbu(r[s0] + 7u);
++                    bus.sw(r[sp] + 0x10u, r[a2]);
++                    bus.sw(r[sp] + 0x14u, r[a3]);
++                    bus.sb(r[fp], 0u);
++                    bus.sb(r[s1] + 7u, static_cast<uint8_t>(r[a0]));
++                    r[v0] = bus.lw(r[s0]);
++                    bus.sw(r[s1], r[v0]);
++                    n += 12u;
++                }
++                else
++                {
++                    // 0x55960: still sounding: key off first
++                    bit64(a2, a3, a0);
++                    r[s6] |= r[v0];
++                    r[s7] |= r[v1];
++                    r[s4] = 1u;
++                    n += 4u;
++                }
++            }
++            else
++            {
++                // 0x559A8: no sample: key off
++                bit64(a2, a3, a0);
++                r[s6] |= r[v0];
++                r[s7] |= r[v1];
++                bus.sw(r[s1], r[a1]);
++                n += 3u;
++            }
++        }
++        // 0x559EC: NAX read back
++        r[a0] = (r[s2] | 0x2240u) & 0xFFFFu;
++        r[a3] = kEaVoiceState;
++        r[a1] = bus.lw(r[sp] + 0x20u);
++        r[v1] = bus.lw(r[s0]);
++        r[v0] = r[a3] + r[a1];
++        bus.sw(r[v0] + 0x3Cu, r[v1]);
++        call(3, 0x00055A10u, 10u);
++        r[a2] = bus.lw(r[sp] + 0x1Cu);
++        bus.sw(r[a2], r[v0]);
++        n += 3u;
++        if (r[s4] != 0u)
++        {
++            r[a3] = bus.lw(r[sp] + 0x18u);
++            bus.sw(r[a2], r[a3]);
++            n += 3u;
++        }
++        else
++        {
++            r[v0] = r[v0] < 0x5040u ? 1u : 0u;
++            n += 3u;
++            if (r[v0] != 0u)
++            {
++                r[v0] = bus.lw(r[sp] + 0x1Cu);
++                bus.sw(r[v0], 0u);
++                n += 3u;
++            }
++        }
++        // 0x55A40: next voice
++        r[fp] += 2u;
++        r[s0] += 8u;
++        r[s3] += 1u;
++        r[v0] = static_cast<int32_t>(r[s3]) < 48 ? 1u : 0u;
++        r[v1] = bus.lw(r[sp] + 0x1Cu) + 8u;
++        r[a0] = bus.lw(r[sp] + 0x20u) + 8u;
++        bus.sw(r[sp] + 0x1Cu, r[v1]);
++        bus.sw(r[sp] + 0x20u, r[a0]);
++        n += 11u;
++        c.pc = r[v0] ? kEaVoiceLoopAddress : kEaVoiceLoopExit;
++        return n;
 +    }
  }
 diff --git a/ps2xIOP/src/emulator/spu2/SPU2/ADSR.cpp b/ps2xIOP/src/emulator/spu2/SPU2/ADSR.cpp
@@ -8808,7 +9497,7 @@ index ea86a9c..31c6972 100644
      std::vector<PendingTransfer> m_pendingGifTransfers;
      std::vector<PendingTransfer> m_pendingVif0Transfers;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index f09ec48..bbae5cc 100644
+index f09ec48..5a223af 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -9,7 +9,9 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
@@ -8821,7 +9510,17 @@ index f09ec48..bbae5cc 100644
  #include <atomic>
  #include <chrono>
  #include <cstdio>
-@@ -462,6 +464,18 @@ void EeScheduler::requestStop()
+@@ -20,6 +22,9 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
+ #include <cstring>
+ #include <limits>
+ #include <sstream>
++#if defined(__EMSCRIPTEN__)
++#include <emscripten.h>
++#endif
+ #include <stdexcept>
+ 
+ namespace
+@@ -462,6 +467,18 @@ void EeScheduler::requestStop()
      m_eventCv.notify_all();
  }
  
@@ -8840,7 +9539,7 @@ index f09ec48..bbae5cc 100644
  void EeScheduler::postEvent(EeEvent event)
  {
      if (event.type == EeEventType::Stop)
-@@ -478,6 +492,37 @@ void EeScheduler::postEvent(EeEvent event)
+@@ -478,9 +495,64 @@ void EeScheduler::postEvent(EeEvent event)
      m_eventCv.notify_one();
  }
  
@@ -8875,10 +9574,63 @@ index f09ec48..bbae5cc 100644
 +    g_eeIdleLoops.push_back({begin, end});
 +}
 +
++#if defined(__EMSCRIPTEN__)
++static double g_eeSlowLast = 0.0; // PS2X_EE_SLOW: end of the last measured stretch (sleeps don't count)
++#endif
++
  bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
  {
      accountCycles(cycles);
-@@ -517,12 +562,26 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
++#if defined(__EMSCRIPTEN__)
++    {
++        // PS2X_EE_SLOW=N (tests, e.g. ?env=PS2X_EE_SLOW=150): the game thread's work takes N% longer,
++        // to reproduce a phone's slow EE on a desktop. Only at slice ends, so the check stays cheap.
++        static const int s_eeSlowPercent = [] { const char *e = std::getenv("PS2X_EE_SLOW"); return e ? std::atoi(e) : 0; }();
++        if (s_eeSlowPercent > 0 && m_eeCycle >= m_sliceEndCycle)
++        {
++            const double now = emscripten_get_now();
++            const double busy = now - g_eeSlowLast;
++            if (g_eeSlowLast != 0.0 && busy < 50.0)
++            {
++                const double until = now + busy * s_eeSlowPercent / 100.0;
++                while (emscripten_get_now() < until)
++                {
++                }
++            }
++            g_eeSlowLast = emscripten_get_now();
++        }
++    }
++#endif
+ 
+     if (m_checkpointPending.load(std::memory_order_acquire) ||
+         m_stopRequested.load(std::memory_order_acquire))
+@@ -508,8 +580,25 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     // (it may be deferred, e.g. while an interrupt handler runs).
+     const int64_t hostDeadline = m_nextHostDeadlineRep.load(std::memory_order_acquire);
+     const uint64_t targetCycle = m_nextHostDeadlineCycle.load(std::memory_order_acquire);
++#if defined(__EMSCRIPTEN__)
++    const int64_t hostNow = std::chrono::steady_clock::now().time_since_epoch().count();
++    // On a slow host (phones) the game's own work takes longer than on a PS2. Jumping time in
++    // the middle of that work stretched it over most of the frame in emulated time, and the
++    // game's sound streamer fed the SPU2 late (repeated blocks, crackling in the menus). Outside
++    // the registered wait loops, time only jumps when it is far behind (20 ms): a short lag is
++    // made up in the wait loops, where the game is only waiting anyway.
++    // (PS2X_WARP_LAG_MS=N changes the margin, 0 jumps anywhere as before.)
++    static const int64_t s_warpLag = [] { const char *e = std::getenv("PS2X_WARP_LAG_MS"); return (e ? std::atoll(e) : 20ll) * 1000000ll; }();
++    auto warpLag = [this]() -> int64_t {
++        const GuestThread *thread = currentThread();
++        return thread != nullptr && eeIdleLoopAt(thread->activeContext().pc) ? 0 : s_warpLag;
++    };
++    if (hostDeadline != INT64_MAX && targetCycle > m_eeCycle && hostNow >= hostDeadline &&
++        (s_warpLag == 0 || hostNow >= hostDeadline + warpLag()))
++#else
+     if (hostDeadline != INT64_MAX && targetCycle > m_eeCycle &&
+         std::chrono::steady_clock::now().time_since_epoch().count() >= hostDeadline)
++#endif
+     {
+         const uint64_t warp = std::min<uint64_t>(targetCycle - m_eeCycle, 0xFFFFFFFFull);
+         {
+@@ -517,12 +606,26 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
              static auto s_lastReport = std::chrono::steady_clock::now();
              ++s_warps;
              s_warpedCycles += warp;
@@ -8905,7 +9657,7 @@ index f09ec48..bbae5cc 100644
                  s_lastReport = now;
                  s_warps = 0u;
                  s_warpedCycles = 0u;
-@@ -541,6 +600,86 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -541,6 +644,89 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return true;
      }
  
@@ -8987,12 +9739,15 @@ index f09ec48..bbae5cc 100644
 +            if (nextEvent != 0u && m_eeCycle >= nextEvent)
 +                break;
 +        }
++#if defined(__EMSCRIPTEN__)
++        g_eeSlowLast = 0.0;
++#endif
 +    }
 +
      renewTimeSlice();
      return false;
  }
-@@ -1946,9 +2085,9 @@ void EeScheduler::makeRunning(GuestThread &item)
+@@ -1946,9 +2132,9 @@ void EeScheduler::makeRunning(GuestThread &item)
          struct Slot { uint64_t ticks = 0; uint32_t entry = 0; int priority = 0; uint32_t switches = 0; };
          static Slot s_slots[256];
          static int s_lastId = -1;
@@ -9004,7 +9759,7 @@ index f09ec48..bbae5cc 100644
          if (s_lastId >= 0)
              s_slots[s_lastId & 255].ticks += tsc - s_lastTsc;
          s_lastTsc = tsc;
-@@ -2206,11 +2345,17 @@ void EeScheduler::processDueDeadlines()
+@@ -2206,11 +2392,17 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -9024,7 +9779,7 @@ index f09ec48..bbae5cc 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -2293,6 +2438,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -2293,6 +2485,22 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }
@@ -10287,10 +11042,10 @@ index 0000000..415e116
 +    0x000000401a006524ull,
 diff --git a/ps2xRuntime/web/library_fetch_stream.js b/ps2xRuntime/web/library_fetch_stream.js
 new file mode 100644
-index 0000000..ab13bcc
+index 0000000..190f160
 --- /dev/null
 +++ b/ps2xRuntime/web/library_fetch_stream.js
-@@ -0,0 +1,254 @@
+@@ -0,0 +1,289 @@
 +/**
 + * WasmFS fetch backend for the game disc, replacing Emscripten's (src/lib/libwasmfs_fetch.js):
 + * the same on-demand HTTP Range reads, plus
@@ -10322,10 +11077,16 @@ index 0000000..ab13bcc
 +    // fetch() with a deadline and retries: on phones a request can stall for good (a dead
 +    // connection after a network change), and with no timeout the game waited on it forever
 +    // ("starting the game..." that never ends). A 404 is final; anything else is retried.
++    // The deadline is on progress, not on the whole request: a phone's connection can stall
++    // mid-transfer, and a whole-request deadline (19 s for a 1 MB chunk) let one stalled read
++    // hold the game's music for close to two minutes over its retries.
++    const STALL_MS = 6000;
 +    async function fetchRetry(url, init, expectBytes) {
 +      for (var attempt = 1; ; attempt++) {
 +        var abort = new AbortController();
-+        var timer = setTimeout(() => abort.abort(), 15000 + (expectBytes || 0) / 256); // + 4 s per MB
++        var timer = 0;
++        var stalled = () => { clearTimeout(timer); timer = setTimeout(() => abort.abort(), STALL_MS); };
++        stalled();
 +        try {
 +          // cache: 'no-store': the chunks are kept in Cache Storage already, and Chrome's HTTP
 +          // cache makes requests for one URL queue behind a single writer (up to 20 s each):
@@ -10334,14 +11095,30 @@ index 0000000..ab13bcc
 +          if (response.status === 404) throw response;
 +          if (!response.ok) throw new Error(`HTTP ${response.status}`);
 +          if (init.method === 'HEAD') return response;
-+          var bytes = new Uint8Array(await response.arrayBuffer());
-+          if (expectBytes && bytes.byteLength !== expectBytes) throw new Error(`short read ${bytes.byteLength}/${expectBytes}`);
++          var bytes;
++          if (response.body && expectBytes) {
++            // Read as it arrives: every piece pushes the stall deadline back
++            bytes = new Uint8Array(expectBytes);
++            var got = 0, reader = response.body.getReader();
++            for (;;) {
++              stalled();
++              var part = await reader.read();
++              if (part.done) break;
++              if (got + part.value.byteLength > expectBytes) throw new Error(`long read`);
++              bytes.set(part.value, got);
++              got += part.value.byteLength;
++            }
++            if (got !== expectBytes) throw new Error(`short read ${got}/${expectBytes}`);
++          } else {
++            bytes = new Uint8Array(await response.arrayBuffer());
++            if (expectBytes && bytes.byteLength !== expectBytes) throw new Error(`short read ${bytes.byteLength}/${expectBytes}`);
++          }
 +          return bytes;
 +        } catch (e) {
 +          if (e && e.status === 404) throw e;
 +          if (attempt >= 6) throw {status: 0};
-+          console.warn(`[disc] ${url.split('/').pop()}: ${e && e.name === 'AbortError' ? 'timed out' : e}; retrying (${attempt})`);
-+          await new Promise((r) => setTimeout(r, 500 * attempt));
++          err(`[disc] ${url.split('/').pop()}: ${e && e.name === 'AbortError' ? 'stalled' : e}; retrying (${attempt})`);
++          await new Promise((r) => setTimeout(r, 300 * attempt));
 +        } finally {
 +          clearTimeout(timer);
 +        }
@@ -10488,10 +11265,23 @@ index 0000000..ab13bcc
 +      if (ahead >= 2) requestChunks(info, last + 2, last + ahead);
 +      var waitStart = 0;
 +      for (var i = first; i <= last; i++) {
-+        if (!info.chunks.has(i)) {
++        var hedge = null, failure = null;
++        while (!info.chunks.has(i)) {
 +          waitStart ||= performance.now();
-+          await info.pending.get(i);
-+          if (!info.chunks.has(i)) requestChunks(info, i, i), await info.pending.get(i);
++          if (!info.pending.has(i)) requestChunks(info, i, i);
++          // The game is waiting on it: if it is slow (often inside a read-ahead request of
++          // several chunks, or on a connection that stalled), ask for this chunk alone as well,
++          // and take whichever answer comes first.
++          await Promise.race([info.pending.get(i).catch((e) => { failure = e; }), hedge || new Promise(() => {}),
++                              new Promise((r) => setTimeout(r, 1500))]);
++          if (failure && failure.status === 404) throw failure;
++          if (!info.chunks.has(i) && !hedge && performance.now() - waitStart >= 1500) {
++            let index = i;
++            var start = index * info.chunkSize, end = Math.min(start + info.chunkSize, info.size);
++            hedge = fetchRetry(info.url, {headers: {'Range': `bytes=${start}-${end - 1}`}}, end - start)
++              .then((chunk) => { if (!info.chunks.has(index)) info.chunks.set(index, chunk); })
++              .catch(() => {});
++          }
 +        }
 +      }
 +      if (waitStart) {

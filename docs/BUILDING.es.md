@@ -198,6 +198,17 @@ nativo están dentro de `__EMSCRIPTEN__`.
 - Cadenas DMA de VIF1 (`ps2_memory.cpp`, `ps2_vif1_interpreter.cpp`, `vif1_source.h`): con la VU remota la
   cadena se decodifica desde los trozos de RDRAM/scratchpad y se escribe en el anillo del GS sin la copia
   intermedia; idéntico byte a byte en 1500 cadenas aleatorias.
+- Bucle de voces del driver de sonido de EA (`iop_hle_routines.h`, `hle::eaVoiceIteration`): el IOP lo
+  ejecuta en nativo (88% del tiempo del IOP), comprobado contra el intérprete en 1.14M voces;
+  `?env=PS2X_IOP_EAVOICES=0` lo desactiva.
+- Saltos de tiempo (`EeScheduler.cpp`, web): un evento atrasado hace saltar el tiempo emulado solo dentro de
+  los bucles de espera registrados del juego; en otro sitio solo con 20 ms de retraso
+  (`?env=PS2X_WARP_LAG_MS=N`, 0 = en cualquier sitio). En equipos lentos, saltar a mitad del trabajo del juego
+  retrasaba al hilo que alimenta el sonido (chasquidos en los menús). `?env=PS2X_EE_SLOW=N` hace el trabajo
+  del hilo del juego un N% más lento (simula un móvil).
+- Lectura del disco (`library_fetch_stream.js`): el plazo de cada petición es de progreso (6 s sin datos), y
+  un trozo que el juego lleva 1.5 s esperando se pide también por separado (una conexión trabada de un móvil
+  llegó a retener la música dos minutos).
 - Desactivado por defecto (en el juego medido peor o sin mejora): caché de llamadas del IOP + libsd nativa
   (`?env=PS2X_IOP_IMPORT_CACHE=1&env=PS2X_IOP_LIBSD=1`), campos de la VU1 en locales (`?vulocals=1`),
   grupos de módulos de la VU1 por microcódigo (`?vumodules=1`). La clave de la caché de bloques de la VU1
