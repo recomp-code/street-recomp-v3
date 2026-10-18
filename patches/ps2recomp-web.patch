@@ -10138,6 +10138,24 @@ index 0e1a2ad..721e03b 100644
              return readHostRange(entry.hostPath, offset, dst, byteCount);
          }
  
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+index 5110ee2..40ed353 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Thread.cpp
+@@ -112,7 +112,13 @@ namespace ps2_syscalls
+             const int priority = static_cast<int>(getRegU32(ctx, 5));
+             int oldPriority = 0;
+             const int result = ee.changePriority(id, priority, interruptSafe, oldPriority);
++#if defined(__EMSCRIPTEN__)
++            // The kernel returns the previous priority on success (CRI ADXM's lock/unlock saves
++            // it and restores it; returning KE_OK left DBZ BT3's main thread at priority 1).
++            setReturnS32(ctx, result == KE_OK ? oldPriority : result);
++#else
+             setReturnS32(ctx, result);
++#endif
+             ee.transferIfRequested(interruptSafe);
+         }
+ 
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 index db0ff1d..711f690 100644
 --- a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
