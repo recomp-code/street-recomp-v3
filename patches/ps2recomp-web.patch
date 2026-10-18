@@ -9497,7 +9497,7 @@ index ea86a9c..31c6972 100644
      std::vector<PendingTransfer> m_pendingGifTransfers;
      std::vector<PendingTransfer> m_pendingVif0Transfers;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index f09ec48..5a223af 100644
+index f09ec48..51c3332 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -9,7 +9,9 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
@@ -9604,7 +9604,7 @@ index f09ec48..5a223af 100644
  
      if (m_checkpointPending.load(std::memory_order_acquire) ||
          m_stopRequested.load(std::memory_order_acquire))
-@@ -508,8 +580,25 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -508,21 +580,66 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
      // (it may be deferred, e.g. while an interrupt handler runs).
      const int64_t hostDeadline = m_nextHostDeadlineRep.load(std::memory_order_acquire);
      const uint64_t targetCycle = m_nextHostDeadlineCycle.load(std::memory_order_acquire);
@@ -9626,11 +9626,26 @@ index f09ec48..5a223af 100644
 +#else
      if (hostDeadline != INT64_MAX && targetCycle > m_eeCycle &&
          std::chrono::steady_clock::now().time_since_epoch().count() >= hostDeadline)
+-    {
 +#endif
-     {
++    {
++#if defined(__EMSCRIPTEN__)
++        // In a wait loop the lag piled up by the game's work (8 ms and more per frame on phones)
++        // was made up in one jump: the IOP and the SPU2 ran through it with no EE code in between,
++        // so the sound streamer missed the driver's half-buffer swaps (5 ms) and the SPU2 played
++        // repeated blocks. Jump at most 1 ms at a time, so interrupts and the threads they wake
++        // run between steps (in a wait loop the next step comes right away). Outside wait loops time
++        // only jumps when far behind (above) and still does it at once.
++        // (PS2X_WARP_STEP_US=N changes the step, 0 jumps all at once.)
++        static const uint64_t s_warpStep = [] { const char *e = std::getenv("PS2X_WARP_STEP_US"); return (e ? std::strtoull(e, nullptr, 10) : 1000ull) * 294912ull / 1000ull; }();
++        uint64_t warp = std::min<uint64_t>(targetCycle - m_eeCycle, 0xFFFFFFFFull);
++        if (s_warpStep != 0u && currentThread() != nullptr && eeIdleLoopAt(currentThread()->activeContext().pc))
++            warp = std::min(warp, s_warpStep);
++#else
          const uint64_t warp = std::min<uint64_t>(targetCycle - m_eeCycle, 0xFFFFFFFFull);
++#endif
          {
-@@ -517,12 +606,26 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+             static uint64_t s_warps = 0u, s_warpedCycles = 0u;
              static auto s_lastReport = std::chrono::steady_clock::now();
              ++s_warps;
              s_warpedCycles += warp;
@@ -9657,7 +9672,7 @@ index f09ec48..5a223af 100644
                  s_lastReport = now;
                  s_warps = 0u;
                  s_warpedCycles = 0u;
-@@ -541,6 +644,89 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -541,6 +658,89 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return true;
      }
  
@@ -9747,7 +9762,7 @@ index f09ec48..5a223af 100644
      renewTimeSlice();
      return false;
  }
-@@ -1946,9 +2132,9 @@ void EeScheduler::makeRunning(GuestThread &item)
+@@ -1946,9 +2146,9 @@ void EeScheduler::makeRunning(GuestThread &item)
          struct Slot { uint64_t ticks = 0; uint32_t entry = 0; int priority = 0; uint32_t switches = 0; };
          static Slot s_slots[256];
          static int s_lastId = -1;
@@ -9759,7 +9774,7 @@ index f09ec48..5a223af 100644
          if (s_lastId >= 0)
              s_slots[s_lastId & 255].ticks += tsc - s_lastTsc;
          s_lastTsc = tsc;
-@@ -2206,11 +2392,17 @@ void EeScheduler::processDueDeadlines()
+@@ -2206,11 +2406,17 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -9779,7 +9794,7 @@ index f09ec48..5a223af 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -2293,6 +2485,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -2293,6 +2499,22 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }

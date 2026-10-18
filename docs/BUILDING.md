@@ -207,6 +207,8 @@ their own patches, and the few runtime changes shared with native code are behin
 - Time jumps (`EeScheduler.cpp`, web): an overdue event makes emulated time jump only inside the game's
   registered wait loops, elsewhere only when 20 ms behind (`?env=PS2X_WARP_LAG_MS=N`, 0 = anywhere). On slow
   hosts jumping in the middle of the game's work made the sound streamer late (crackle in the menus).
+  In the wait loops the jump goes 1 ms at a time (`?env=PS2X_WARP_STEP_US=N`, 0 = all at once): a phone made
+  up 8 ms in one jump, past the sound driver's 5 ms half-buffer swap.
   `?env=PS2X_EE_SLOW=N` makes the game thread's work N% slower (phone simulation).
 - Disc streaming (`library_fetch_stream.js`): the request deadline is on progress (6 s without data), and a
   chunk the game has waited on for 1.5 s is also requested on its own (a stalled phone connection once held

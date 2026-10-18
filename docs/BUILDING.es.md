@@ -204,7 +204,9 @@ nativo están dentro de `__EMSCRIPTEN__`.
 - Saltos de tiempo (`EeScheduler.cpp`, web): un evento atrasado hace saltar el tiempo emulado solo dentro de
   los bucles de espera registrados del juego; en otro sitio solo con 20 ms de retraso
   (`?env=PS2X_WARP_LAG_MS=N`, 0 = en cualquier sitio). En equipos lentos, saltar a mitad del trabajo del juego
-  retrasaba al hilo que alimenta el sonido (chasquidos en los menús). `?env=PS2X_EE_SLOW=N` hace el trabajo
+  retrasaba al hilo que alimenta el sonido (chasquidos en los menús). En los bucles de espera el salto va de
+  1 ms en 1 ms (`?env=PS2X_WARP_STEP_US=N`, 0 = de golpe): un móvil recuperaba 8 ms de un salto, más que el
+  cambio de medio búfer del driver de sonido (5 ms). `?env=PS2X_EE_SLOW=N` hace el trabajo
   del hilo del juego un N% más lento (simula un móvil).
 - Lectura del disco (`library_fetch_stream.js`): el plazo de cada petición es de progreso (6 s sin datos), y
   un trozo que el juego lleva 1.5 s esperando se pide también por separado (una conexión trabada de un móvil
