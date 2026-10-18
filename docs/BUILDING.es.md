@@ -208,6 +208,8 @@ nativo están dentro de `__EMSCRIPTEN__`.
   1 ms en 1 ms (`?env=PS2X_WARP_STEP_US=N`, 0 = de golpe): un móvil recuperaba 8 ms de un salto, más que el
   cambio de medio búfer del driver de sonido (5 ms). `?env=PS2X_EE_SLOW=N` hace el trabajo
   del hilo del juego un N% más lento (simula un móvil).
+- Cambios de microprograma de la VU1 (Play! `VuExecutor.cpp`): qué flags lee la micro memoria se recuerda por
+  contenido; revisar los 16 KB en cada cambio era ~10% del hilo de la VU1 en un partido.
 - Lectura del disco (`library_fetch_stream.js`): el plazo de cada petición es de progreso (6 s sin datos), y
   un trozo que el juego lleva 1.5 s esperando se pide también por separado (una conexión trabada de un móvil
   llegó a retener la música dos minutos).

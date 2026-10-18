@@ -1062,7 +1062,7 @@ index 052b681..f474dae 100644
  	struct BlockFmacPipelineInfo
  	{
 diff --git a/Source/ee/VuExecutor.cpp b/Source/ee/VuExecutor.cpp
-index 72e80fc..6e62792 100644
+index 72e80fc..83b6e79 100644
 --- a/Source/ee/VuExecutor.cpp
 +++ b/Source/ee/VuExecutor.cpp
 @@ -2,6 +2,9 @@
@@ -1075,7 +1075,7 @@ index 72e80fc..6e62792 100644
  
  // clang-format off
  const CVuExecutor::BLOCK_COMPILE_HINTS CVuExecutor::g_blockCompileHints[] =
-@@ -21,8 +24,72 @@ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
+@@ -21,8 +24,73 @@ void CVuExecutor::SetBlockNoClamping(BlockNoClampingSet blockNoClamping)
  	m_blockNoClamping = std::move(blockNoClamping);
  }
  
@@ -1144,11 +1144,12 @@ index 72e80fc..6e62792 100644
 +	m_moduleGroupMicroMemories.clear();
 +#endif
 +	m_partitions.clear();
++	m_flagHintsByHash.clear();
 +	m_microMemoryHashValid = false;
  	m_cachedBlocks.clear();
  	m_blockNoClamping.clear();
  	CGenericMipsExecutor::Reset();
-@@ -43,13 +110,18 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+@@ -43,13 +111,18 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
  	memcpy(&hash, &xxHash, sizeof(xxHash));
  	static_assert(sizeof(hash) == sizeof(xxHash));
  	auto blockKey = std::make_pair(hash, blockSizeByte);
@@ -1169,7 +1170,7 @@ index 72e80fc..6e62792 100644
  		//Check if we have a block that has the same contents and the same range.
  		for(auto blockIterator = beginBlockIterator; blockIterator != endBlockIterator; blockIterator++)
  		{
-@@ -64,7 +136,7 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+@@ -64,7 +137,7 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
  		{
  			auto result = std::make_shared<CVuBasicBlock>(context, begin, end, m_blockCategory);
  			result->CopyFunctionFrom(beginBlockIterator->second);
@@ -1178,7 +1179,7 @@ index 72e80fc..6e62792 100644
  			return result;
  		}
  	}
-@@ -84,19 +156,170 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
+@@ -84,19 +157,180 @@ BasicBlockPtr CVuExecutor::BlockFactory(CMIPS& context, uint32 begin, uint32 end
  		result->AddBlockCompileHints(VUShared::COMPILEHINT_NO_CLAMPING);
  	}
  
@@ -1235,7 +1236,17 @@ index 72e80fc..6e62792 100644
 +		auto map = m_context.m_pMemoryMap->GetInstructionMap(0);
 +		m_microMemoryHash = XXH3_64bits(map->pPointer, m_maxAddress);
 +		m_microMemoryHashValid = true;
-+		m_flagHints = ComputeFlagHints();
++		auto knownHints = m_flagHintsByHash.find(m_microMemoryHash);
++		if(knownHints != std::end(m_flagHintsByHash))
++		{
++			m_flagHints = knownHints->second;
++		}
++		else
++		{
++			m_flagHints = ComputeFlagHints();
++			if(m_flagHintsByHash.size() >= 4096) m_flagHintsByHash.clear();
++			m_flagHintsByHash.emplace(m_microMemoryHash, m_flagHints);
++		}
 +	}
 +	const auto partitionKey = std::make_pair(m_microMemoryHash, startAddress);
 +	if(auto partition = m_partitions.find(partitionKey); partition != std::end(m_partitions))
@@ -1353,7 +1364,7 @@ index 72e80fc..6e62792 100644
  	{
  		uint32 addrLo = address + 0;
  		uint32 addrHi = address + 4;
-@@ -105,18 +328,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+@@ -105,18 +339,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  		auto branchType = m_context.m_pArch->IsInstructionBranch(&m_context, addrLo, lowerOp);
  		if(upperOp & VUShared::VU_UPPEROP_BIT_E)
  		{
@@ -1387,7 +1398,7 @@ index 72e80fc..6e62792 100644
  			break;
  		}
  		else if(branchType == MIPS_BRANCH_NODELAY)
-@@ -125,6 +359,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+@@ -125,6 +370,29 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  			assert(false);
  		}
  	}
@@ -1417,7 +1428,7 @@ index 72e80fc..6e62792 100644
  	assert((endAddress - startAddress) <= MAX_BLOCK_SIZE);
  	CreateBlock(startAddress, endAddress);
  	auto block = static_cast<CVuBasicBlock*>(FindBlockStartingAt(startAddress));
-@@ -132,4 +389,10 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
+@@ -132,4 +400,10 @@ void CVuExecutor::PartitionFunction(uint32 startAddress)
  	{
  		SetupBlockLinks(startAddress, endAddress, branchAddress);
  	}
@@ -1429,7 +1440,7 @@ index 72e80fc..6e62792 100644
 +	m_partitions[partitionKey] = std::move(partition);
  }
 diff --git a/Source/ee/VuExecutor.h b/Source/ee/VuExecutor.h
-index e2b43c9..690ed6b 100644
+index e2b43c9..97926d6 100644
 --- a/Source/ee/VuExecutor.h
 +++ b/Source/ee/VuExecutor.h
 @@ -1,6 +1,7 @@
@@ -1470,7 +1481,7 @@ index e2b43c9..690ed6b 100644
  
  protected:
  	typedef std::multimap<CachedBlockKey, BasicBlockPtr> CachedBlockMap;
-@@ -27,9 +50,54 @@ protected:
+@@ -27,9 +50,56 @@ protected:
  
  	BasicBlockPtr BlockFactory(CMIPS&, uint32, uint32) override;
  	void PartitionFunction(uint32) override;
@@ -1489,6 +1500,8 @@ index e2b43c9..690ed6b 100644
 +	uint64 HashBlockSurroundings(uint32, uint32) const;
 +	uint32 ComputeFlagHints() const;
 +	uint32 m_flagHints = 0;
++	//Per micro memory contents (the scan of the whole memory ran at every microprogram swap)
++	std::unordered_map<uint64, uint32> m_flagHintsByHash;
 +	enum
 +	{
 +		MAX_SUPERBLOCK_PARTS = 16,
