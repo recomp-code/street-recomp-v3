@@ -192,6 +192,23 @@ desensambla volcados de RAM (IOP o EE).
   comunitaria modificada: su firma da HashMismatch y el driver la rechaza, 0xBAD00002). Streamline
   público 2.14.16 solo reserva `kFeatureDLSS_NR = 1004`, sin API todavía.
 
+### 5.4b DLSS temporal: vectores de movimiento estimados + máscara (2026-10-19)
+- Un juego de PS2 no da vectores de movimiento: se estiman en la GPU (`nba_motion.glsl` / `.hlsl`,
+  6 pases compute): luma a 1/2 y 1/4, búsqueda ±4 texels con SAD 5x5 a 1/4, refinado ±1 a 1/2 con
+  ajuste parabólico subtexel, vectores bilineales a resolución de render (píxeles, hacia el cuadro
+  anterior) y una máscara `BiasCurrentColorMask` donde la coincidencia es mala.
+- Sin subpíxel (vectores enteros = saltos de 2 px reales) las líneas finas (vallas) salen rotas en
+  paneos lentos; con subpíxel quedan limpias y mejor suavizadas que sin vectores.
+- Las piernas rápidas toman el movimiento del fondo (bloque ~10x10 px) y DLSS las duplicaba; la
+  máscara (coste medio por texel 0,02→0,06 = historial→cuadro actual, máximo 3x3) las deja nítidas
+  sin perder lo ganado en zonas lentas.
+- `InReset=1` en el primer cuadro y al pasar entre 3D y pantallas planas (la profundidad aparece o
+  desaparece). Variables: `PS2X_DLSS_MOTION=0` (sin vectores), `PS2X_DLSS_BIAS=<escala>|0`,
+  `PS2X_DLSS_MV_SCALE` (signo/escala para depurar la convención). Probado A/B con la misma jugada
+  grabada (`play_capture.ps1`) en Vulkan y D3D12.
+- D3D12: los nombres de macro van en un array paralelo a los pipelines (con 6 pases y 5 nombres,
+  `GetShaderCacheKey` leía fuera y el host crasheaba al arrancar): ahora con `static_assert`.
+
 ### 5.5 Compilar el juego sin quedarse sin memoria
 - 3123 bloques unity de 32 funciones (593 MB de C++). Algunos bloques piden hasta ~8 GB por
   compilador: con 24 a la vez en 32 GB Windows paginaba a disco (138 000 páginas/s) y no avanzaba.

@@ -3865,6 +3865,126 @@ index 000000000..4e0b3d548
 +  cG=ASatH2(nG+AGtZeroH2(dit-rG)*AH2_(1.0/1023.0));
 +  cB=ASatH2(nB+AGtZeroH2(dit-rB)*AH2_(1.0/1023.0));}
 +#endif
+diff --git a/bin/resources/shaders/dx11/nba_motion.hlsl b/bin/resources/shaders/dx11/nba_motion.hlsl
+new file mode 100644
+index 000000000..31833d201
+--- /dev/null
++++ b/bin/resources/shaders/dx11/nba_motion.hlsl
+@@ -0,0 +1,114 @@
++// PS2Recomp: motion vectors for DLSS estimated from the frames (Direct3D 12 version of
++// shaders/vulkan/nba_motion.glsl, same passes and results). PASS is defined by the compiler:
++//   0  colour (render rect)  -> luma at 1/2 resolution
++//   1  luma 1/2              -> luma 1/4
++//   2  search at 1/4: current vs previous luma, +-RADIUS texels, 5x5 patch SAD
++//   3  refine at 1/2 around 2x the 1/4 vector (+-1 texel, sub-texel parabola fit)
++//   4  1/2 vectors -> render-resolution vectors in pixels (bilinear), pointing to the previous frame
++//   5  match cost -> "bias current colour" mask (DLSS trusts the current frame where no match)
++
++cbuffer Constants : register(b0)
++{
++    int4 c0;   // PASS 0: src rect xy; all: dst size in zw
++    float4 c1; // PASS 4: x = vector sign/scale; PASS 5: x, y = cost per texel for mask 0 and 1
++    int4 c2;
++    int4 c3;
++};
++
++Texture2D<float4> src0 : register(t0);
++Texture2D<float4> src1 : register(t1);
++Texture2D<float4> src2 : register(t2);
++#if PASS == 0 || PASS == 1 || PASS == 5
++RWTexture2D<float> dst : register(u0);
++#else
++RWTexture2D<float4> dst : register(u0);
++#endif
++
++static const int RADIUS = 4;
++
++int2 Size(Texture2D<float4> t)
++{
++    uint w, h;
++    t.GetDimensions(w, h);
++    return int2(w, h);
++}
++
++float Luma(float3 c) { return dot(c, float3(0.299, 0.587, 0.114)); }
++float Cur(int2 p) { return src0.Load(int3(clamp(p, int2(0, 0), Size(src0) - 1), 0)).r; }
++float Prev(int2 p) { return src1.Load(int3(clamp(p, int2(0, 0), Size(src1) - 1), 0)).r; }
++
++float Sad(int2 p, int2 d)
++{
++    float s = 0.0;
++    for (int y = -2; y <= 2; y++)
++        for (int x = -2; x <= 2; x++)
++            s += abs(Cur(p + int2(x, y)) - Prev(p + int2(x, y) + d));
++    return s;
++}
++
++[numthreads(8, 8, 1)]
++void main(uint3 id : SV_DispatchThreadID)
++{
++    int2 p = int2(id.xy);
++    if (any(p >= c0.zw))
++        return;
++#if PASS == 0
++    int2 s = c0.xy + p * 2;
++    float l = Luma(src0.Load(int3(s, 0)).rgb) + Luma(src0.Load(int3(s + int2(1, 0), 0)).rgb) +
++              Luma(src0.Load(int3(s + int2(0, 1), 0)).rgb) + Luma(src0.Load(int3(s + int2(1, 1), 0)).rgb);
++    dst[p] = l * 0.25;
++#elif PASS == 1
++    int2 s = p * 2;
++    float l = src0.Load(int3(s, 0)).r + src0.Load(int3(s + int2(1, 0), 0)).r +
++              src0.Load(int3(s + int2(0, 1), 0)).r + src0.Load(int3(s + int2(1, 1), 0)).r;
++    dst[p] = l * 0.25;
++#elif PASS == 2
++    int2 best = int2(0, 0);
++    float bestCost = Sad(p, int2(0, 0)) * 0.9;
++    for (int y = -RADIUS; y <= RADIUS; y++)
++        for (int x = -RADIUS; x <= RADIUS; x++)
++        {
++            float cost = Sad(p, int2(x, y)) + 0.01 * float(abs(x) + abs(y));
++            if (cost < bestCost) { bestCost = cost; best = int2(x, y); }
++        }
++    dst[p] = float4(float2(best), bestCost, 0.0);
++#elif PASS == 3
++    int2 init = int2(src2.Load(int3(clamp(p / 2, int2(0, 0), Size(src2) - 1), 0)).xy) * 2;
++    int2 best = int2(0, 0);
++    float bestCost = Sad(p, int2(0, 0)) * 0.9;
++    for (int y = -1; y <= 1; y++)
++        for (int x = -1; x <= 1; x++)
++        {
++            int2 d = init + int2(x, y);
++            float cost = Sad(p, d) + 0.01 * float(abs(d.x) + abs(d.y));
++            if (cost < bestCost) { bestCost = cost; best = d; }
++        }
++    float2 frac = float2(0.0, 0.0);
++    float cx0 = Sad(p, best - int2(1, 0)), cx1 = Sad(p, best + int2(1, 0));
++    float cy0 = Sad(p, best - int2(0, 1)), cy1 = Sad(p, best + int2(0, 1));
++    float c = Sad(p, best);
++    float dx = cx0 - 2.0 * c + cx1, dy = cy0 - 2.0 * c + cy1;
++    if (dx > 1e-5) frac.x = clamp(0.5 * (cx0 - cx1) / dx, -0.5, 0.5);
++    if (dy > 1e-5) frac.y = clamp(0.5 * (cy0 - cy1) / dy, -0.5, 0.5);
++    dst[p] = float4(float2(best) + frac, bestCost, 0.0);
++#elif PASS == 5
++    int2 hp = p / 2, mxx = Size(src0) - 1;
++    float cost = 0.0;
++    for (int y = -1; y <= 1; y++)
++        for (int x = -1; x <= 1; x++)
++            cost = max(cost, src0.Load(int3(clamp(hp + int2(x, y), int2(0, 0), mxx), 0)).z);
++    dst[p] = smoothstep(c1.x, c1.y, cost / 25.0);
++#else
++    // Bilinear between the 1/2-resolution vectors (manual: this pass has no sampler bound).
++    float2 q = (float2(p) + 0.5) * 0.5 - 0.5;
++    int2 b = int2(floor(q));
++    float2 f = q - float2(b);
++    int2 mx = Size(src0) - 1;
++    float2 v00 = src0.Load(int3(clamp(b, int2(0, 0), mx), 0)).xy;
++    float2 v10 = src0.Load(int3(clamp(b + int2(1, 0), int2(0, 0), mx), 0)).xy;
++    float2 v01 = src0.Load(int3(clamp(b + int2(0, 1), int2(0, 0), mx), 0)).xy;
++    float2 v11 = src0.Load(int3(clamp(b + int2(1, 1), int2(0, 0), mx), 0)).xy;
++    float2 v = lerp(lerp(v00, v10, f.x), lerp(v01, v11, f.x), f.y) * 2.0;
++    dst[p] = float4(v * c1.x, 0.0, 0.0);
++#endif
++}
 diff --git a/bin/resources/shaders/vulkan/fsr1.glsl b/bin/resources/shaders/vulkan/fsr1.glsl
 new file mode 100644
 index 000000000..b3389f470
@@ -3941,6 +4061,123 @@ index 000000000..b3389f470
 +    FilterPixel(gxy);
 +    gxy.x -= 8u;
 +    FilterPixel(gxy);
++}
+diff --git a/bin/resources/shaders/vulkan/nba_motion.glsl b/bin/resources/shaders/vulkan/nba_motion.glsl
+new file mode 100644
+index 000000000..13020be93
+--- /dev/null
++++ b/bin/resources/shaders/vulkan/nba_motion.glsl
+@@ -0,0 +1,111 @@
++#version 460 core
++
++// PS2Recomp: motion vectors for DLSS, estimated from the frames themselves (a PS2 game gives the
++// GS screen-space vertices only, no per-object motion). Hierarchical block matching on luma:
++//   PASS 0  colour (render rect)  -> luma at 1/2 resolution
++//   PASS 1  luma 1/2              -> luma 1/4
++//   PASS 2  search at 1/4: current vs previous luma, +-RADIUS texels, 5x5 patch SAD
++//   PASS 3  refine at 1/2 around 2x the 1/4 vector (+-1 texel), also tries zero
++//   PASS 4  1/2 vectors -> render-resolution vectors in pixels (DLSS input, MVLowRes)
++//   PASS 5  match cost of the 1/2 vectors -> "bias current colour" mask at render resolution:
++//           where no good match was found (fast thin limbs, disocclusion) DLSS trusts the
++//           current frame instead of its history, so those areas stay sharp
++// Vectors point from a pixel of the current frame to where it was in the previous one.
++// The including code prepends "#define PASS n".
++
++layout(push_constant) uniform const_buffer
++{
++    ivec4 c0; // PASS 0: src rect xy, dst size; others: dst size in c0.zw
++    vec4 c1;  // PASS 4: x = vector sign/scale; PASS 5: x, y = cost per texel for mask 0 and 1
++    ivec4 c2;
++    ivec4 c3;
++};
++
++layout(set=0, binding=0) uniform sampler2D src0;
++layout(set=0, binding=1) uniform sampler2D src1;
++layout(set=0, binding=2) uniform sampler2D src2;
++#if PASS == 0 || PASS == 1 || PASS == 5
++layout(set=0, binding=3, r32f) uniform writeonly image2D dst;
++#else
++layout(set=0, binding=3, rgba16f) uniform writeonly image2D dst;
++#endif
++
++const int RADIUS = 4;
++
++float Luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
++
++float Cur(ivec2 p) { return texelFetch(src0, clamp(p, ivec2(0), textureSize(src0, 0) - 1), 0).r; }
++float Prev(ivec2 p) { return texelFetch(src1, clamp(p, ivec2(0), textureSize(src1, 0) - 1), 0).r; }
++
++float Sad(ivec2 p, ivec2 d)
++{
++    float s = 0.0;
++    for (int y = -2; y <= 2; y++)
++        for (int x = -2; x <= 2; x++)
++            s += abs(Cur(p + ivec2(x, y)) - Prev(p + ivec2(x, y) + d));
++    return s;
++}
++
++layout(local_size_x=8, local_size_y=8) in;
++void main()
++{
++    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    if (any(greaterThanEqual(p, c0.zw)))
++        return;
++#if PASS == 0
++    ivec2 s = c0.xy + p * 2;
++    float l = Luma(texelFetch(src0, s, 0).rgb) + Luma(texelFetch(src0, s + ivec2(1, 0), 0).rgb) +
++              Luma(texelFetch(src0, s + ivec2(0, 1), 0).rgb) + Luma(texelFetch(src0, s + ivec2(1, 1), 0).rgb);
++    imageStore(dst, p, vec4(l * 0.25));
++#elif PASS == 1
++    ivec2 s = p * 2;
++    float l = texelFetch(src0, s, 0).r + texelFetch(src0, s + ivec2(1, 0), 0).r +
++              texelFetch(src0, s + ivec2(0, 1), 0).r + texelFetch(src0, s + ivec2(1, 1), 0).r;
++    imageStore(dst, p, vec4(l * 0.25));
++#elif PASS == 2
++    // Small bias towards no motion: flat areas and the HUD stay still.
++    ivec2 best = ivec2(0);
++    float bestCost = Sad(p, ivec2(0)) * 0.9;
++    for (int y = -RADIUS; y <= RADIUS; y++)
++        for (int x = -RADIUS; x <= RADIUS; x++)
++        {
++            float cost = Sad(p, ivec2(x, y)) + 0.01 * float(abs(x) + abs(y));
++            if (cost < bestCost) { bestCost = cost; best = ivec2(x, y); }
++        }
++    imageStore(dst, p, vec4(vec2(best), bestCost, 0.0));
++#elif PASS == 3
++    ivec2 init = ivec2(texelFetch(src2, clamp(p / 2, ivec2(0), textureSize(src2, 0) - 1), 0).xy) * 2;
++    ivec2 best = ivec2(0);
++    float bestCost = Sad(p, ivec2(0)) * 0.9;
++    for (int y = -1; y <= 1; y++)
++        for (int x = -1; x <= 1; x++)
++        {
++            ivec2 d = init + ivec2(x, y);
++            float cost = Sad(p, d) + 0.01 * float(abs(d.x) + abs(d.y));
++            if (cost < bestCost) { bestCost = cost; best = d; }
++        }
++    // Sub-texel refinement: a parabola through the costs either side of the best match on each
++    // axis (an integer vector here is 2 render pixels, far too coarse for slow camera pans).
++    vec2 frac = vec2(0.0);
++    float cx0 = Sad(p, best - ivec2(1, 0)), cx1 = Sad(p, best + ivec2(1, 0));
++    float cy0 = Sad(p, best - ivec2(0, 1)), cy1 = Sad(p, best + ivec2(0, 1));
++    float c = Sad(p, best);
++    float dx = cx0 - 2.0 * c + cx1, dy = cy0 - 2.0 * c + cy1;
++    if (dx > 1e-5) frac.x = clamp(0.5 * (cx0 - cx1) / dx, -0.5, 0.5);
++    if (dy > 1e-5) frac.y = clamp(0.5 * (cy0 - cy1) / dy, -0.5, 0.5);
++    imageStore(dst, p, vec4(vec2(best) + frac, bestCost, 0.0));
++#elif PASS == 5
++    // Worst match cost around the pixel (3x3 at 1/2 res) so the mask covers limb edges too.
++    ivec2 h = p / 2, mx = textureSize(src0, 0) - 1;
++    float cost = 0.0;
++    for (int y = -1; y <= 1; y++)
++        for (int x = -1; x <= 1; x++)
++            cost = max(cost, texelFetch(src0, clamp(h + ivec2(x, y), ivec2(0), mx), 0).z);
++    imageStore(dst, p, vec4(smoothstep(c1.x, c1.y, cost / 25.0)));
++#else
++    // Bilinear between the 1/2-resolution vectors (no blocky steps between neighbours).
++    vec2 uv = (vec2(p) + 0.5) / vec2(c0.zw);
++    vec2 v = texture(src0, uv).xy * 2.0;
++    imageStore(dst, p, vec4(v * c1.x, 0.0, 0.0));
++#endif
 +}
 diff --git a/common/CrashHandler.cpp b/common/CrashHandler.cpp
 index a44f07af3..80506fe8d 100644
@@ -5945,7 +6182,7 @@ index 5f6f8d409..dcb6638b8 100644
  public:
  	GSRenderer();
 diff --git a/pcsx2/GS/Renderers/DX12/GSDevice12.cpp b/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
-index 8541f266a..60a9e3a67 100644
+index 8541f266a..b317f5f47 100644
 --- a/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
 +++ b/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
 @@ -27,6 +27,12 @@
@@ -5961,7 +6198,18 @@ index 8541f266a..60a9e3a67 100644
  #ifdef ENABLE_OGL_DEBUG
  #define USE_PIX
  #include "WinPixEventRuntime/pix3.h"
-@@ -1016,6 +1022,7 @@ void GSDevice12::Destroy()
+@@ -996,6 +1002,10 @@ bool GSDevice12::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
+ 	if (!CompileCASPipelines())
+ 		return false;
+ 
++	// PS2Recomp: DLSS motion vectors (optional: without them DLSS drops its history every frame).
++	if (!CompileMotionPipelines())
++		Console.Warning("(PS2Recomp) DLSS motion vector pipelines unavailable (D3D12).");
++
+ 	if (!CompileImGuiPipeline())
+ 		return false;
+ 
+@@ -1016,6 +1026,7 @@ void GSDevice12::Destroy()
  		ExecuteCommandList(true);
  	}
  
@@ -5969,7 +6217,132 @@ index 8541f266a..60a9e3a67 100644
  	DestroySwapChain();
  	DestroyResources();
  }
-@@ -2511,6 +2518,227 @@ bool GSDevice12::DoCAS(
+@@ -2315,6 +2326,124 @@ bool GSDevice12::CompileCASPipelines()
+ 	return true;
+ }
+ 
++bool GSDevice12::CompileMotionPipelines()
++{
++	D3D12::RootSignatureBuilder rsb;
++	rsb.Add32BitConstants(0, 16, D3D12_SHADER_VISIBILITY_ALL);
++	rsb.AddDescriptorTable(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0, 3, D3D12_SHADER_VISIBILITY_ALL);
++	rsb.AddDescriptorTable(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 0, 1, D3D12_SHADER_VISIBILITY_ALL);
++	m_mv_root_signature = rsb.Create(false);
++	if (!m_mv_root_signature)
++		return false;
++
++	std::optional<std::string> source = ReadShaderSource("shaders/dx11/nba_motion.hlsl");
++	if (!source.has_value())
++		return false;
++	static constexpr const char* pass_names[] = {"0", "1", "2", "3", "4", "5"};
++	static_assert(std::size(pass_names) == std::tuple_size_v<decltype(m_mv_pipelines)>);
++	for (u32 pass = 0; pass < m_mv_pipelines.size(); pass++)
++	{
++		const D3D_SHADER_MACRO macros[] = {{"PASS", pass_names[pass]}, {nullptr, nullptr}};
++		const ComPtr<ID3DBlob> cs(m_shader_cache.GetComputeShader(source.value(), macros, "main"));
++		if (!cs)
++			return false;
++		D3D12::ComputePipelineBuilder cpb;
++		cpb.SetRootSignature(m_mv_root_signature.get());
++		cpb.SetShader(cs->GetBufferPointer(), cs->GetBufferSize());
++		m_mv_pipelines[pass] = cpb.Create(m_device.get(), m_shader_cache, false);
++		if (!m_mv_pipelines[pass])
++			return false;
++	}
++	return true;
++}
++
++// Writes estimated motion vectors for the src_rect of sTex into m_dlss_mv (render size, pixels,
++// pointing to the previous frame). False when there is no usable previous frame yet.
++bool GSDevice12::EstimateMotion(GSTexture12* sTex, const GSVector4i& src_rect)
++{
++	if (!m_mv_pipelines[4] || !m_dlss_mv)
++		return false;
++	const int w = src_rect.width(), h = src_rect.height();
++	const int hw = std::max(1, w / 2), hh = std::max(1, h / 2), qw = std::max(1, w / 4), qh = std::max(1, h / 4);
++	auto ensure = [&](GSTexture*& t, int tw, int th, GSTexture::Format f) {
++		if (t && t->GetWidth() == tw && t->GetHeight() == th)
++			return true;
++		delete t;
++		t = CreateSurface(GSTexture::ShaderWriteTexture, tw, th, 1, f);
++		m_mv_have_prev = false;
++		return t != nullptr;
++	};
++	for (int p = 0; p < 2; p++)
++	{
++		if (!ensure(m_mv_luma[p][0], hw, hh, GSTexture::Format::DepthColor) ||
++			!ensure(m_mv_luma[p][1], qw, qh, GSTexture::Format::DepthColor))
++			return false;
++	}
++	if (!ensure(m_mv_vec[0], qw, qh, GSTexture::Format::ColorHDR) || !ensure(m_mv_vec[1], hw, hh, GSTexture::Format::ColorHDR) ||
++		!ensure(m_dlss_bias, w, h, GSTexture::Format::DepthColor))
++		return false;
++
++	static const float s_scale = [] { const char* e = std::getenv("PS2X_DLSS_MV_SCALE"); return e ? static_cast<float>(std::atof(e)) : 1.0f; }();
++	// "Bias current colour" mask: average luma difference per texel of the best match that maps to
++	// 0 (history kept) and 1 (current frame only). PS2X_DLSS_BIAS scales both (0 = no mask).
++	static const float s_bias = [] { const char* e = std::getenv("PS2X_DLSS_BIAS"); return e ? static_cast<float>(std::atof(e)) : 1.0f; }();
++	float c1v[2] = {s_scale, 0.0f};
++	const D3D12CommandList& cmdlist = GetCommandList();
++	bool ok = true;
++	auto run = [&](u32 pass, GSTexture* s0, GSTexture* s1, GSTexture* s2, GSTexture* d, int c0x, int c0y, int dw, int dh) {
++		GSTexture12* const src[3] = {static_cast<GSTexture12*>(s0), static_cast<GSTexture12*>(s1), static_cast<GSTexture12*>(s2)};
++		GSTexture12* const dst = static_cast<GSTexture12*>(d);
++		for (GSTexture12* s : src)
++		{
++			if (s->GetState() == GSTexture::State::Cleared)
++				s->CommitClear(cmdlist);
++			s->TransitionToState(cmdlist, GSTexture12::ResourceState::ComputeShaderResource);
++		}
++		dst->TransitionToState(cmdlist, GSTexture12::ResourceState::CASShaderUAV);
++		const D3D12DescriptorHandle srvs[3] = {src[0]->GetSRVDescriptor(), src[1]->GetSRVDescriptor(), src[2]->GetSRVDescriptor()};
++		D3D12DescriptorHandle srv_gpu, uav_gpu;
++		if (!GetTextureGroupDescriptors(&srv_gpu, srvs, 3) || !GetTextureGroupDescriptors(&uav_gpu, &dst->GetUAVDescriptor(), 1))
++		{
++			ok = false;
++			return;
++		}
++		u32 pc[16] = {};
++		pc[0] = static_cast<u32>(c0x);
++		pc[1] = static_cast<u32>(c0y);
++		pc[2] = static_cast<u32>(dw);
++		pc[3] = static_cast<u32>(dh);
++		std::memcpy(&pc[4], c1v, sizeof(c1v));
++		cmdlist.list4->SetComputeRootSignature(m_mv_root_signature.get());
++		cmdlist.list4->SetComputeRoot32BitConstants(0, 16, pc, 0);
++		cmdlist.list4->SetComputeRootDescriptorTable(1, srv_gpu);
++		cmdlist.list4->SetComputeRootDescriptorTable(2, uav_gpu);
++		cmdlist.list4->SetPipelineState(m_mv_pipelines[pass].get());
++		cmdlist.list4->Dispatch((dw + 7) / 8, (dh + 7) / 8, 1);
++	};
++
++	const int cur = static_cast<int>(m_mv_frame & 1u), prev = cur ^ 1;
++	run(0, sTex, sTex, sTex, m_mv_luma[cur][0], src_rect.x, src_rect.y, hw, hh);
++	run(1, m_mv_luma[cur][0], m_mv_luma[cur][0], m_mv_luma[cur][0], m_mv_luma[cur][1], 0, 0, qw, qh);
++	const bool have_prev = m_mv_have_prev;
++	if (have_prev)
++	{
++		run(2, m_mv_luma[cur][1], m_mv_luma[prev][1], m_mv_luma[cur][1], m_mv_vec[0], 0, 0, qw, qh);
++		run(3, m_mv_luma[cur][0], m_mv_luma[prev][0], m_mv_vec[0], m_mv_vec[1], 0, 0, hw, hh);
++		run(4, m_mv_vec[1], m_mv_vec[1], m_mv_vec[1], m_dlss_mv, 0, 0, w, h);
++		if (s_bias > 0.0f)
++		{
++			c1v[0] = 0.02f * s_bias;
++			c1v[1] = 0.06f * s_bias;
++			run(5, m_mv_vec[1], m_mv_vec[1], m_mv_vec[1], m_dlss_bias, 0, 0, w, h);
++		}
++	}
++	m_mv_have_prev = true;
++	m_mv_frame++;
++	m_dirty_flags |= DIRTY_FLAG_PIPELINE;
++	InvalidateCachedState();
++	return have_prev && ok;
++}
++
+ bool GSDevice12::CompileImGuiPipeline()
+ {
+ 	const std::optional<std::string> hlsl = ReadShaderSource("shaders/dx11/imgui.fx");
+@@ -2511,6 +2640,259 @@ bool GSDevice12::DoCAS(
  	return true;
  }
  
@@ -6048,7 +6421,9 @@ index 8541f266a..60a9e3a67 100644
 +		delete m_dlss_depth;
 +		delete m_dlss_mv;
 +		m_dlss_depth = CreateSurface(GSTexture::RenderTarget, in_w, in_h, 1, GSTexture::Format::DepthColor);
-+		m_dlss_mv = CreateSurface(GSTexture::RenderTarget, in_w, in_h, 1, GSTexture::Format::ColorHDR);
++		// Render target (cleared to zero) that the motion vector pass can also write.
++		m_dlss_mv = CreateSurface(GSTexture::RenderTarget | GSTexture::Usage::ShaderWrite, in_w, in_h, 1, GSTexture::Format::ColorHDR);
++		m_mv_have_prev = false;
 +		if (!m_dlss_depth || !m_dlss_mv)
 +			return false;
 +		ClearRenderTarget(m_dlss_depth, 0);
@@ -6107,6 +6482,21 @@ index 8541f266a..60a9e3a67 100644
 +	}
 +	GSTexture12* const depth = real_depth ? game_depth : static_cast<GSTexture12*>(m_dlss_depth);
 +	GSTexture12* const mv = static_cast<GSTexture12*>(m_dlss_mv);
++
++	// Temporal DLSS with motion vectors estimated from the frames, as on Vulkan
++	// (PS2X_DLSS_MOTION=0 turns it off); history dropped on 3D <-> flat screen switches.
++	static const bool s_motion = [] { const char* e = std::getenv("PS2X_DLSS_MOTION"); return !e || e[0] != '0'; }();
++	static int s_prev_real_depth = -1;
++	const bool scene_change = s_prev_real_depth != static_cast<int>(real_depth);
++	s_prev_real_depth = static_cast<int>(real_depth);
++	if (mv->GetState() == GSTexture::State::Cleared)
++		mv->CommitClear(cmdlist);
++	const bool have_motion = s_motion && EstimateMotion(sTex, src_rect);
++	if (scene_change)
++		m_mv_have_prev = s_motion;
++	static const bool s_use_bias = [] { const char* e = std::getenv("PS2X_DLSS_BIAS"); return !e || std::atof(e) > 0.0; }();
++	GSTexture12* const bias = (have_motion && s_use_bias) ? static_cast<GSTexture12*>(m_dlss_bias) : nullptr;
++
 +	for (GSTexture12* t : {sTex, depth, mv, dTex})
 +	{
 +		if (t->GetState() == GSTexture::State::Cleared)
@@ -6116,6 +6506,11 @@ index 8541f266a..60a9e3a67 100644
 +	sTex->TransitionToState(cmdlist, GSTexture12::ResourceState::ComputeShaderResource);
 +	depth->TransitionToState(cmdlist, GSTexture12::ResourceState::ComputeShaderResource);
 +	mv->TransitionToState(cmdlist, GSTexture12::ResourceState::ComputeShaderResource);
++	if (bias)
++	{
++		bias->SetUseFenceCounter(GetCurrentFenceValue());
++		bias->TransitionToState(cmdlist, GSTexture12::ResourceState::ComputeShaderResource);
++	}
 +	dTex->TransitionToState(cmdlist, GSTexture12::ResourceState::CASShaderUAV);
 +
 +	NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
@@ -6123,6 +6518,8 @@ index 8541f266a..60a9e3a67 100644
 +	eval.Feature.pInOutput = dTex->GetResource();
 +	eval.pInDepth = depth->GetResource();
 +	eval.pInMotionVectors = mv->GetResource();
++	if (bias)
++		eval.pInBiasCurrentColorMask = bias->GetResource(); // poorly matched areas: trust the current frame
 +	eval.InRenderSubrectDimensions.Width = in_w;
 +	eval.InRenderSubrectDimensions.Height = in_h;
 +	eval.InColorSubrectBase.X = src_rect.x;
@@ -6132,9 +6529,8 @@ index 8541f266a..60a9e3a67 100644
 +		eval.InDepthSubrectBase.X = src_rect.x;
 +		eval.InDepthSubrectBase.Y = src_rect.y;
 +	}
-+	// No real motion vectors exist for a PS2 frame: drop the history every frame so moving
-+	// objects never ghost (DLSS then works as a per-frame AI upscaler).
-+	eval.InReset = 1;
++	// Without estimated motion (first frame, scene change, or turned off) the history is dropped.
++	eval.InReset = (have_motion && !scene_change) ? 0 : 1;
 +	eval.InMVScaleX = 1.0f;
 +	eval.InMVScaleY = 1.0f;
 +	const NVSDK_NGX_Result res = NGX_D3D12_EVALUATE_DLSS_EXT(cmdlist.list4.get(), static_cast<NVSDK_NGX_Handle*>(m_dlss_feature), params, &eval);
@@ -6192,16 +6588,25 @@ index 8541f266a..60a9e3a67 100644
 +	delete m_dlss_mv;
 +	m_dlss_depth = nullptr;
 +	m_dlss_mv = nullptr;
++	for (GSTexture** t : {&m_mv_luma[0][0], &m_mv_luma[0][1], &m_mv_luma[1][0], &m_mv_luma[1][1], &m_mv_vec[0], &m_mv_vec[1], &m_dlss_bias})
++	{
++		delete *t;
++		*t = nullptr;
++	}
++	m_mv_have_prev = false;
++	for (ComPtr<ID3D12PipelineState>& p : m_mv_pipelines)
++		p.reset();
++	m_mv_root_signature.reset();
 +}
 +
  void GSDevice12::IASetVertexBuffer(const void* vertex, size_t stride, size_t count)
  {
  	const u32 size = static_cast<u32>(stride) * static_cast<u32>(count);
 diff --git a/pcsx2/GS/Renderers/DX12/GSDevice12.h b/pcsx2/GS/Renderers/DX12/GSDevice12.h
-index 691e176af..892169e46 100644
+index 691e176af..5f7e18557 100644
 --- a/pcsx2/GS/Renderers/DX12/GSDevice12.h
 +++ b/pcsx2/GS/Renderers/DX12/GSDevice12.h
-@@ -461,6 +461,21 @@ private:
+@@ -461,6 +461,31 @@ private:
  
  	bool DoCAS(
  		GSTexture* sTex, GSTexture* dTex, bool sharpen_only, const std::array<u32, NUM_CAS_CONSTANTS>& constants) final;
@@ -6216,7 +6621,17 @@ index 691e176af..892169e46 100644
 +	void* m_dlss_feature = nullptr; // NVSDK_NGX_Handle*
 +	int m_dlss_in_w = 0, m_dlss_in_h = 0, m_dlss_out_w = 0, m_dlss_out_h = 0;
 +	GSTexture* m_dlss_depth = nullptr; // zero depth (render size), when the game's is not usable
-+	GSTexture* m_dlss_mv = nullptr;    // zero motion vectors (render size)
++	GSTexture* m_dlss_mv = nullptr;    // motion vectors (render size): zero, or estimated below
++	// Motion vectors for DLSS estimated from the frames (shaders/dx11/nba_motion.hlsl).
++	ComPtr<ID3D12RootSignature> m_mv_root_signature;
++	std::array<ComPtr<ID3D12PipelineState>, 6> m_mv_pipelines;
++	GSTexture* m_mv_luma[2][2] = {};  // [frame parity][0 = 1/2 res, 1 = 1/4 res]
++	GSTexture* m_mv_vec[2] = {};      // [0 = 1/4 res search, 1 = 1/2 res refined]
++	GSTexture* m_dlss_bias = nullptr; // "bias current colour" mask (render size) where matching failed
++	u32 m_mv_frame = 0;
++	bool m_mv_have_prev = false;
++	bool CompileMotionPipelines();
++	bool EstimateMotion(GSTexture12* sTex, const GSVector4i& src_rect);
 +	bool InitDLSS();
 +	bool DoDLSS(GSTexture12* sTex, const GSVector4i& src_rect, GSTexture12* dTex);
 +	void DestroyUpscalers();
@@ -6412,7 +6827,7 @@ index 440e2794c..a5108c35f 100644
  		{
  			if ((m_TEX0.PSM & 0xf) != PSMCT24 && m_dirty[i].rgba.c.a && bpp >= 16)
 diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
-index d3dad7e9c..ff0405643 100644
+index d3dad7e9c..a042041c2 100644
 --- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 +++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 @@ -21,10 +21,21 @@
@@ -6483,18 +6898,20 @@ index d3dad7e9c..ff0405643 100644
  	m_optional_extensions.vk_ext_provoking_vertex = SupportsExtension(VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME, false);
  	m_optional_extensions.vk_ext_memory_budget = SupportsExtension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, false);
  	m_optional_extensions.vk_ext_calibrated_timestamps =
-@@ -2234,6 +2277,10 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
+@@ -2234,6 +2277,12 @@ bool GSDeviceVK::Create(GSVSyncMode vsync_mode, bool allow_present_throttle)
  	if (!CompileCASPipelines())
  		return false;
  
 +	// PS2Recomp upscaler (optional: without it the window is filled by the usual bilinear present).
 +	if (!CompileFSRPipelines())
 +		Console.Warning("(PS2Recomp) FSR pipelines unavailable.");
++	if (!CompileMotionPipelines())
++		Console.Warning("(PS2Recomp) DLSS motion vector pipelines unavailable.");
 +
  	if (!CompileImGuiPipeline())
  		return false;
  
-@@ -2245,6 +2292,14 @@ void GSDeviceVK::Destroy()
+@@ -2245,6 +2294,20 @@ void GSDeviceVK::Destroy()
  {
  	std::unique_lock lock(s_instance_mutex);
  
@@ -6505,11 +6922,17 @@ index d3dad7e9c..ff0405643 100644
 +	m_fsr_easu = nullptr;
 +	m_dlss_depth = nullptr;
 +	m_dlss_mv = nullptr;
++	for (GSTexture** t : {&m_mv_luma[0][0], &m_mv_luma[0][1], &m_mv_luma[1][0], &m_mv_luma[1][1], &m_mv_vec[0], &m_mv_vec[1], &m_dlss_bias})
++	{
++		delete *t;
++		*t = nullptr;
++	}
++	m_mv_have_prev = false;
 +
  	GSDevice::Destroy();
  
  	EndRenderPass();
-@@ -2253,6 +2308,8 @@ void GSDeviceVK::Destroy()
+@@ -2253,6 +2316,8 @@ void GSDeviceVK::Destroy()
  		ExecuteCommandBuffer(false);
  		WaitForGPUIdle();
  	}
@@ -6518,7 +6941,7 @@ index d3dad7e9c..ff0405643 100644
  
  	m_swap_chain.reset();
  
-@@ -4774,6 +4831,382 @@ bool GSDeviceVK::DoCAS(
+@@ -4774,6 +4839,535 @@ bool GSDeviceVK::DoCAS(
  	return true;
  }
  
@@ -6568,6 +6991,124 @@ index d3dad7e9c..ff0405643 100644
 +			return false;
 +	}
 +	return true;
++}
++
++bool GSDeviceVK::CompileMotionPipelines()
++{
++	VkDevice dev = m_device;
++	Vulkan::DescriptorSetLayoutBuilder dslb;
++	Vulkan::PipelineLayoutBuilder plb;
++
++	dslb.SetPushFlag();
++	for (u32 i = 0; i < 3; i++)
++		dslb.AddBinding(i, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1, VK_SHADER_STAGE_COMPUTE_BIT);
++	dslb.AddBinding(3, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
++	if ((m_mv_ds_layout = dslb.Create(dev)) == VK_NULL_HANDLE)
++		return false;
++	plb.AddPushConstants(VK_SHADER_STAGE_COMPUTE_BIT, 0, 16 * sizeof(u32));
++	plb.AddDescriptorSet(m_mv_ds_layout);
++	if ((m_mv_pipeline_layout = plb.Create(dev)) == VK_NULL_HANDLE)
++		return false;
++
++	std::optional<std::string> source = ReadShaderSource("shaders/vulkan/nba_motion.glsl");
++	if (!source.has_value())
++		return false;
++	const size_t version_end = source->find('\n') + 1;
++	for (u32 pass = 0; pass < m_mv_pipelines.size(); pass++)
++	{
++		std::string src = *source;
++		src.insert(version_end, fmt::format("#define PASS {}\n", pass));
++		VkShaderModule mod = g_vulkan_shader_cache->GetComputeShader(src.c_str());
++		if (mod == VK_NULL_HANDLE)
++			return false;
++		Vulkan::ComputePipelineBuilder cpb;
++		cpb.SetPipelineLayout(m_mv_pipeline_layout);
++		cpb.SetShader(mod, "main");
++		m_mv_pipelines[pass] = cpb.Create(dev, g_vulkan_shader_cache->GetPipelineCache(true), false);
++		vkDestroyShaderModule(dev, mod, nullptr);
++		if (!m_mv_pipelines[pass])
++			return false;
++	}
++	return true;
++}
++
++// Writes estimated motion vectors for the src_rect of sTex into m_dlss_mv (render size, pixels,
++// pointing to the previous frame). False when there is no usable previous frame yet: the caller
++// then resets DLSS's history.
++bool GSDeviceVK::EstimateMotion(VkCommandBuffer cmdbuf, GSTextureVK* sTex, const GSVector4i& src_rect)
++{
++	if (!m_mv_pipelines[4] || !m_dlss_mv)
++		return false;
++	const int w = src_rect.width(), h = src_rect.height();
++	const int hw = std::max(1, w / 2), hh = std::max(1, h / 2), qw = std::max(1, w / 4), qh = std::max(1, h / 4);
++	auto ensure = [&](GSTexture*& t, int tw, int th, GSTexture::Format f) {
++		if (t && t->GetWidth() == tw && t->GetHeight() == th)
++			return true;
++		delete t;
++		t = CreateSurface(GSTexture::ShaderWriteTexture, tw, th, 1, f);
++		m_mv_have_prev = false;
++		return t != nullptr;
++	};
++	for (int p = 0; p < 2; p++)
++	{
++		if (!ensure(m_mv_luma[p][0], hw, hh, GSTexture::Format::DepthColor) ||
++			!ensure(m_mv_luma[p][1], qw, qh, GSTexture::Format::DepthColor))
++			return false;
++	}
++	if (!ensure(m_mv_vec[0], qw, qh, GSTexture::Format::ColorHDR) || !ensure(m_mv_vec[1], hw, hh, GSTexture::Format::ColorHDR) ||
++		!ensure(m_dlss_bias, w, h, GSTexture::Format::DepthColor))
++		return false;
++
++	// PS2X_DLSS_MV_SCALE: sign/scale of the vectors handed to DLSS (debugging the convention).
++	static const float s_scale = [] { const char* e = std::getenv("PS2X_DLSS_MV_SCALE"); return e ? static_cast<float>(std::atof(e)) : 1.0f; }();
++	// "Bias current colour" mask: average luma difference per texel of the best match that maps to
++	// 0 (history kept) and 1 (current frame only). PS2X_DLSS_BIAS scales both (0 = no mask).
++	static const float s_bias = [] { const char* e = std::getenv("PS2X_DLSS_BIAS"); return e ? static_cast<float>(std::atof(e)) : 1.0f; }();
++	float c1v[2] = {s_scale, 0.0f};
++	auto run = [&](u32 pass, GSTexture* s0, GSTexture* s1, GSTexture* s2, GSTexture* d, int c0x, int c0y, int dw, int dh) {
++		GSTextureVK* const src[3] = {static_cast<GSTextureVK*>(s0), static_cast<GSTextureVK*>(s1), static_cast<GSTextureVK*>(s2)};
++		GSTextureVK* const dst = static_cast<GSTextureVK*>(d);
++		for (GSTextureVK* s : src)
++			s->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ShaderReadOnly);
++		dst->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ComputeReadWriteImage);
++		Vulkan::DescriptorSetUpdateBuilder dsub;
++		// Only the last pass filters (bilinear vectors); the others use texelFetch.
++		const VkSampler sampler = (pass == 4) ? m_linear_sampler : m_point_sampler;
++		for (u32 i = 0; i < 3; i++)
++			dsub.AddCombinedImageSamplerDescriptorWrite(VK_NULL_HANDLE, i, src[i]->GetView(), sampler, src[i]->GetVkLayout());
++		dsub.AddStorageImageDescriptorWrite(VK_NULL_HANDLE, 3, dst->GetView(), dst->GetVkLayout());
++		dsub.PushUpdate(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_mv_pipeline_layout, 0, false);
++		u32 pc[16] = {};
++		pc[0] = static_cast<u32>(c0x);
++		pc[1] = static_cast<u32>(c0y);
++		pc[2] = static_cast<u32>(dw);
++		pc[3] = static_cast<u32>(dh);
++		std::memcpy(&pc[4], c1v, sizeof(c1v));
++		vkCmdPushConstants(cmdbuf, m_mv_pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), pc);
++		vkCmdBindPipeline(cmdbuf, VK_PIPELINE_BIND_POINT_COMPUTE, m_mv_pipelines[pass]);
++		vkCmdDispatch(cmdbuf, (dw + 7) / 8, (dh + 7) / 8, 1);
++	};
++
++	const int cur = static_cast<int>(m_mv_frame & 1u), prev = cur ^ 1;
++	run(0, sTex, sTex, sTex, m_mv_luma[cur][0], src_rect.x, src_rect.y, hw, hh);
++	run(1, m_mv_luma[cur][0], m_mv_luma[cur][0], m_mv_luma[cur][0], m_mv_luma[cur][1], 0, 0, qw, qh);
++	const bool have_prev = m_mv_have_prev;
++	if (have_prev)
++	{
++		run(2, m_mv_luma[cur][1], m_mv_luma[prev][1], m_mv_luma[cur][1], m_mv_vec[0], 0, 0, qw, qh);
++		run(3, m_mv_luma[cur][0], m_mv_luma[prev][0], m_mv_vec[0], m_mv_vec[1], 0, 0, hw, hh);
++		run(4, m_mv_vec[1], m_mv_vec[1], m_mv_vec[1], m_dlss_mv, 0, 0, w, h);
++		if (s_bias > 0.0f)
++		{
++			c1v[0] = 0.02f * s_bias;
++			c1v[1] = 0.06f * s_bias;
++			run(5, m_mv_vec[1], m_mv_vec[1], m_mv_vec[1], m_dlss_bias, 0, 0, w, h);
++		}
++	}
++	m_mv_have_prev = true;
++	m_mv_frame++;
++	InvalidateCachedState();
++	return have_prev;
 +}
 +
 +namespace
@@ -6735,7 +7276,8 @@ index d3dad7e9c..ff0405643 100644
 +		delete m_dlss_depth;
 +		delete m_dlss_mv;
 +		m_dlss_depth = CreateSurface(GSTexture::RenderTarget, in_w, in_h, 1, GSTexture::Format::DepthColor);
-+		m_dlss_mv = CreateSurface(GSTexture::RenderTarget, in_w, in_h, 1, GSTexture::Format::ColorHDR);
++		m_dlss_mv = CreateSurface(GSTexture::ShaderWriteTexture, in_w, in_h, 1, GSTexture::Format::ColorHDR);
++		m_mv_have_prev = false;
 +		if (!m_dlss_depth || !m_dlss_mv)
 +			return false;
 +		static_cast<GSTextureVK*>(m_dlss_depth)->TransitionToLayout(cmdbuf, GSTextureVK::Layout::TransferDst);
@@ -6798,6 +7340,18 @@ index d3dad7e9c..ff0405643 100644
 +	}
 +	GSTextureVK* const depth = real_depth ? game_depth : static_cast<GSTextureVK*>(m_dlss_depth);
 +	GSTextureVK* const mv = static_cast<GSTextureVK*>(m_dlss_mv);
++
++	// Temporal DLSS with motion vectors estimated from the frames (PS2X_DLSS_MOTION=0 turns it
++	// off: then the history is dropped every frame). The history is also dropped when the game
++	// switches between 3D and flat screens (menus, videos, loading), seen as the depth coming/going.
++	static const bool s_motion = [] { const char* e = std::getenv("PS2X_DLSS_MOTION"); return !e || e[0] != '0'; }();
++	static int s_prev_real_depth = -1;
++	const bool scene_change = s_prev_real_depth != static_cast<int>(real_depth);
++	s_prev_real_depth = static_cast<int>(real_depth);
++	const bool have_motion = s_motion && EstimateMotion(cmdbuf, sTex, src_rect);
++	if (scene_change)
++		m_mv_have_prev = s_motion; // keep this frame as the reference, but restart the history
++
 +	if (real_depth && depth->GetState() == GSTexture::State::Cleared)
 +		depth->CommitClear(cmdbuf);
 +	depth->SetUseFenceCounter(GetCurrentFenceCounter());
@@ -6817,12 +7371,22 @@ index d3dad7e9c..ff0405643 100644
 +		depth->GetVkFormat(), depth->GetWidth(), depth->GetHeight(), false);
 +	NVSDK_NGX_Resource_VK mv_res = NVSDK_NGX_Create_ImageView_Resource_VK(mv->GetView(), mv->GetImage(), range,
 +		mv->GetVkFormat(), in_w, in_h, false);
++	static const bool s_use_bias = [] { const char* e = std::getenv("PS2X_DLSS_BIAS"); return !e || std::atof(e) > 0.0; }();
++	GSTextureVK* const bias = (have_motion && s_use_bias) ? static_cast<GSTextureVK*>(m_dlss_bias) : nullptr;
++	NVSDK_NGX_Resource_VK bias_res = {};
++	if (bias)
++	{
++		bias->TransitionToLayout(cmdbuf, GSTextureVK::Layout::ShaderReadOnly);
++		bias_res = NVSDK_NGX_Create_ImageView_Resource_VK(bias->GetView(), bias->GetImage(), range, bias->GetVkFormat(), in_w, in_h, false);
++	}
 +
 +	NVSDK_NGX_VK_DLSS_Eval_Params eval = {};
 +	eval.Feature.pInColor = &color_res;
 +	eval.Feature.pInOutput = &out_res;
 +	eval.pInDepth = &depth_res;
 +	eval.pInMotionVectors = &mv_res;
++	if (bias)
++		eval.pInBiasCurrentColorMask = &bias_res; // poorly matched areas: trust the current frame
 +	eval.InRenderSubrectDimensions.Width = in_w;
 +	eval.InRenderSubrectDimensions.Height = in_h;
 +	eval.InColorSubrectBase.X = src_rect.x;
@@ -6832,9 +7396,9 @@ index d3dad7e9c..ff0405643 100644
 +		eval.InDepthSubrectBase.X = src_rect.x;
 +		eval.InDepthSubrectBase.Y = src_rect.y;
 +	}
-+	// No real motion vectors exist for a PS2 frame: drop the history every frame so moving
-+	// objects never ghost (DLSS then works as a per-frame AI upscaler).
-+	eval.InReset = 1;
++	// Without estimated motion (first frame, scene change, or turned off) the history is dropped,
++	// so nothing can ghost; DLSS then works as a per-frame AI upscaler.
++	eval.InReset = (have_motion && !scene_change) ? 0 : 1;
 +	eval.InMVScaleX = 1.0f;
 +	eval.InMVScaleY = 1.0f;
 +	const NVSDK_NGX_Result res = NGX_VULKAN_EVALUATE_DLSS_EXT(cmdbuf, static_cast<NVSDK_NGX_Handle*>(m_dlss_feature), params, &eval);
@@ -6896,16 +7460,28 @@ index d3dad7e9c..ff0405643 100644
 +		vkDestroyDescriptorSetLayout(m_device, m_fsr_ds_layout, nullptr);
 +	m_fsr_pipeline_layout = VK_NULL_HANDLE;
 +	m_fsr_ds_layout = VK_NULL_HANDLE;
++	for (VkPipeline& it : m_mv_pipelines)
++	{
++		if (it != VK_NULL_HANDLE)
++			vkDestroyPipeline(m_device, it, nullptr);
++		it = VK_NULL_HANDLE;
++	}
++	if (m_mv_pipeline_layout != VK_NULL_HANDLE)
++		vkDestroyPipelineLayout(m_device, m_mv_pipeline_layout, nullptr);
++	if (m_mv_ds_layout != VK_NULL_HANDLE)
++		vkDestroyDescriptorSetLayout(m_device, m_mv_ds_layout, nullptr);
++	m_mv_pipeline_layout = VK_NULL_HANDLE;
++	m_mv_ds_layout = VK_NULL_HANDLE;
 +}
 +
  void GSDeviceVK::DestroyResources()
  {
  	if (m_tfx_ubo_descriptor_set != VK_NULL_HANDLE)
 diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
-index c245f34a9..f8014e0ed 100644
+index c245f34a9..a545002bd 100644
 --- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
 +++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.h
-@@ -478,6 +478,23 @@ private:
+@@ -478,6 +478,34 @@ private:
  	std::array<VkPipeline, NUM_CAS_PIPELINES> m_cas_pipelines = {};
  	VkPipeline m_imgui_pipeline = VK_NULL_HANDLE;
  
@@ -6920,7 +7496,18 @@ index c245f34a9..f8014e0ed 100644
 +	void* m_dlss_feature = nullptr; // NVSDK_NGX_Handle*
 +	int m_dlss_in_w = 0, m_dlss_in_h = 0, m_dlss_out_w = 0, m_dlss_out_h = 0;
 +	GSTexture* m_dlss_depth = nullptr; // zero depth (render size)
-+	GSTexture* m_dlss_mv = nullptr;    // zero motion vectors (render size)
++	GSTexture* m_dlss_mv = nullptr;    // motion vectors (render size): zero, or estimated below
++	// Motion vectors for DLSS estimated from the frames (shaders/vulkan/nba_motion.glsl).
++	VkDescriptorSetLayout m_mv_ds_layout = VK_NULL_HANDLE;
++	VkPipelineLayout m_mv_pipeline_layout = VK_NULL_HANDLE;
++	std::array<VkPipeline, 6> m_mv_pipelines = {};
++	GSTexture* m_mv_luma[2][2] = {};  // [frame parity][0 = 1/2 res, 1 = 1/4 res]
++	GSTexture* m_mv_vec[2] = {};      // [0 = 1/4 res search, 1 = 1/2 res refined]
++	GSTexture* m_dlss_bias = nullptr; // "bias current colour" mask (render size) where matching failed
++	u32 m_mv_frame = 0;
++	bool m_mv_have_prev = false;
++	bool CompileMotionPipelines();
++	bool EstimateMotion(VkCommandBuffer cmdbuf, GSTextureVK* sTex, const GSVector4i& src_rect);
 +	bool CompileFSRPipelines();
 +	bool InitDLSS();
 +	bool DoDLSS(GSTextureVK* sTex, const GSVector4i& src_rect, GSTextureVK* dTex);
@@ -6929,7 +7516,7 @@ index c245f34a9..f8014e0ed 100644
  	GSHWDrawConfig::VSConstantBuffer m_vs_cb_cache;
  	GSHWDrawConfig::PSConstantBuffer m_ps_cb_cache;
  	GSHWDrawConfig::VSPushConstants m_vs_pc_cache;
-@@ -495,6 +512,7 @@ private:
+@@ -495,6 +523,7 @@ private:
  
  	bool DoCAS(
  		GSTexture* sTex, GSTexture* dTex, bool sharpen_only, const std::array<u32, NUM_CAS_CONSTANTS>& constants) final;
