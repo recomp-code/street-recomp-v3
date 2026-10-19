@@ -213,6 +213,12 @@ nativo están dentro de `__EMSCRIPTEN__`.
 - Lecturas de flags de la VU1 (Play! `VUShared.cpp`, `?vuflagtrack=0` = apagado): un FCAND/FCOR/FMAND que va
   después de un valor escrito en el mismo bloque lee esa casilla del pipeline en vez de recorrer las 8
   (comparado con el recorrido completo en la prueba de programas aleatorios de VuTest).
+- Contabilidad del hilo del juego (`EeScheduler`): entre dos puntos donde puede pasar algo (lote de
+  temporizadores/IOP, evento programado, fin del turno) un punto de control generado solo suma sus ciclos
+  (`?env=PS2X_FAST_CHECKPOINTS=0` = desactivado), y un trozo recompilado que salta al siguiente lo llama
+  directamente si no hay nada pendiente (`?env=PS2X_FAST_CHAIN=0` = desactivado). Partido: hilo del juego
+  31,2% -> 28,6%; simulación de celular (`PS2X_EE_SLOW=200`) partido 95% -> 87%, mitades de sonido
+  repetidas 54 -> 4 cada 5 s.
 - Lectura del disco (`library_fetch_stream.js`): el plazo de cada petición es de progreso (6 s sin datos), y
   un trozo que el juego lleva 1.5 s esperando se pide también por separado (una conexión trabada de un móvil
   llegó a retener la música dos minutos).

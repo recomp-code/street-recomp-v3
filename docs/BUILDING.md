@@ -215,6 +215,11 @@ their own patches, and the few runtime changes shared with native code are behin
 - VU1 flag reads (Play! `VUShared.cpp`, `?vuflagtrack=0` = off): an FCAND/FCOR/FMAND read that comes after a
   value queued in the same block reads its pipeline slot directly instead of scanning all 8 (checked against
   the scan with VuTest's random-program stress test).
+- Game thread bookkeeping (`EeScheduler`): between two points where something can happen (timer/IOP batch,
+  scheduled event, end of the time slice) a generated checkpoint only adds its cycles
+  (`?env=PS2X_FAST_CHECKPOINTS=0` = off), and a recompiled chunk that branches into the next one calls it
+  directly when nothing is pending (`?env=PS2X_FAST_CHAIN=0` = off). Match: game thread 31.2% -> 28.6%;
+  phone simulation (`PS2X_EE_SLOW=200`) match 95% -> 87%, repeated sound halves 54 -> 4 per 5 s.
 - Disc streaming (`library_fetch_stream.js`): the request deadline is on progress (6 s without data), and a
   chunk the game has waited on for 1.5 s is also requested on its own (a stalled phone connection once held
   the music for two minutes).
