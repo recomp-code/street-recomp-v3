@@ -29,6 +29,9 @@ jobs:
           git clone -q https://github.com/ran-j/PS2Recomp.git PS2Recomp
           git -C PS2Recomp checkout -q "$PS2RECOMP_COMMIT"
           git -C PS2Recomp apply --whitespace=nowarn ../nbastreet-v3-recomp/patches/ps2recomp.patch
+          # Same as tools/setup_sources.ps1: the PC version also uses the browser version's
+          # cross-platform improvements (PCSX2's SPU2, VIF1 chains read in place, ...).
+          git -C PS2Recomp apply --whitespace=nowarn ../nbastreet-v3-recomp/patches/ps2recomp-web.patch
           git clone -q https://github.com/PCSX2/pcsx2.git pcsx2
           git -C pcsx2 checkout -q "$PCSX2_COMMIT"
           git -C pcsx2 apply --whitespace=nowarn ../nbastreet-v3-recomp/patches/pcsx2.patch

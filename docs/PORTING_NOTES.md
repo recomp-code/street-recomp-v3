@@ -178,6 +178,29 @@ desensambla volcados de RAM (IOP o EE).
 - Ruta de botones probada hasta un partido real: `97:START,101:CROSS,104:CROSS,...` (GAME ON + valores
   por defecto); el partido empieza hacia el vsync 7150 de la grabación.
 
+### 5.4 DLSS en Direct3D 12 y add-ons de DLSS 5 (2026-10-19)
+- DLSS también en D3D12 (`GSDevice12::DoUpscale/InitDLSS/DoDLSS`): mismas entradas que en Vulkan
+  (color, Z real del juego con `DepthInverted`, MV a cero + `InReset=1`). Tras la evaluación hay
+  que volver a poner los descriptor heaps de PCSX2 (NGX pone los suyos) e `InvalidateCachedState()`.
+  La profundidad D3D12 (`D32_FLOAT_S8X24_UINT`) se le pasa tal cual y NGX la acepta.
+- DLSS solo actúa si la salida es mayor que la resolución interna: con ventana 1280x960 y 16:9 la
+  salida mide 720 px de alto y 2x interna son 896 → no se usa (`PS2X_HOST_WINDOW=1920x1080` en pruebas).
+- Verificado con ReShade 6.8 (add-on) + RenoDX "DLSS 5 Neural Rendering" en una carpeta de host
+  aparte: engancha `NVSDK_NGX_D3D12_CreateFeature/EvaluateFeature/ReleaseFeature` en las dos copias
+  de NGX, "first NGX evaluate intercepted", ~14 000 evaluaciones en un partido, "injection admitted".
+  El pase neural no corre porque falta el `nvngx_dlssnr.dll` firmado por NVIDIA (no se usa la copia
+  comunitaria modificada: su firma da HashMismatch y el driver la rechaza, 0xBAD00002). Streamline
+  público 2.14.16 solo reserva `kFeatureDLSS_NR = 1004`, sin API todavía.
+
+### 5.5 Compilar el juego sin quedarse sin memoria
+- 3123 bloques unity de 32 funciones (593 MB de C++). Algunos bloques piden hasta ~8 GB por
+  compilador: con 24 a la vez en 32 GB Windows paginaba a disco (138 000 páginas/s) y no avanzaba.
+  Con `/p:CL_MPCount=12 /m:1` (1 por ~2,5 GB de RAM; `tools\install.ps1` lo calcula) va a ~500
+  bloques/min, salvo los bloques bajos con las funciones gigantes (2–4 min cada uno). Total ~1 h.
+- Los parches de macOS/navegador no se habían compilado en Windows: a `gs_dump_writer.cpp` le
+  faltaba `ps2x/host_intrin.h` (ps2xStatTicks); arreglado en `ps2recomp-web.patch`, que ahora
+  también aplican `setup_sources.ps1` y el CI de Windows.
+
 ## Texturas HD (packs PCSX2) — qué NO reemplazar
 * Volcado: menú del host -> "Texturas HD" -> "Activadas + volcar originales"; `tools\texturas_preparar.ps1`
   copia a `texturas_hd\originales`; el usuario reescala con IA a `texturas_hd\hd`; `tools\texturas_instalar.ps1`.

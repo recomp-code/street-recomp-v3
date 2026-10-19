@@ -191,7 +191,11 @@ Write-Host "    OK"
 Step "Compiling the game (the first time this can take more than an hour)"
 if ($Rebuild -or -not (Test-Path $gameExe)) {
     Run "$CMakeDir\cmake.exe" @('-S', "$Root\PS2Recomp", '-B', $build) "$Logs\install_configure2.log"
-    Run "$CMakeDir\cmake.exe" @('--build', $build, '--config', 'Release', '--target', 'ps2EntryRunner', '--parallel') "$Logs\install_game.log"
+    # Some blocks of the game code need several GB each to compile: one compiler per ~2.5 GB of RAM
+    # (never more than the cores), or Windows pages to disk and the build takes many hours.
+    $ramGB = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+    $jobs = [int][math]::Max(2, [math]::Min([Environment]::ProcessorCount, [math]::Floor($ramGB / 2.5)))
+    Run "$CMakeDir\cmake.exe" @('--build', $build, '--config', 'Release', '--target', 'ps2EntryRunner', '--', '/m:1', "/p:CL_MPCount=$jobs") "$Logs\install_game.log"
 }
 Write-Host "    OK: $gameExe"
 

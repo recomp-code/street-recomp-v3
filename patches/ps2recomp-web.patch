@@ -10157,14 +10157,16 @@ index 5110ee2..40ed353 100644
          }
  
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-index db0ff1d..711f690 100644
+index db0ff1d..8d6a8e7 100644
 --- a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-@@ -21,7 +21,7 @@
+@@ -20,8 +20,8 @@
+ #define WIN32_LEAN_AND_MEAN
  #endif
  #include <windows.h>
- #include <intrin.h>
+-#include <intrin.h>
 -#elif defined(__APPLE__) || defined(__linux__)
++#include "ps2x/host_intrin.h"
 +#elif defined(__APPLE__) || defined(__linux__) || defined(__EMSCRIPTEN__)
  #include "ps2x/host_intrin.h"
  #include <cerrno>

@@ -24,7 +24,7 @@ native code with [PS2Recomp](https://github.com/ran-j/PS2Recomp) and drawn on yo
   native code: no CPU emulator while you play.
 - **Full speed:** matches at 60 fps.
 - **Modern rendering:** up to 8x internal resolution (5K), texture filtering, 16:9, fullscreen.
-  Windows: Vulkan, Direct3D 11/12 or OpenGL, with AMD FSR 1 or NVIDIA DLSS. Mac: Metal.
+  Windows: Vulkan, Direct3D 11/12 or OpenGL, with AMD FSR 1 or NVIDIA DLSS (Vulkan and Direct3D 12, fed with the game's real depth). Mac: Metal.
 - **HD textures** (fan pack, installed automatically on Windows).
 - **Online play** against a community server, no router setup needed.
 - **Controller** and keyboard (Windows: Xbox-style/XInput; Mac: Xbox, PlayStation or MFi).

@@ -23,7 +23,7 @@ en el **navegador** (experimental): alta resolución, texturas HD, mando y **onl
   nativo: no hay emulador de CPU mientras juegas.
 - **Velocidad completa:** partidos a 60 fps.
 - **Gráficos modernos:** hasta 8x de resolución interna (5K), filtrado de texturas, 16:9, pantalla
-  completa. Windows: Vulkan, Direct3D 11/12 u OpenGL, con AMD FSR 1 o NVIDIA DLSS. Mac: Metal.
+  completa. Windows: Vulkan, Direct3D 11/12 u OpenGL, con AMD FSR 1 o NVIDIA DLSS (Vulkan y Direct3D 12, con la profundidad real del juego). Mac: Metal.
 - **Texturas HD** (pack de fans, se instala solo en Windows).
 - **Online** contra un servidor de la comunidad, sin configurar el router.
 - **Mando** y teclado (Windows: tipo Xbox/XInput; Mac: Xbox, PlayStation o MFi).

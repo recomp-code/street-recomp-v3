@@ -5944,6 +5944,273 @@ index 5f6f8d409..dcb6638b8 100644
  
  public:
  	GSRenderer();
+diff --git a/pcsx2/GS/Renderers/DX12/GSDevice12.cpp b/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
+index 8541f266a..efa8a16cf 100644
+--- a/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
++++ b/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
+@@ -27,6 +27,12 @@
+ #include <sstream>
+ #include <limits>
+ 
++#if defined(PCSX2_NBA_DLSS)
++#include <d3d11.h>
++#include "nvsdk_ngx.h"
++#include "nvsdk_ngx_helpers.h"
++#endif
++
+ #ifdef ENABLE_OGL_DEBUG
+ #define USE_PIX
+ #include "WinPixEventRuntime/pix3.h"
+@@ -1016,6 +1022,7 @@ void GSDevice12::Destroy()
+ 		ExecuteCommandList(true);
+ 	}
+ 
++	DestroyUpscalers();
+ 	DestroySwapChain();
+ 	DestroyResources();
+ }
+@@ -2511,6 +2518,215 @@ bool GSDevice12::DoCAS(
+ 	return true;
+ }
+ 
++int GSDevice12::DoUpscale(GSTexture* sTex, const GSVector4i& src_rect, GSTexture* dTex, int mode, float sharpness)
++{
++	// FSR 1 is only implemented on Vulkan; Direct3D 12 offers DLSS.
++	if (mode == 2 && InitDLSS() && DoDLSS(static_cast<GSTexture12*>(sTex), src_rect, static_cast<GSTexture12*>(dTex)))
++		return 2;
++	return 0;
++}
++
++#if defined(PCSX2_NBA_DLSS)
++
++bool GSDevice12::InitDLSS()
++{
++	if (m_dlss_tried)
++		return m_dlss_ok;
++	m_dlss_tried = true;
++
++	// NGX writes its logs/cache next to the executable (where nvngx_dlss.dll also lives).
++	wchar_t exe_path[MAX_PATH] = {};
++	GetModuleFileNameW(nullptr, exe_path, MAX_PATH);
++	std::wstring data_path(exe_path);
++	data_path = data_path.substr(0, data_path.find_last_of(L"\\/"));
++
++	NVSDK_NGX_Result res = NVSDK_NGX_D3D12_Init_with_ProjectID("6c1a4b5e-3f2d-4e8b-9a71-5d0c2e9f8b34",
++		NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", data_path.c_str(), m_device.get());
++	if (NVSDK_NGX_FAILED(res))
++	{
++		Console.Error("(PS2Recomp) DLSS (D3D12): NGX init failed (0x%08X).", static_cast<u32>(res));
++		return false;
++	}
++
++	NVSDK_NGX_Parameter* params = nullptr;
++	res = NVSDK_NGX_D3D12_GetCapabilityParameters(&params);
++	if (NVSDK_NGX_FAILED(res) || !params)
++	{
++		Console.Error("(PS2Recomp) DLSS (D3D12): no NGX capability parameters (0x%08X).", static_cast<u32>(res));
++		NVSDK_NGX_D3D12_Shutdown1(m_device.get());
++		return false;
++	}
++	int available = 0;
++	NVSDK_NGX_Parameter_GetI(params, NVSDK_NGX_Parameter_SuperSampling_Available, &available);
++	if (!available)
++	{
++		int needs_driver = 0;
++		NVSDK_NGX_Parameter_GetI(params, NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
++		Console.Error("(PS2Recomp) DLSS (D3D12) not available on this GPU/driver%s.", needs_driver ? " (driver update needed)" : "");
++		NVSDK_NGX_D3D12_DestroyParameters(params);
++		NVSDK_NGX_D3D12_Shutdown1(m_device.get());
++		return false;
++	}
++	m_ngx_params = params;
++	m_dlss_ok = true;
++	Console.WriteLn("(PS2Recomp) DLSS ready (NGX initialised, Direct3D 12).");
++	return true;
++}
++
++bool GSDevice12::DoDLSS(GSTexture12* sTex, const GSVector4i& src_rect, GSTexture12* dTex)
++{
++	NVSDK_NGX_Parameter* params = static_cast<NVSDK_NGX_Parameter*>(m_ngx_params);
++	const int in_w = src_rect.width(), in_h = src_rect.height();
++	const int out_w = dTex->GetWidth(), out_h = dTex->GetHeight();
++
++	EndRenderPass();
++
++	// (Re)create the feature and the zero depth / motion vector inputs when the sizes change.
++	if (!m_dlss_feature || in_w != m_dlss_in_w || in_h != m_dlss_in_h || out_w != m_dlss_out_w || out_h != m_dlss_out_h)
++	{
++		if (m_dlss_feature)
++		{
++			ExecuteCommandList(true); // the old feature may still be in use by the GPU
++			NVSDK_NGX_D3D12_ReleaseFeature(static_cast<NVSDK_NGX_Handle*>(m_dlss_feature));
++			m_dlss_feature = nullptr;
++		}
++		delete m_dlss_depth;
++		delete m_dlss_mv;
++		m_dlss_depth = CreateSurface(GSTexture::RenderTarget, in_w, in_h, 1, GSTexture::Format::DepthColor);
++		m_dlss_mv = CreateSurface(GSTexture::RenderTarget, in_w, in_h, 1, GSTexture::Format::ColorHDR);
++		if (!m_dlss_depth || !m_dlss_mv)
++			return false;
++		ClearRenderTarget(m_dlss_depth, 0);
++		ClearRenderTarget(m_dlss_mv, 0);
++
++		NVSDK_NGX_DLSS_Create_Params create = {};
++		create.Feature.InWidth = in_w;
++		create.Feature.InHeight = in_h;
++		create.Feature.InTargetWidth = out_w;
++		create.Feature.InTargetHeight = out_h;
++		create.Feature.InPerfQualityValue = NVSDK_NGX_PerfQuality_Value_MaxQuality;
++		// LDR input, motion vectors at render resolution, no exposure texture; PS2 Z grows towards
++		// the camera ("inverted" depth in DLSS terms).
++		create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
++		                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
++		NVSDK_NGX_Handle* handle = nullptr;
++		const NVSDK_NGX_Result res = NGX_D3D12_CREATE_DLSS_EXT(GetCommandList().list4.get(), 1, 1, &handle, params, &create);
++		m_dlss_in_w = in_w, m_dlss_in_h = in_h, m_dlss_out_w = out_w, m_dlss_out_h = out_h;
++		if (NVSDK_NGX_FAILED(res) || !handle)
++		{
++			static int s_fail_logs = 0;
++			if (s_fail_logs++ < 4)
++				Console.Error("(PS2Recomp) DLSS (D3D12) feature %dx%d -> %dx%d failed (0x%08X).", in_w, in_h, out_w, out_h,
++					static_cast<u32>(res));
++			return false;
++		}
++		m_dlss_feature = handle;
++		InvalidateCachedState();
++	}
++	if (!m_dlss_feature)
++		return false;
++
++	const D3D12CommandList& cmdlist = GetCommandList();
++	// The game's real depth buffer of the shown frame when the renderer has one that covers the
++	// input (see GSRendererHW::NbaTrackDepth), otherwise the cleared stand-in (all far).
++	GSTexture12* const game_depth = static_cast<GSTexture12*>(m_upscaler_depth);
++	const bool real_depth = game_depth && game_depth->IsDepthStencil() &&
++	                        game_depth->GetWidth() >= src_rect.z && game_depth->GetHeight() >= src_rect.w;
++	static int s_real_depth = -1;
++	if (s_real_depth != static_cast<int>(real_depth))
++	{
++		s_real_depth = static_cast<int>(real_depth);
++		Console.WriteLn("(PS2Recomp) DLSS depth: %s", real_depth ? "game depth buffer" : "none");
++	}
++	GSTexture12* const depth = real_depth ? game_depth : static_cast<GSTexture12*>(m_dlss_depth);
++	GSTexture12* const mv = static_cast<GSTexture12*>(m_dlss_mv);
++	for (GSTexture12* t : {sTex, depth, mv, dTex})
++	{
++		if (t->GetState() == GSTexture::State::Cleared)
++			t->CommitClear(cmdlist);
++		t->SetUseFenceCounter(GetCurrentFenceValue());
++	}
++	sTex->TransitionToState(cmdlist, GSTexture12::ResourceState::ComputeShaderResource);
++	depth->TransitionToState(cmdlist, GSTexture12::ResourceState::ComputeShaderResource);
++	mv->TransitionToState(cmdlist, GSTexture12::ResourceState::ComputeShaderResource);
++	dTex->TransitionToState(cmdlist, GSTexture12::ResourceState::CASShaderUAV);
++
++	NVSDK_NGX_D3D12_DLSS_Eval_Params eval = {};
++	eval.Feature.pInColor = sTex->GetResource();
++	eval.Feature.pInOutput = dTex->GetResource();
++	eval.pInDepth = depth->GetResource();
++	eval.pInMotionVectors = mv->GetResource();
++	eval.InRenderSubrectDimensions.Width = in_w;
++	eval.InRenderSubrectDimensions.Height = in_h;
++	eval.InColorSubrectBase.X = src_rect.x;
++	eval.InColorSubrectBase.Y = src_rect.y;
++	if (real_depth)
++	{
++		eval.InDepthSubrectBase.X = src_rect.x;
++		eval.InDepthSubrectBase.Y = src_rect.y;
++	}
++	// No real motion vectors exist for a PS2 frame: drop the history every frame so moving
++	// objects never ghost (DLSS then works as a per-frame AI upscaler).
++	eval.InReset = 1;
++	eval.InMVScaleX = 1.0f;
++	eval.InMVScaleY = 1.0f;
++	const NVSDK_NGX_Result res = NGX_D3D12_EVALUATE_DLSS_EXT(cmdlist.list4.get(), static_cast<NVSDK_NGX_Handle*>(m_dlss_feature), params, &eval);
++
++	// NGX recorded its own pipelines, root signatures and descriptor heaps into our command list.
++	CommandListResources& clr = m_command_lists[m_current_command_list];
++	ID3D12DescriptorHeap* heaps[2] = {clr.descriptor_allocator.GetDescriptorHeap(), clr.sampler_allocator.GetDescriptorHeap()};
++	cmdlist.list4->SetDescriptorHeaps(std::size(heaps), heaps);
++	InvalidateCachedState();
++	if (NVSDK_NGX_FAILED(res))
++	{
++		static int s_eval_logs = 0;
++		if (s_eval_logs++ < 4)
++			Console.Error("(PS2Recomp) DLSS (D3D12) evaluate failed (0x%08X).", static_cast<u32>(res));
++		return false;
++	}
++	dTex->TransitionToState(cmdlist, GSTexture12::ResourceState::PixelShaderResource);
++	return true;
++}
++
++#else
++
++bool GSDevice12::InitDLSS()
++{
++	if (!m_dlss_tried)
++	{
++		m_dlss_tried = true;
++		Console.Warning("(PS2Recomp) This renderer was built without the NVIDIA DLSS SDK.");
++	}
++	return false;
++}
++
++bool GSDevice12::DoDLSS(GSTexture12*, const GSVector4i&, GSTexture12*)
++{
++	return false;
++}
++
++#endif // PCSX2_NBA_DLSS
++
++void GSDevice12::DestroyUpscalers()
++{
++#if defined(PCSX2_NBA_DLSS)
++	if (m_dlss_feature)
++		NVSDK_NGX_D3D12_ReleaseFeature(static_cast<NVSDK_NGX_Handle*>(m_dlss_feature));
++	if (m_ngx_params)
++		NVSDK_NGX_D3D12_DestroyParameters(static_cast<NVSDK_NGX_Parameter*>(m_ngx_params));
++	if (m_dlss_ok)
++		NVSDK_NGX_D3D12_Shutdown1(m_device.get());
++#endif
++	m_dlss_feature = nullptr;
++	m_ngx_params = nullptr;
++	m_dlss_ok = false;
++	m_dlss_tried = false;
++	delete m_dlss_depth;
++	delete m_dlss_mv;
++	m_dlss_depth = nullptr;
++	m_dlss_mv = nullptr;
++}
++
+ void GSDevice12::IASetVertexBuffer(const void* vertex, size_t stride, size_t count)
+ {
+ 	const u32 size = static_cast<u32>(stride) * static_cast<u32>(count);
+diff --git a/pcsx2/GS/Renderers/DX12/GSDevice12.h b/pcsx2/GS/Renderers/DX12/GSDevice12.h
+index 691e176af..892169e46 100644
+--- a/pcsx2/GS/Renderers/DX12/GSDevice12.h
++++ b/pcsx2/GS/Renderers/DX12/GSDevice12.h
+@@ -461,6 +461,21 @@ private:
+ 
+ 	bool DoCAS(
+ 		GSTexture* sTex, GSTexture* dTex, bool sharpen_only, const std::array<u32, NUM_CAS_CONSTANTS>& constants) final;
++	int DoUpscale(GSTexture* sTex, const GSVector4i& src_rect, GSTexture* dTex, int mode, float sharpness) final;
++
++	// PS2Recomp final upscaler on Direct3D 12: NVIDIA DLSS (NGX). Same inputs as the Vulkan path
++	// (colour, the game's depth, zero motion vectors), so DLSS add-ons that hook D3D12 DLSS
++	// evaluate calls see a regular DLSS integration.
++	bool m_dlss_tried = false;
++	bool m_dlss_ok = false;
++	void* m_ngx_params = nullptr;  // NVSDK_NGX_Parameter*
++	void* m_dlss_feature = nullptr; // NVSDK_NGX_Handle*
++	int m_dlss_in_w = 0, m_dlss_in_h = 0, m_dlss_out_w = 0, m_dlss_out_h = 0;
++	GSTexture* m_dlss_depth = nullptr; // zero depth (render size), when the game's is not usable
++	GSTexture* m_dlss_mv = nullptr;    // zero motion vectors (render size)
++	bool InitDLSS();
++	bool DoDLSS(GSTexture12* sTex, const GSVector4i& src_rect, GSTexture12* dTex);
++	void DestroyUpscalers();
+ 
+ 	bool GetSampler(D3D12DescriptorHandle* cpu_handle, GSHWDrawConfig::SamplerSelector ss);
+ 	void ClearSamplerCache() final;
 diff --git a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp b/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
 index 98483f2b8..a903a1cd1 100644
 --- a/pcsx2/GS/Renderers/HW/GSRendererHW.cpp
