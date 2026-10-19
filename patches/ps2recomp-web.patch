@@ -9406,7 +9406,7 @@ index 6ad81e7..f3d7a6a 100644
      do                                     \
      {                                      \
 diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
-index 31a296b..f3532df 100644
+index 31a296b..ebcf7a1 100644
 --- a/ps2xRuntime/include/runtime/ee_scheduler.h
 +++ b/ps2xRuntime/include/runtime/ee_scheduler.h
 @@ -237,6 +237,7 @@ enum class EeEventType : uint8_t
@@ -9417,17 +9417,66 @@ index 31a296b..f3532df 100644
  };
  
  struct EeEvent
-@@ -279,6 +280,9 @@ public:
+@@ -279,7 +280,28 @@ public:
      void run();
      void requestStop();
      void postEvent(EeEvent event);
 +    // From any thread: runs task on the EE thread at its next checkpoint (where it may queue
 +    // guest invocations, e.g. a completion callback for work done by another host thread).
 +    void postHostTask(std::function<void()> task);
++#if defined(__EMSCRIPTEN__)
++    // Web: generated code calls this at every loop back-edge and guest call (~8 M/s in a match).
++    // Until the next cycle at which anything can happen (timer/IOP batch, scheduled event, end of
++    // the time slice; 0 while something is pending) a checkpoint only adds its cycles; the rest
++    // of the bookkeeping is done, for all of them at once, by the next full checkpoint.
++    // (PS2X_FAST_CHECKPOINTS=0 turns this off.)
++    [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept
++    {
++        const uint64_t cycle = m_eeCycle + (cycles != 0u ? cycles : 1u);
++        if (cycle < m_fastCheckpointUntil.load(std::memory_order_relaxed))
++        {
++            m_eeCycle = cycle;
++            return false;
++        }
++        return checkpointDueFull(cycles);
++    }
++#else
      [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
++#endif
      void accountCycles(uint32_t cycles) noexcept;
      [[nodiscard]] bool isExecutingGuest() const noexcept;
-@@ -442,6 +446,8 @@ private:
+ 
+@@ -373,6 +395,18 @@ private:
+         uint64_t sequence = 0;
+     };
+ 
++#if defined(__EMSCRIPTEN__)
++    [[nodiscard]] bool checkpointDueFull(uint32_t cycles) noexcept;
++    void armFastCheckpoints() noexcept;
++    void disarmFastCheckpoints() noexcept { m_fastCheckpointUntil.store(0u); }
++    void markCheckpointPending() noexcept
++    {
++        m_checkpointPending.store(true);
++        m_fastCheckpointUntil.store(0u);
++    }
++#else
++    void markCheckpointPending() noexcept { m_checkpointPending.store(true, std::memory_order_release); }
++#endif
+     void assertExecutor() const;
+     [[nodiscard]] int allocateThreadId();
+     GuestThread &acquireInvocationThread();
+@@ -432,6 +466,10 @@ private:
+     bool m_insideInterrupt = false;
+     uint32_t m_pendingEeTimerInterrupts = 0;
+     uint64_t m_eeCycle = 0;
++#if defined(__EMSCRIPTEN__)
++    std::atomic<uint64_t> m_fastCheckpointUntil{0}; // see checkpointDue
++    uint64_t m_accountedCycle = 0;                  // m_eeCycle already given to the timers and the IOP
++#endif
+     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
+     std::thread::id m_executorThread{};
+     std::atomic<bool> m_running{false};
+@@ -442,6 +480,8 @@ private:
  
      mutable std::mutex m_eventMutex;
      std::condition_variable m_eventCv;
@@ -9497,7 +9546,7 @@ index ea86a9c..31c6972 100644
      std::vector<PendingTransfer> m_pendingGifTransfers;
      std::vector<PendingTransfer> m_pendingVif0Transfers;
 diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
-index f09ec48..51c3332 100644
+index f09ec48..01db8ac 100644
 --- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 +++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
 @@ -9,7 +9,9 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
@@ -9520,7 +9569,68 @@ index f09ec48..51c3332 100644
  #include <stdexcept>
  
  namespace
-@@ -462,6 +467,18 @@ void EeScheduler::requestStop()
+@@ -190,6 +195,10 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
+     m_insideInterrupt = false;
+     m_pendingEeTimerInterrupts = 0u;
+     m_eeCycle = 0u;
++#if defined(__EMSCRIPTEN__)
++    m_accountedCycle = 0u;
++    disarmFastCheckpoints();
++#endif
+     m_sliceEndCycle = kDefaultTimeSliceCycles;
+     m_stopRequested.store(false, std::memory_order_release);
+     m_checkpointPending.store(false, std::memory_order_release);
+@@ -421,6 +430,44 @@ void EeScheduler::run()
+             m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+             m_guestExecuting.store(true, std::memory_order_release);
+             function(m_rdram, &context, &m_runtime);
++#if defined(__EMSCRIPTEN__)
++            // A recompiled function also returns here when it branches out of its own range (the
++            // recompiler splits code into chunks; ~1.6 M times/s in an NBA match). When nothing is
++            // pending, the rest of this loop would only look the next chunk up and call it: do
++            // just that, with the same checks, instead of the whole round trip.
++            // (PS2X_FAST_CHAIN=0 turns this off.)
++            static const bool s_fastChain = [] { const char *e = std::getenv("PS2X_FAST_CHAIN"); return !(e && *e == '0'); }();
++            if (s_fastChain)
++            {
++                const int runningId = running->id;
++                for (;;)
++                {
++                    const uint32_t pc = context.pc;
++                    if (pc == 0u || m_currentThreadId != runningId || &running->activeContext() != &context ||
++                        m_rescheduleRequested || m_pendingEeTimerInterrupts != 0u || m_debugPublishCountdown == 0u ||
++                        m_checkpointPending.load(std::memory_order_acquire) || running->resumeCompletion ||
++                        (!m_pendingInvocations.empty() && running->invocations.empty()) || !m_runtime.hasFunction(pc))
++                        break;
++                    const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
++                    if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
++                        break;
++                    --m_debugPublishCountdown;
++                    publishDebugContext(context);
++                    const PS2Runtime::RecompiledFunction next = m_runtime.lookupFunction(pc);
++                    if (checkpointDue(kGuestDispatchCycles))
++                        break; // as "continue" above: the code below handles what is due
++                    context.vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);
++                    {
++                        ResumeRecord &record = g_resumeRing[g_resumeRingNext++ % g_resumeRing.size()];
++                        record = ResumeRecord{runningId, static_cast<uint32_t>(running->invocations.size()), pc,
++                                              static_cast<uint32_t>(_mm_cvtsi128_si32(context.r[29])),
++                                              static_cast<uint32_t>(_mm_cvtsi128_si32(context.r[31]))};
++                    }
++                    m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
++                    next(m_rdram, &context, &m_runtime);
++                }
++            }
++#endif
+             m_guestExecuting.store(false, std::memory_order_release);
+             m_insideInterrupt = false;
+         }
+@@ -458,10 +505,22 @@ void EeScheduler::run()
+ void EeScheduler::requestStop()
+ {
+     m_stopRequested.store(true, std::memory_order_release);
+-    m_checkpointPending.store(true, std::memory_order_release);
++    markCheckpointPending();
      m_eventCv.notify_all();
  }
  
@@ -9531,7 +9641,7 @@ index f09ec48..51c3332 100644
 +        const uint32_t id = ++m_nextHostTaskId;
 +        m_hostTasks.emplace(id, std::move(task));
 +        m_events.push_back(EeEvent{EeEventType::HostTask, id, 0});
-+        m_checkpointPending.store(true, std::memory_order_release);
++        markCheckpointPending();
 +    }
 +    m_eventCv.notify_one();
 +}
@@ -9539,12 +9649,22 @@ index f09ec48..51c3332 100644
  void EeScheduler::postEvent(EeEvent event)
  {
      if (event.type == EeEventType::Stop)
-@@ -478,9 +495,64 @@ void EeScheduler::postEvent(EeEvent event)
+@@ -473,14 +532,111 @@ void EeScheduler::postEvent(EeEvent event)
+     {
+         std::lock_guard lock(m_eventMutex);
+         m_events.push_back(event);
+-        m_checkpointPending.store(true, std::memory_order_release);
++        markCheckpointPending();
+     }
      m_eventCv.notify_one();
  }
  
 +namespace
 +{
++    // EE cycles not yet handed to the IOP (see accountCycles)
++    uint64_t g_iopCyclesPending = 0u;
++    constexpr uint64_t kIopBatchCycles = 8192u;
++
 +    // Guest PC ranges where a game only spins waiting for an event (see ps2xAddEeIdleLoop).
 +    struct EeIdleLoop
 +    {
@@ -9578,8 +9698,46 @@ index f09ec48..51c3332 100644
 +static double g_eeSlowLast = 0.0; // PS2X_EE_SLOW: end of the last measured stretch (sleeps don't count)
 +#endif
 +
++#if defined(__EMSCRIPTEN__)
++namespace
++{
++    // Mirror of PS2Memory::advanceEeTimers' batch on the web (it updates the timers once 2048 EE
++    // cycles have accumulated; keep both numbers equal): lets fast checkpoints stop right at the
++    // cycle where the timers would be updated, as they were before fast checkpoints.
++    constexpr uint64_t kEeTimerBatchCycles = 2048u;
++    uint64_t g_eeTimerBatchPending = 0u;
++}
++
++void EeScheduler::armFastCheckpoints() noexcept
++{
++    static const bool s_enabled = [] { const char *e = std::getenv("PS2X_FAST_CHECKPOINTS"); return !(e && *e == '0'); }();
++    if (!s_enabled)
++        return;
++    const uint64_t nextEventCycle = m_nextDeadlineCycle.load();
++    uint64_t limit = m_sliceEndCycle;
++    if (nextEventCycle != 0u && nextEventCycle < limit)
++        limit = nextEventCycle;
++    limit = std::min(limit, m_eeCycle + (kEeTimerBatchCycles - g_eeTimerBatchPending));
++    limit = std::min(limit, m_eeCycle + (kIopBatchCycles - g_iopCyclesPending));
++    m_fastCheckpointUntil.store(limit);
++    // Posted from another thread meanwhile (posters set the flag or the deadline, then disarm):
++    if (m_checkpointPending.load() || m_stopRequested.load() || m_pendingEeTimerInterrupts != 0u ||
++        m_nextDeadlineCycle.load() != nextEventCycle)
++        m_fastCheckpointUntil.store(0u);
++}
++
++bool EeScheduler::checkpointDueFull(uint32_t cycles) noexcept
++{
++    // Whatever this returns, the next fast window starts from the state it leaves
++    struct Rearm
++    {
++        EeScheduler &scheduler;
++        ~Rearm() { scheduler.armFastCheckpoints(); }
++    } rearm{*this};
++#else
  bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
  {
++#endif
      accountCycles(cycles);
 +#if defined(__EMSCRIPTEN__)
 +    {
@@ -9604,7 +9762,16 @@ index f09ec48..51c3332 100644
  
      if (m_checkpointPending.load(std::memory_order_acquire) ||
          m_stopRequested.load(std::memory_order_acquire))
-@@ -508,21 +580,66 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+@@ -491,7 +647,7 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     const uint64_t nextEventCycle = m_nextDeadlineCycle.load(std::memory_order_acquire);
+     if (nextEventCycle != 0u && m_eeCycle >= nextEventCycle)
+     {
+-        m_checkpointPending.store(true, std::memory_order_release);
++        markCheckpointPending();
+         return true;
+     }
+ 
+@@ -508,28 +664,73 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
      // (it may be deferred, e.g. while an interrupt handler runs).
      const int64_t hostDeadline = m_nextHostDeadlineRep.load(std::memory_order_acquire);
      const uint64_t targetCycle = m_nextHostDeadlineCycle.load(std::memory_order_acquire);
@@ -9672,7 +9839,15 @@ index f09ec48..51c3332 100644
                  s_lastReport = now;
                  s_warps = 0u;
                  s_warpedCycles = 0u;
-@@ -541,6 +658,89 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+             }
+         }
+         accountCycles(static_cast<uint32_t>(warp));
+-        m_checkpointPending.store(true, std::memory_order_release);
++        markCheckpointPending();
+         return true;
+     }
+ 
+@@ -541,30 +742,121 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
          return true;
      }
  
@@ -9762,7 +9937,55 @@ index f09ec48..51c3332 100644
      renewTimeSlice();
      return false;
  }
-@@ -1946,9 +2146,9 @@ void EeScheduler::makeRunning(GuestThread &item)
+ 
+ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
++#if defined(__EMSCRIPTEN__)
++    // Also the cycles fast checkpoints added since the last accounting (see checkpointDue)
++    m_eeCycle += std::max<uint64_t>(1u, cycles);
++    const uint64_t elapsed = m_eeCycle - m_accountedCycle;
++    m_accountedCycle = m_eeCycle;
++    g_eeTimerBatchPending += elapsed;
++    if (g_eeTimerBatchPending >= kEeTimerBatchCycles)
++        g_eeTimerBatchPending = 0u;
++#else
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_eeCycle += elapsed;
++#endif
+     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+     // The IOP only runs once 8192 EE cycles have accumulated (IopEmulator::runEeCycles keeps a
+     // carry), and this is called at every generated checkpoint (~7.6 M times/s in a match):
+     // accumulate here and hand the IOP whole slices, instead of a call chain per checkpoint.
+     // (File-scope rather than a member so ee_scheduler.h, included by all generated code, stays put.)
+-    static uint64_t s_iopCyclesPending = 0u;
+-    constexpr uint64_t kIopBatchCycles = 8192u;
+-    s_iopCyclesPending += elapsed;
+-    if (s_iopCyclesPending >= kIopBatchCycles)
++    g_iopCyclesPending += elapsed;
++    if (g_iopCyclesPending >= kIopBatchCycles)
+     {
+-        m_runtime.advanceIopEeCycles(s_iopCyclesPending);
+-        s_iopCyclesPending = 0u;
++        m_runtime.advanceIopEeCycles(g_iopCyclesPending);
++        g_iopCyclesPending = 0u;
+     }
+     if (m_pendingEeTimerInterrupts != 0u)
+     {
+-        m_checkpointPending.store(true, std::memory_order_release);
++        markCheckpointPending();
+     }
+ }
+ 
+@@ -1334,7 +1626,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
+     assertExecutor();
+     invocation.sequence = ++m_invocationSequence;
+     m_pendingInvocations.push_back(std::move(invocation));
+-    m_checkpointPending.store(true, std::memory_order_release);
++    markCheckpointPending();
+ }
+ 
+ void EeScheduler::queueInvocationDelayed(GuestInvocation invocation, uint64_t delayCycles, std::chrono::microseconds delayHost)
+@@ -1946,9 +2238,9 @@ void EeScheduler::makeRunning(GuestThread &item)
          struct Slot { uint64_t ticks = 0; uint32_t entry = 0; int priority = 0; uint32_t switches = 0; };
          static Slot s_slots[256];
          static int s_lastId = -1;
@@ -9774,7 +9997,16 @@ index f09ec48..51c3332 100644
          if (s_lastId >= 0)
              s_slots[s_lastId & 255].ticks += tsc - s_lastTsc;
          s_lastTsc = tsc;
-@@ -2206,11 +2406,17 @@ void EeScheduler::processDueDeadlines()
+@@ -2055,7 +2347,7 @@ void EeScheduler::requestPreemptionIfHigher(const GuestThread &readyThread, bool
+     m_rescheduleRequested = true;
+     if (interruptSafe || m_insideInterrupt)
+     {
+-        m_checkpointPending.store(true, std::memory_order_release);
++        markCheckpointPending();
+     }
+ }
+ 
+@@ -2206,11 +2498,17 @@ void EeScheduler::processDueDeadlines()
          {
              if (scheduled.event.type == EeEventType::VBlankStart)
              {
@@ -9794,7 +10026,7 @@ index f09ec48..51c3332 100644
                                EeEvent{EeEventType::VBlankStart, 0, 0});
              }
              processEvent(scheduled.event);
-@@ -2293,6 +2499,22 @@ void EeScheduler::processEvent(const EeEvent &event)
+@@ -2293,6 +2591,22 @@ void EeScheduler::processEvent(const EeEvent &event)
          queueInvocation(std::move(invocation));
          break;
      }
@@ -9817,6 +10049,39 @@ index f09ec48..51c3332 100644
      case EeEventType::DelayedInvocation:
      {
          auto it = m_delayedInvocations.find(event.id);
+@@ -2428,7 +2742,7 @@ void EeScheduler::waitForEvent()
+             accountCycles(step);
+             remaining -= step;
+         }
+-        m_checkpointPending.store(true, std::memory_order_release);
++        markCheckpointPending();
+     }
+ }
+ 
+@@ -2446,6 +2760,13 @@ void EeScheduler::scheduleEvent(uint64_t deadlineCycle,
+ 
+ void EeScheduler::updateNextDeadline()
+ {
++#if defined(__EMSCRIPTEN__)
++    struct Disarm
++    {
++        EeScheduler &scheduler;
++        ~Disarm() { scheduler.disarmFastCheckpoints(); } // after the new deadline is stored
++    } disarm{*this};
++#endif
+     if (m_deadlines.empty())
+     {
+         m_nextDeadlineCycle.store(0u, std::memory_order_release);
+@@ -2486,6 +2807,9 @@ bool EeScheduler::hasReadyAtOrAbovePriority(int priority) const
+ 
+ void EeScheduler::renewTimeSlice()
+ {
++#if defined(__EMSCRIPTEN__)
++    disarmFastCheckpoints();
++#endif
+     m_sliceEndCycle = m_eeCycle + kDefaultTimeSliceCycles;
+     m_timeSliceExpired = false;
+ }
 diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
 index 4928e86..d29ccdf 100644
 --- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
