@@ -5945,7 +5945,7 @@ index 5f6f8d409..dcb6638b8 100644
  public:
  	GSRenderer();
 diff --git a/pcsx2/GS/Renderers/DX12/GSDevice12.cpp b/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
-index 8541f266a..efa8a16cf 100644
+index 8541f266a..60a9e3a67 100644
 --- a/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
 +++ b/pcsx2/GS/Renderers/DX12/GSDevice12.cpp
 @@ -27,6 +27,12 @@
@@ -5969,7 +5969,7 @@ index 8541f266a..efa8a16cf 100644
  	DestroySwapChain();
  	DestroyResources();
  }
-@@ -2511,6 +2518,215 @@ bool GSDevice12::DoCAS(
+@@ -2511,6 +2518,227 @@ bool GSDevice12::DoCAS(
  	return true;
  }
  
@@ -6064,6 +6064,18 @@ index 8541f266a..efa8a16cf 100644
 +		// the camera ("inverted" depth in DLSS terms).
 +		create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
 +		                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
++		// DLSS model preset: NVIDIA's default for the mode (with DLSS 310.x that is already the
++		// transformer preset K, identical output); PS2X_DLSS_PRESET=<letter> forces one, like DLSS Swapper.
++		{
++			static const unsigned preset = [] {
++				const char* p = std::getenv("PS2X_DLSS_PRESET");
++				return (p && *p >= 'A' && *p <= 'O') ? static_cast<unsigned>(*p - 'A' + 1) : static_cast<unsigned>(NVSDK_NGX_DLSS_Hint_Render_Preset_Default);
++			}();
++			for (const char* mode : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
++					 NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
++					 NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality})
++				NVSDK_NGX_Parameter_SetUI(params, mode, preset);
++		}
 +		NVSDK_NGX_Handle* handle = nullptr;
 +		const NVSDK_NGX_Result res = NGX_D3D12_CREATE_DLSS_EXT(GetCommandList().list4.get(), 1, 1, &handle, params, &create);
 +		m_dlss_in_w = in_w, m_dlss_in_h = in_h, m_dlss_out_w = out_w, m_dlss_out_h = out_h;
@@ -6400,7 +6412,7 @@ index 440e2794c..a5108c35f 100644
  		{
  			if ((m_TEX0.PSM & 0xf) != PSMCT24 && m_dirty[i].rgba.c.a && bpp >= 16)
 diff --git a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
-index d3dad7e9c..365382aaa 100644
+index d3dad7e9c..ff0405643 100644
 --- a/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 +++ b/pcsx2/GS/Renderers/Vulkan/GSDeviceVK.cpp
 @@ -21,10 +21,21 @@
@@ -6506,7 +6518,7 @@ index d3dad7e9c..365382aaa 100644
  
  	m_swap_chain.reset();
  
-@@ -4774,6 +4831,370 @@ bool GSDeviceVK::DoCAS(
+@@ -4774,6 +4831,382 @@ bool GSDeviceVK::DoCAS(
  	return true;
  }
  
@@ -6743,6 +6755,18 @@ index d3dad7e9c..365382aaa 100644
 +		// the camera, so the depth buffer is "inverted" (1 = near) in DLSS terms.
 +		create.InFeatureCreateFlags = NVSDK_NGX_DLSS_Feature_Flags_MVLowRes | NVSDK_NGX_DLSS_Feature_Flags_AutoExposure |
 +		                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted;
++		// DLSS model preset: NVIDIA's default for the mode (with DLSS 310.x that is already the
++		// transformer preset K, identical output); PS2X_DLSS_PRESET=<letter> forces one, like DLSS Swapper.
++		{
++			static const unsigned preset = [] {
++				const char* p = std::getenv("PS2X_DLSS_PRESET");
++				return (p && *p >= 'A' && *p <= 'O') ? static_cast<unsigned>(*p - 'A' + 1) : static_cast<unsigned>(NVSDK_NGX_DLSS_Hint_Render_Preset_Default);
++			}();
++			for (const char* mode : {NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_DLAA, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Quality,
++					 NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Balanced, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_Performance,
++					 NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraPerformance, NVSDK_NGX_Parameter_DLSS_Hint_Render_Preset_UltraQuality})
++				NVSDK_NGX_Parameter_SetUI(params, mode, preset);
++		}
 +		NVSDK_NGX_Handle* handle = nullptr;
 +		const NVSDK_NGX_Result res = NGX_VULKAN_CREATE_DLSS_EXT(cmdbuf, 1, 1, &handle, params, &create);
 +		if (NVSDK_NGX_FAILED(res) || !handle)
