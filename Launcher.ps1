@@ -232,23 +232,30 @@ function Update-DlssVersion {
         $dlssLabel.Text = 'NVIDIA DLSS: not installed (RTX only)'
     }
 }
-# Only NVIDIA's own, untouched DLSS runtime is accepted: valid NVIDIA signature and the DLSS
-# product name. The previous file is kept as nvngx_dlss.prev.dll.
+# Installs the chosen DLSS runtime as nvngx_dlss.dll; the previous file is kept as nvngx_dlss.prev.dll.
 function Install-DlssDll($file) {
     $sig = Get-AuthenticodeSignature $file
     $info = (Get-Item $file).VersionInfo
+    # Any file can be used (developers test their own builds), but anything that is not NVIDIA's
+    # signed DLSS runtime is only installed after a warning.
+    $problems = @()
     if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=NVIDIA Corporation') {
-        [Windows.Forms.MessageBox]::Show("This file is not signed by NVIDIA (or it was modified after signing), so it was not used.`n`nSignature: $($sig.Status)", 'NVIDIA DLSS') | Out-Null
-        return
+        $problems += "- It is not signed by NVIDIA, or it was modified after signing (signature: $($sig.Status))."
     }
     if ($info.ProductName -notmatch 'Deep Learning SuperSampling') {
-        [Windows.Forms.MessageBox]::Show("This NVIDIA file is not the DLSS runtime (nvngx_dlss.dll):`n$($info.ProductName)", 'NVIDIA DLSS') | Out-Null
-        return
+        $problems += "- It does not look like the DLSS runtime (product: $($info.ProductName))."
+    }
+    if ($problems) {
+        $answer = [Windows.Forms.MessageBox]::Show("Warning about this file:`n`n$($problems -join "`n")`n`nIf DLSS does not work with it, press 'Use another DLSS DLL...' again and choose nvngx_dlss.prev.dll in $GsHost to go back.`n`nUse it anyway?", 'NVIDIA DLSS', 'YesNo', 'Warning')
+        if ($answer -ne 'Yes') { return }
     }
     try {
         New-Item -ItemType Directory -Force $GsHost | Out-Null
+        # Through a temporary copy: the chosen file may be nvngx_dlss.prev.dll itself (going back).
+        $staged = Join-Path $env:TEMP 'nvngx_dlss.staged.dll'
+        Copy-Item $file $staged -Force
         if (Test-Path $DlssDll) { Copy-Item $DlssDll "$GsHost\nvngx_dlss.prev.dll" -Force }
-        Copy-Item $file $DlssDll -Force
+        Move-Item $staged $DlssDll -Force
         Update-DlssVersion
         [Windows.Forms.MessageBox]::Show("DLSS $($info.FileVersion -replace ',', '.' -replace ' ', '') installed. It is used the next time you press PLAY (Upscaling: NVIDIA DLSS).", 'NVIDIA DLSS') | Out-Null
     } catch {
