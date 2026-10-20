@@ -27,7 +27,7 @@ en el **navegador** (experimental): alta resolución, texturas HD, mando y **onl
 - **NVIDIA DLSS bien hecho** (Vulkan y Direct3D 12): la profundidad real del juego y vectores de
   movimiento calculados en la GPU, así DLSS acumula detalle entre fotogramas; una máscara mantiene
   nítidas las piernas en movimiento rápido. En Direct3D 12 es una integración DLSS estándar que los
-  add-ons de DLSS pueden enganchar. El launcher muestra la versión de DLSS y puede usar otro `nvngx_dlss.dll` oficial (avisa antes de usar un archivo que no sea el DLSS firmado por NVIDIA).
+  add-ons de DLSS pueden enganchar. El launcher muestra la versión de DLSS y puede usar otro `nvngx_dlss.dll` (avisa antes de usar un archivo que no sea el DLSS firmado por NVIDIA).
 - **Sonido fiel:** el SPU2 de PCSX2 (reverb, interpolación, barridos de volumen) mezcla el audio.
 - **Texturas HD** (pack de fans, se instala solo en Windows).
 - **Online** contra un servidor de la comunidad, sin configurar el router.
