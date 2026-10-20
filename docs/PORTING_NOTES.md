@@ -209,11 +209,19 @@ desensambla volcados de RAM (IOP o EE).
 - D3D12: los nombres de macro van en un array paralelo a los pipelines (con 6 pases y 5 nombres,
   `GetShaderCacheKey` leía fuera y el host crasheaba al arrancar): ahora con `static_assert`.
 
+- Prueba de un usuario con un add-on de DLSS neural rendering (ReShade, D3D12) y su propio runtime:
+  el add-on intercepta nuestra evaluación, crea su feature NGX 18 con nuestra salida 1920x1080 y la
+  resolución de render 1278x896 como guía, y la evalúa cada fotograma sin errores (~57 fps en
+  menús). El proyecto no incluye ni descarga nada de eso; `tools/test_dlss_addon.ps1` resume el log.
+
 ### 5.5 Compilar el juego sin quedarse sin memoria
 - 3123 bloques unity de 32 funciones (593 MB de C++). Algunos bloques piden hasta ~8 GB por
   compilador: con 24 a la vez en 32 GB Windows paginaba a disco (138 000 páginas/s) y no avanzaba.
   Con `/p:CL_MPCount=12 /m:1` (1 por ~2,5 GB de RAM; `tools\install.ps1` lo calcula) va a ~500
   bloques/min, salvo los bloques bajos con las funciones gigantes (2–4 min cada uno). Total ~1 h.
+- `register_functions.cpp` (~50 MB, una sola función que registra todas las demás, se ejecuta una
+  vez al arrancar) se compila aparte, sin optimizar y sin la cabecera precompilada.
+- `install.ps1` muestra "compiling: N/M blocks (P%), about X min left" leyendo la salida de MSBuild.
 - Los parches de macOS/navegador no se habían compilado en Windows: a `gs_dump_writer.cpp` le
   faltaba `ps2x/host_intrin.h` (ps2xStatTicks); arreglado en `ps2recomp-web.patch`, que ahora
   también aplican `setup_sources.ps1` y el CI de Windows.

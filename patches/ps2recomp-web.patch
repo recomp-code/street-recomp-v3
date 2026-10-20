@@ -9216,7 +9216,7 @@ index 0000000..dbd9aa9
 +    std::string describe();
 +}
 diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
-index f29c1d1..c485f3c 100644
+index f29c1d1..ec7a2c2 100644
 --- a/ps2xRuntime/CMakeLists.txt
 +++ b/ps2xRuntime/CMakeLists.txt
 @@ -81,7 +81,18 @@ else()
@@ -9248,7 +9248,27 @@ index f29c1d1..c485f3c 100644
      set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
  else()
      set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
-@@ -517,12 +528,96 @@ target_include_directories(ps2_runtime PUBLIC
+@@ -480,6 +491,19 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+     )
+ endif()
+ 
++# register_functions.cpp is one huge function (a table of every recompiled function, ~50 MB of
++# source for a whole game) that runs once at start: optimising it only costs build time.
++set(PS2X_REGISTER_FUNCTIONS_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp")
++if(EXISTS "${PS2X_REGISTER_FUNCTIONS_CPP}")
++    # Own options, so outside the unity blocks and without the (optimised) precompiled header.
++    set_source_files_properties("${PS2X_REGISTER_FUNCTIONS_CPP}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON SKIP_PRECOMPILE_HEADERS ON)
++    if(MSVC)
++        set_property(SOURCE "${PS2X_REGISTER_FUNCTIONS_CPP}" APPEND PROPERTY COMPILE_OPTIONS "/Od")
++    else()
++        set_property(SOURCE "${PS2X_REGISTER_FUNCTIONS_CPP}" APPEND PROPERTY COMPILE_OPTIONS "-O0")
++    endif()
++endif()
++
+ if(PS2X_ENABLE_RUNNER_PCH)
+     set(PS2X_RUNNER_PCH_HEADERS
+         "${CMAKE_CURRENT_SOURCE_DIR}/include/ps2_runtime_macros.h"
+@@ -517,12 +541,96 @@ target_include_directories(ps2_runtime PUBLIC
      ${CMAKE_CURRENT_SOURCE_DIR}/src/lib/Kernel
  )
  

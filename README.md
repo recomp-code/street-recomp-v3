@@ -24,7 +24,11 @@ native code with [PS2Recomp](https://github.com/ran-j/PS2Recomp) and drawn on yo
   native code: no CPU emulator while you play.
 - **Full speed:** matches at 60 fps.
 - **Modern rendering:** up to 8x internal resolution (5K), texture filtering, 16:9, fullscreen.
-  Windows: Vulkan, Direct3D 11/12 or OpenGL, with AMD FSR 1 or NVIDIA DLSS (Vulkan and Direct3D 12, fed with the game's real depth). Mac: Metal.
+  Windows: Vulkan, Direct3D 11/12 or OpenGL, with AMD FSR 1 or NVIDIA DLSS. Mac: Metal.
+- **NVIDIA DLSS done properly** (Vulkan and Direct3D 12): the game's real depth buffer plus motion
+  vectors estimated on the GPU, so DLSS accumulates detail over frames; a mask keeps fast-moving
+  limbs sharp. On Direct3D 12 it is a standard DLSS integration that DLSS add-ons can hook.
+- **Faithful sound:** PCSX2's SPU2 (reverb, interpolation, volume sweeps) mixes the game's audio.
 - **HD textures** (fan pack, installed automatically on Windows).
 - **Online play** against a community server, no router setup needed.
 - **Controller** and keyboard (Windows: Xbox-style/XInput; Mac: Xbox, PlayStation or MFi).
@@ -39,7 +43,8 @@ native code with [PS2Recomp](https://github.com/ran-j/PS2Recomp) and drawn on yo
 1. Download **`NBAStreetV3-PC-<version>.zip`** from
    [**Releases**](https://github.com/recomp-code/street-recomp-v3/releases/latest) and unzip it.
 2. Double-click **`Launcher.cmd`**, click **Browse...** and choose your ISO.
-3. Click **Prepare game** (only once: it downloads the tools and builds the game, 1-2 hours).
+3. Click **Prepare game** (only once: it downloads the tools and builds the game from your ISO,
+   about 1 hour; the window shows how many blocks are compiled and the time left).
 4. Click **PLAY**.
 
 ## Play on Mac

@@ -23,7 +23,12 @@ en el **navegador** (experimental): alta resolución, texturas HD, mando y **onl
   nativo: no hay emulador de CPU mientras juegas.
 - **Velocidad completa:** partidos a 60 fps.
 - **Gráficos modernos:** hasta 8x de resolución interna (5K), filtrado de texturas, 16:9, pantalla
-  completa. Windows: Vulkan, Direct3D 11/12 u OpenGL, con AMD FSR 1 o NVIDIA DLSS (Vulkan y Direct3D 12, con la profundidad real del juego). Mac: Metal.
+  completa. Windows: Vulkan, Direct3D 11/12 u OpenGL, con AMD FSR 1 o NVIDIA DLSS. Mac: Metal.
+- **NVIDIA DLSS bien hecho** (Vulkan y Direct3D 12): la profundidad real del juego y vectores de
+  movimiento calculados en la GPU, así DLSS acumula detalle entre fotogramas; una máscara mantiene
+  nítidas las piernas en movimiento rápido. En Direct3D 12 es una integración DLSS estándar que los
+  add-ons de DLSS pueden enganchar.
+- **Sonido fiel:** el SPU2 de PCSX2 (reverb, interpolación, barridos de volumen) mezcla el audio.
 - **Texturas HD** (pack de fans, se instala solo en Windows).
 - **Online** contra un servidor de la comunidad, sin configurar el router.
 - **Mando** y teclado (Windows: tipo Xbox/XInput; Mac: Xbox, PlayStation o MFi).
@@ -38,7 +43,8 @@ en el **navegador** (experimental): alta resolución, texturas HD, mando y **onl
 1. Descarga **`NBAStreetV3-PC-<versión>.zip`** de
    [**Releases**](https://github.com/recomp-code/street-recomp-v3/releases/latest) y descomprímelo.
 2. Doble clic en **`Launcher.cmd`**, pulsa **Browse...** y elige tu ISO.
-3. Pulsa **Prepare game** (solo una vez: descarga las herramientas y compila el juego, 1-2 horas).
+3. Pulsa **Prepare game** (solo una vez: descarga las herramientas y compila el juego desde tu ISO,
+   cerca de 1 hora; la ventana muestra los bloques compilados y el tiempo que falta).
 4. Pulsa **PLAY**.
 
 ## Jugar en Mac

@@ -48,7 +48,7 @@ function Download($url, $file) {
     Invoke-WebRequest -Uri $url -OutFile "$file.part" -UseBasicParsing
     Move-Item "$file.part" $file -Force
 }
-function Run($exe, [string[]]$arguments, $log) {
+function Run($exe, [string[]]$arguments, $log, [scriptblock]$OnLine = $null) {
     Write-Host "    $([IO.Path]::GetFileName($exe)) $($arguments -join ' ')"
     # Native tools print warnings on stderr (CMake's deprecation notices, for one). With
     # $ErrorActionPreference = 'Stop', Windows PowerShell 5.1 turns every redirected stderr line
@@ -58,7 +58,7 @@ function Run($exe, [string[]]$arguments, $log) {
     $ErrorActionPreference = 'Continue'
     try {
         if ($log) {
-            & $exe @arguments 2>&1 | ForEach-Object { "$_" } | Out-File -FilePath $log -Encoding utf8
+            & $exe @arguments 2>&1 | ForEach-Object { $line = "$_"; if ($OnLine) { & $OnLine $line }; $line } | Out-File -FilePath $log -Encoding utf8
         } else {
             & $exe @arguments
         }
@@ -195,7 +195,25 @@ if ($Rebuild -or -not (Test-Path $gameExe)) {
     # (never more than the cores), or Windows pages to disk and the build takes many hours.
     $ramGB = (Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB
     $jobs = [int][math]::Max(2, [math]::Min([Environment]::ProcessorCount, [math]::Floor($ramGB / 2.5)))
-    Run "$CMakeDir\cmake.exe" @('--build', $build, '--config', 'Release', '--target', 'ps2EntryRunner', '--', '/m:1', "/p:CL_MPCount=$jobs") "$Logs\install_game.log"
+    # Progress: MSBuild prints each block of game code ("unity_N_cxx.cxx") as it compiles it.
+    $unityDir = Join-Path $build 'ps2xRuntime\CMakeFiles\ps2EntryRunner.dir\Unity'
+    $script:blocksTotal = [math]::Max(1, @(Get-ChildItem $unityDir -Filter 'unity_*_cxx.cxx' -ErrorAction SilentlyContinue).Count)
+    $script:blocksDone = 0
+    $script:buildStart = Get-Date
+    Write-Host "    $jobs compilers at once, $($script:blocksTotal) blocks of game code"
+    $progress = {
+        param($line)
+        if ($line -notmatch '^\s+unity_\d+_cxx\.cxx\s*$') { return }
+        $script:blocksDone++
+        if ($script:blocksDone % 10 -ne 0 -and $script:blocksDone -ne $script:blocksTotal) { return }
+        $pct = [math]::Min(100, [int](100 * $script:blocksDone / $script:blocksTotal))
+        $elapsed = ((Get-Date) - $script:buildStart).TotalMinutes
+        # The last blocks hold the biggest functions and are the slowest: pad the estimate.
+        $left = [math]::Ceiling($elapsed / $script:blocksDone * ($script:blocksTotal - $script:blocksDone) * 1.5)
+        Write-Host -NoNewline ("`r    compiling: {0}/{1} blocks ({2}%), about {3} min left      " -f $script:blocksDone, $script:blocksTotal, $pct, $left)
+    }
+    Run "$CMakeDir\cmake.exe" @('--build', $build, '--config', 'Release', '--target', 'ps2EntryRunner', '--', '/m:1', "/p:CL_MPCount=$jobs") "$Logs\install_game.log" $progress
+    Write-Host ''
 }
 Write-Host "    OK: $gameExe"
 
