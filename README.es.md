@@ -8,7 +8,8 @@ en el **navegador** (experimental): alta resolución, texturas HD, mando y **onl
 [PCSX2](https://github.com/PCSX2/pcsx2).
 
 > **Necesitas tu propia copia** de NBA Street V3 (USA, SLUS-21126) en un archivo ISO. No se incluye
-> nada del juego: se compila en tu ordenador a partir de tu copia.
+> ningún archivo del disco: en Windows y con los scripts de Mac el juego se compila en tu ordenador a partir de tu
+> copia; la app de Mac lista para jugar trae el código del juego ya recompilado y lee todo lo demás de tu ISO.
 
 | | |
 |---|---|
@@ -49,7 +50,20 @@ en el **navegador** (experimental): alta resolución, texturas HD, mando y **onl
 
 ## Jugar en Mac
 
-Necesitas un Mac con **Apple Silicon** (M1 o posterior), **macOS 14.4** o superior, unos **30 GB**
+**Listo para jugar, sin compilar:** descarga **`NBAStreetV3-Mac-<versión>.zip`** de
+[**Releases**](https://github.com/recomp-code/street-recomp-v3/releases/latest) (Apple Silicon, macOS 14 o posterior).
+
+1. Descomprímelo y arrastra **`NBAStreetV3.app`** a Aplicaciones.
+2. Solo la primera vez: la app no está firmada con una cuenta de desarrollador de Apple. En macOS 15 o posterior,
+   doble clic, cierra el aviso y ve a Ajustes del Sistema > Privacidad y seguridad > **Abrir igualmente**. En macOS 14,
+   clic derecho > **Abrir** > **Abrir**. O ejecuta `xattr -dr com.apple.quarantine /Applications/NBAStreetV3.app`.
+3. Pulsa **Browse...**, elige tu ISO (la app comprueba que es SLUS-21126), elige la resolución y pulsa **PLAY**.
+
+La app monta tu ISO en solo lectura mientras juegas y guarda partidas, opciones gráficas y registros en
+`~/Library/Application Support/NBAStreetV3`. El juego online (servidor de la comunidad) viene activado. Se genera con
+`tools/macos/app/` (`build_ffmpeg.sh`, `build_runner.sh`, `make_dist.sh`; launcher: `NBAStreetV3.swift`).
+
+**O compílalo tú** (también sirve para tener las novedades antes de una versión). Necesitas un Mac con **Apple Silicon** (M1 o posterior), **macOS 14.4** o superior, unos **30 GB**
 libres y:
 
 ```sh
@@ -209,5 +223,5 @@ Nunca subas archivos del juego (ISO, ELF, código generado, texturas extraídas,
 GPL-3.0, igual que PS2Recomp y PCSX2. Basado en [PS2Recomp](https://github.com/ran-j/PS2Recomp) de
 ran-j y colaboradores y en [PCSX2](https://github.com/PCSX2/pcsx2) (GS, microVU, DEV9). La versión de
 Mac ejecuta el VU1 con el recompilador microVU arm64 de [ARMSX2](https://github.com/ARMSX2/ARMSX2).
-NBA Street V3 es propiedad de Electronic Arts; este proyecto no está afiliado a EA y no incluye
+NBA Street V3 es propiedad de Electronic Arts; este proyecto no está afiliado a EA. El repositorio no incluye
 contenido del juego.
