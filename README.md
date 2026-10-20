@@ -8,8 +8,9 @@ resolution, HD textures, controller support and **working online play**. The gam
 native code with [PS2Recomp](https://github.com/ran-j/PS2Recomp) and drawn on your GPU by the
 [PCSX2](https://github.com/PCSX2/pcsx2) renderer.
 
-> **You need your own copy** of NBA Street V3 (USA, SLUS-21126) as an ISO file. Nothing from the game
-> is included: it is built on your computer from your copy.
+> **You need your own copy** of NBA Street V3 (USA, SLUS-21126) as an ISO file. No disc files are
+> included: on Windows and with the Mac build scripts the game is built on your computer from your copy; the
+> ready-to-play Mac app holds the game's code already recompiled, and reads everything else from your ISO.
 
 | | |
 |---|---|
@@ -49,7 +50,20 @@ native code with [PS2Recomp](https://github.com/ran-j/PS2Recomp) and drawn on yo
 
 ## Play on Mac
 
-Needs a Mac with **Apple Silicon** (M1 or newer), **macOS 14.4** or later, about **30 GB** free and:
+**Ready to play, nothing to compile:** download **`NBAStreetV3-Mac-<version>.zip`** from
+[**Releases**](https://github.com/recomp-code/street-recomp-v3/releases/latest) (Apple Silicon, macOS 14 or newer).
+
+1. Unzip it and drag **`NBAStreetV3.app`** to Applications.
+2. First start only: the app is not signed with an Apple developer account. On macOS 15 or newer, double-click it, close
+   the warning, then System Settings > Privacy & Security > **Open Anyway**. On macOS 14, right-click > **Open** >
+   **Open**. Or run `xattr -dr com.apple.quarantine /Applications/NBAStreetV3.app`.
+3. Click **Browse...**, choose your ISO (the app checks it is SLUS-21126), pick the resolution and click **PLAY**.
+
+The app mounts your ISO read-only while you play and keeps saves, graphics settings and logs in
+`~/Library/Application Support/NBAStreetV3`. Online play (community server) is on by default. It is built with
+`tools/macos/app/` (`build_ffmpeg.sh`, `build_runner.sh`, `make_dist.sh`; launcher: `NBAStreetV3.swift`).
+
+**Or build it yourself** (this is also how you get updates before a release). Needs a Mac with **Apple Silicon** (M1 or newer), **macOS 14.4** or later, about **30 GB** free and:
 
 ```sh
 xcode-select --install                     # Apple's command line tools (once)
@@ -187,6 +201,7 @@ account (any e-mail; **don't reuse a real password**) and a **persona**, then an
 | `game/` | Recompiler config for SLUS-21126, game fixes, network settings |
 | `tools/` | Windows scripts (`install.ps1`, builds, debugging, textures) |
 | `tools/macos/` | Mac scripts (`install.sh`, `play.sh`, `build.sh`, `build_pcsx2.sh`, `run_scripted.sh`) |
+| `tools/macos/app/` | The ready-to-play Mac app: launcher (`NBAStreetV3.swift`), `build_ffmpeg.sh`, `build_runner.sh`, `make_dist.sh` |
 | `patches/ps2recomp-web.patch` | Browser build, on top of `ps2recomp.patch` (Emscripten, web platform, Play! GS host) |
 | `patches/play.patch`, `play-dependencies.patch`, `play-codegen.patch` | Changes to Play! `83700b2c` (WebGL2 GS fixes, HD textures, wasm exceptions, VU JIT) |
 | `tools/web/` | Browser build (`build.sh`, `serve.sh`, Caddy configs) |
@@ -200,4 +215,4 @@ Never upload game files (ISO, ELF, generated code, extracted textures, saves).
 GPL-3.0, like PS2Recomp and PCSX2. Based on [PS2Recomp](https://github.com/ran-j/PS2Recomp) by ran-j
 and contributors and [PCSX2](https://github.com/PCSX2/pcsx2) (GS, microVU, DEV9). The Mac version runs
 VU1 on the arm64 microVU recompiler from [ARMSX2](https://github.com/ARMSX2/ARMSX2). NBA Street V3 is
-property of Electronic Arts; this project is not affiliated with EA and includes no game content.
+property of Electronic Arts; this project is not affiliated with EA. The repository includes no game content.

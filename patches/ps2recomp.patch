@@ -21168,10 +21168,10 @@ index f0ad507..4f31ff1 100644
              {
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 new file mode 100644
-index 0000000..db0ff1d
+index 0000000..7e6b76e
 --- /dev/null
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-@@ -0,0 +1,817 @@
+@@ -0,0 +1,838 @@
 +#include "gs_dump_writer.h"
 +#include "ps2_live_ring.h"
 +
@@ -21426,16 +21426,26 @@ index 0000000..db0ff1d
 +                std::vector<std::string> args{exe, "-live", "-window", "-livering", suffix};
 +                const char *extra = std::getenv("PS2X_GSHOST_ARGS");
 +                std::string extraArgs = extra ? extra : "-ini nba_street.ini"; // quality settings next to the host
-+                size_t pos = 0;
-+                while (pos < extraArgs.size())
++                // Split on spaces; "double quotes" keep a path with spaces in one argument (the Mac app's
++                // -ini lives in ~/Library/Application Support).
++                std::string cur;
++                bool inArg = false, quoted = false;
++                for (const char c : extraArgs)
 +                {
-+                    const size_t start = extraArgs.find_first_not_of(' ', pos);
-+                    if (start == std::string::npos)
-+                        break;
-+                    const size_t end = extraArgs.find(' ', start);
-+                    args.push_back(extraArgs.substr(start, end == std::string::npos ? std::string::npos : end - start));
-+                    pos = end == std::string::npos ? extraArgs.size() : end;
++                    if (c == '"')
++                        quoted = !quoted, inArg = true;
++                    else if (c == ' ' && !quoted)
++                    {
++                        if (inArg)
++                            args.push_back(cur);
++                        cur.clear();
++                        inArg = false;
++                    }
++                    else
++                        cur += c, inArg = true;
 +                }
++                if (inArg)
++                    args.push_back(cur);
 +                std::vector<char *> argv;
 +                for (std::string &arg : args)
 +                    argv.push_back(arg.data());
@@ -21542,6 +21552,30 @@ index 0000000..db0ff1d
 +                return file != nullptr;
 +            }
 +
++#if defined(PS2X_GS_LIVE_RING)
++            // The GS host's window was closed (or the host died): the game has nothing left to show, so it exits too.
++            [[noreturn]] void hostClosed()
++            {
++#if defined(_WIN32)
++                DWORD exitCode = 0;
++                const bool exited = live.hostProcess && GetExitCodeProcess(live.hostProcess, &exitCode) && exitCode != STILL_ACTIVE;
++                std::fprintf(stderr, "[gslive] GS host closed (%s, exit code 0x%lX), exiting\n",
++                             exited ? "process ended" : "window closed", exited ? exitCode : 0ul);
++                std::fflush(stderr);
++                ExitProcess(0);
++#else
++                const bool exited = live.hostExited;
++                const int status = live.hostStatus;
++                std::fprintf(stderr, "[gslive] GS host closed (%s, %s %d), exiting\n",
++                             exited ? "process ended" : "window closed",
++                             exited && WIFSIGNALED(status) ? "signal" : "exit code",
++                             !exited ? 0 : WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
++                std::fflush(stderr);
++                std::_Exit(0);
++#endif
++            }
++#endif
++
 +            void write(const void *data, size_t size)
 +            {
 +                if (size == 0)
@@ -21550,25 +21584,7 @@ index 0000000..db0ff1d
 +                if (liveActive)
 +                {
 +                    if (!live.write(static_cast<const uint8_t *>(data), size))
-+                    {
-+#if defined(_WIN32)
-+                        DWORD exitCode = 0;
-+                        const bool exited = live.hostProcess && GetExitCodeProcess(live.hostProcess, &exitCode) && exitCode != STILL_ACTIVE;
-+                        std::fprintf(stderr, "[gslive] GS host closed (%s, exit code 0x%lX), exiting\n",
-+                                     exited ? "process ended" : "window closed", exited ? exitCode : 0ul);
-+                        std::fflush(stderr);
-+                        ExitProcess(0);
-+#else
-+                        const bool exited = live.hostExited;
-+                        const int status = live.hostStatus;
-+                        std::fprintf(stderr, "[gslive] GS host closed (%s, %s %d), exiting\n",
-+                                     exited ? "process ended" : "window closed",
-+                                     exited && WIFSIGNALED(status) ? "signal" : "exit code",
-+                                     !exited ? 0 : WIFSIGNALED(status) ? WTERMSIG(status) : WEXITSTATUS(status));
-+                        std::fflush(stderr);
-+                        std::_Exit(0);
-+#endif
-+                    }
++                        hostClosed();
 +                    bytes += size;
 +                    return;
 +                }
@@ -21981,6 +21997,11 @@ index 0000000..db0ff1d
 +        if (w.file && w.frames % 600u == 0u)
 +            std::fflush(w.file);
 +        ++w.frames;
++#if defined(PS2X_GS_LIVE_RING)
++        // Menus write little: the ring can take minutes to fill after the host closes, so look every 30 frames.
++        if (w.liveActive && (w.frames % 30u) == 0u && w.live.hostGone())
++            w.hostClosed();
++#endif
 +        if (w.file && w.maxFrames != 0u && w.frames >= w.maxFrames)
 +        {
 +            std::fprintf(stderr, "[gsdump] %u frames written, closing dump (%.1f MB)\n", w.frames,
@@ -24373,7 +24394,7 @@ index 37b6a4d..e493c89 100644
      static constexpr uint32_t D_STAT = 0x1000E010u;
      static constexpr uint32_t D_CTRL = 0x1000E000u;
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 45cb9d2..5c92038 100644
+index 45cb9d2..108257b 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
 @@ -1,9 +1,15 @@
@@ -24405,17 +24426,34 @@ index 45cb9d2..5c92038 100644
  #include <algorithm>
  #include <array>
  #include <cstring>
-@@ -26,6 +38,9 @@
+@@ -26,7 +38,25 @@
  #include <thread>
  #include <unordered_map>
  #include <sstream>
+-
 +#include <cmath>
 +#include <unordered_set>
 +#include "ps2x/host_intrin.h"
- 
++
++#if defined(__APPLE__)
++#include <objc/message.h>
++#include <objc/runtime.h>
++// [gslive] macOS: the window library turns the process into a regular app (Dock icon), but with the PCSX2 GS host
++// drawing the game this process has no visible window: an accessory app keeps everything working without the icon.
++static void ps2xMacHideDockIcon()
++{
++    Class nsApp = objc_getClass("NSApplication");
++    if (!nsApp)
++        return;
++    id app = ((id(*)(Class, SEL))objc_msgSend)(nsApp, sel_registerName("sharedApplication"));
++    if (app)
++        ((void (*)(id, SEL, long))objc_msgSend)(app, sel_registerName("setActivationPolicy:"), 1L); // Accessory
++}
++#endif
  namespace ps2_stubs
  {
-@@ -37,6 +52,99 @@ namespace ps2_stubs
+     void resetSifState();
+@@ -37,6 +67,99 @@ namespace ps2_stubs
  #define EM_MIPS 8            // MIPS architecture
  #define PT_LOAD 1            // Loadable segment
  
@@ -24515,7 +24553,7 @@ index 45cb9d2..5c92038 100644
  static constexpr int FB_WIDTH = 640;
  static constexpr int FB_HEIGHT = 512;
  static constexpr int DEFAULT_DISPLAY_HEIGHT = 448;
-@@ -151,8 +259,18 @@ namespace
+@@ -151,8 +274,18 @@ namespace
          return true;
      }
  
@@ -24534,7 +24572,7 @@ index 45cb9d2..5c92038 100644
          DispatchHistory &h = g_dispatchHistory;
          h.pcs[h.next] = pc;
          h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
-@@ -162,6 +280,27 @@ namespace
+@@ -162,6 +295,27 @@ namespace
          }
      }
  
@@ -24562,7 +24600,7 @@ index 45cb9d2..5c92038 100644
      std::string formatDispatchHistory()
      {
          const DispatchHistory &h = g_dispatchHistory;
-@@ -477,10 +616,36 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
+@@ -477,10 +631,36 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
      s_hasUploadedFrame = true;
  }
  
@@ -24599,7 +24637,7 @@ index 45cb9d2..5c92038 100644
  
      m_eeScheduler = std::make_unique<EeScheduler>(*this);
  
-@@ -526,6 +691,7 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
+@@ -526,6 +706,7 @@ void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
  
  PS2Runtime::~PS2Runtime()
  {
@@ -24607,7 +24645,7 @@ index 45cb9d2..5c92038 100644
      try
      {
          requestStop();
-@@ -605,9 +771,18 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
+@@ -605,9 +786,18 @@ void PS2Runtime::notifyIopSifTransfer(uint8_t *rdram, const ps2x::iop::SifTransf
      m_iopSubsystem->onSifTransfer(transfer);
  }
  
@@ -24626,7 +24664,7 @@ index 45cb9d2..5c92038 100644
  }
  
  void PS2Runtime::resetIop()
-@@ -715,6 +890,21 @@ bool PS2Runtime::syncCoreSubsystems()
+@@ -715,6 +905,21 @@ bool PS2Runtime::syncCoreSubsystems()
  
  bool PS2Runtime::initialize(const char *title)
  {
@@ -24648,7 +24686,7 @@ index 45cb9d2..5c92038 100644
      try
      {
          if (!m_memory.initialize())
-@@ -731,7 +921,10 @@ bool PS2Runtime::initialize(const char *title)
+@@ -731,8 +936,15 @@ bool PS2Runtime::initialize(const char *title)
  #if defined(PLATFORM_VITA)
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
  #else
@@ -24658,9 +24696,14 @@ index 45cb9d2..5c92038 100644
 +        const bool liveGs = ps2_gsdump::liveActive();
 +        SetConfigFlags(liveGs ? FLAG_WINDOW_HIDDEN : FLAG_WINDOW_RESIZABLE);
          InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
++#if defined(__APPLE__)
++        if (liveGs)
++            ps2xMacHideDockIcon();
++#endif
          InitAudioDevice();
          m_audioBackend.setAudioReady(IsAudioDeviceReady());
-@@ -1064,6 +1257,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
+ #endif
+@@ -1064,6 +1276,11 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
          paths.cdRoot = paths.elfDirectory;
          paths.mcRoot = paths.elfDirectory / "mc0";
      }
@@ -24672,7 +24715,7 @@ index 45cb9d2..5c92038 100644
  
      setIoPaths(paths);
  }
-@@ -1342,6 +1540,393 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
+@@ -1342,6 +1559,393 @@ void PS2Runtime::reportMissingFunction(uint8_t *rdram,
      }
  }
  
@@ -25066,7 +25109,7 @@ index 45cb9d2..5c92038 100644
  bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
                                       R5900Context *ctx,
                                       uint32_t targetPc,
-@@ -1352,6 +1937,62 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1352,6 +1956,62 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  {
      ctx->pc = targetPc;
      const bool isCall = (kind == GuestBranchKind::DirectCall || kind == GuestBranchKind::IndirectCall);
@@ -25129,7 +25172,7 @@ index 45cb9d2..5c92038 100644
  
      // Every inter-function transfer is also a deterministic EE safe point.
      // Backward edges inside generated functions use eeCheckpointDue(), while
-@@ -1363,7 +2004,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1363,7 +2023,7 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      if (!isCall)
      {
@@ -25138,7 +25181,7 @@ index 45cb9d2..5c92038 100644
          {
              reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
          }
-@@ -1372,6 +2013,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1372,6 +2032,14 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -25153,7 +25196,7 @@ index 45cb9d2..5c92038 100644
      if (!hasFunction(targetPc))
      {
          reportMissingFunction(rdram, ctx, targetPc, sourcePc, kind, debugName);
-@@ -1396,6 +2045,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1396,6 +2064,15 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
  
      RecompiledFunction targetFn = lookupFunction(targetPc);
      const uint32_t entryPc = ctx->pc;
@@ -25169,7 +25212,7 @@ index 45cb9d2..5c92038 100644
      targetFn(rdram, ctx, this);
  
      if (isStopRequested() || ctx->pc == 0u)
-@@ -1403,11 +2061,25 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
+@@ -1403,11 +2080,25 @@ bool PS2Runtime::dispatchGuestBranch(uint8_t *rdram,
          return false;
      }
  
@@ -25196,7 +25239,7 @@ index 45cb9d2..5c92038 100644
      return ctx->pc == fallthroughPc;
  }
  
-@@ -1489,6 +2161,17 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
+@@ -1489,6 +2180,17 @@ void PS2Runtime::drainCompletedDmacHandlers(uint8_t *rdram)
      {
          ps2_syscalls::dispatchDmacHandlersForCause(rdram, this, cause);
      }
@@ -25214,7 +25257,7 @@ index 45cb9d2..5c92038 100644
  }
  
  void PS2Runtime::handleTrap(uint8_t *rdram, R5900Context *ctx)
-@@ -2339,6 +3022,127 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
+@@ -2339,6 +3041,127 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
      raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
  }
  
@@ -25342,7 +25385,7 @@ index 45cb9d2..5c92038 100644
  void PS2Runtime::run()
  {
      m_stopRequested.store(false, std::memory_order_relaxed);
-@@ -2367,6 +3171,7 @@ void PS2Runtime::run()
+@@ -2367,6 +3190,7 @@ void PS2Runtime::run()
      std::thread gameThread([&]()
                             {
          ThreadNaming::SetCurrentThreadName("GameThread");
@@ -25350,7 +25393,7 @@ index 45cb9d2..5c92038 100644
          try
          {
              m_eeScheduler->reset(m_memory.getRDRAM(), m_cpuContext);
-@@ -2385,6 +3190,9 @@ void PS2Runtime::run()
+@@ -2385,6 +3209,9 @@ void PS2Runtime::run()
          }
          gameThreadFinished.store(true, std::memory_order_release); });
  
@@ -25360,7 +25403,7 @@ index 45cb9d2..5c92038 100644
      uint64_t tick = 0;
      while (!isStopRequested() && !gameThreadFinished.load(std::memory_order_acquire))
      {
-@@ -2392,6 +3200,8 @@ void PS2Runtime::run()
+@@ -2392,6 +3219,8 @@ void PS2Runtime::run()
              tick++;
              if ((tick % 120) == 0)
              {
@@ -25369,7 +25412,7 @@ index 45cb9d2..5c92038 100644
                  uint64_t curDma = m_memory.dmaStartCount();
                  uint64_t curGif = m_memory.gifCopyCount();
                  uint64_t curGs = m_memory.gsWriteCount();
-@@ -2418,8 +3228,98 @@ void PS2Runtime::run()
+@@ -2418,8 +3247,98 @@ void PS2Runtime::run()
                                                 << " vif=" << curVif
                                                 << std::endl);
  
@@ -25468,7 +25511,7 @@ index 45cb9d2..5c92038 100644
          uint32_t presentWidth = FB_WIDTH;
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
          UploadFrame(frameTex, this, presentWidth, presentHeight);
-@@ -2459,6 +3359,7 @@ void PS2Runtime::run()
+@@ -2459,6 +3378,7 @@ void PS2Runtime::run()
      {
          gameThread.join();
      }
