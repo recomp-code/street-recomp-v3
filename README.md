@@ -27,7 +27,7 @@ native code with [PS2Recomp](https://github.com/ran-j/PS2Recomp) and drawn on yo
   Windows: Vulkan, Direct3D 11/12 or OpenGL, with AMD FSR 1 or NVIDIA DLSS. Mac: Metal.
 - **NVIDIA DLSS done properly** (Vulkan and Direct3D 12): the game's real depth buffer plus motion
   vectors estimated on the GPU, so DLSS accumulates detail over frames; a mask keeps fast-moving
-  limbs sharp. On Direct3D 12 it is a standard DLSS integration that DLSS add-ons can hook.
+  limbs sharp. On Direct3D 12 it is a standard DLSS integration that DLSS add-ons can hook. The launcher shows the DLSS version and can switch to another official `nvngx_dlss.dll` (only NVIDIA-signed files are accepted).
 - **Faithful sound:** PCSX2's SPU2 (reverb, interpolation, volume sweeps) mixes the game's audio.
 - **HD textures** (fan pack, installed automatically on Windows).
 - **Online play** against a community server, no router setup needed.

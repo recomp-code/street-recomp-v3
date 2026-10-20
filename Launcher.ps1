@@ -57,7 +57,7 @@ $Renderers = [ordered]@{ 'Vulkan (recommended)' = 14; 'Direct3D 11' = 3; 'Direct
 # ---------------------------------------------------------------- window
 $form = New-Object Windows.Forms.Form
 $form.Text = 'NBA Street V3 - PC'
-$form.Size = New-Object Drawing.Size(520, 612)
+$form.Size = New-Object Drawing.Size(520, 646)
 $form.FormBorderStyle = 'FixedDialog'
 $form.MaximizeBox = $false
 $form.StartPosition = 'CenterScreen'
@@ -94,7 +94,7 @@ $form.Controls.Add($status)
 
 # Graphics
 $group = New-Object Windows.Forms.GroupBox
-$group.Text = 'Graphics'; $group.Location = '20,172'; $group.Size = '468,152'
+$group.Text = 'Graphics'; $group.Location = '20,172'; $group.Size = '468,186'
 $form.Controls.Add($group)
 
 $resLabel = New-Object Windows.Forms.Label
@@ -128,10 +128,17 @@ $smoothBox = New-Object Windows.Forms.CheckBox
 $smoothBox.Text = 'NVIDIA Smooth Motion (120+ Hz screens)'; $smoothBox.Location = '150,120'; $smoothBox.AutoSize = $true
 $smoothBox.Checked = $settings.SmoothMotion
 $group.Controls.Add($smoothBox)
+# NVIDIA DLSS runtime used by the renderer (like DLSS Swapper: the player can put in a newer one)
+$dlssLabel = New-Object Windows.Forms.Label
+$dlssLabel.Location = '12,154'; $dlssLabel.Size = '250,22'; $dlssLabel.ForeColor = [Drawing.Color]::DimGray
+$group.Controls.Add($dlssLabel)
+$dlssButton = New-Object Windows.Forms.Button
+$dlssButton.Text = 'Use another DLSS DLL...'; $dlssButton.Location = '270,148'; $dlssButton.Size = '186,30'
+$group.Controls.Add($dlssButton)
 
 # HD textures
 $texGroup = New-Object Windows.Forms.GroupBox
-$texGroup.Text = 'HD textures'; $texGroup.Location = '20,332'; $texGroup.Size = '468,92'
+$texGroup.Text = 'HD textures'; $texGroup.Location = '20,366'; $texGroup.Size = '468,92'
 $form.Controls.Add($texGroup)
 
 $texBox = New-Object Windows.Forms.CheckBox
@@ -152,7 +159,7 @@ $texGroup.Controls.Add($texFolder)
 
 # Online
 $netGroup = New-Object Windows.Forms.GroupBox
-$netGroup.Text = 'Online'; $netGroup.Location = '20,432'; $netGroup.Size = '468,56'
+$netGroup.Text = 'Online'; $netGroup.Location = '20,466'; $netGroup.Size = '468,56'
 $form.Controls.Add($netGroup)
 $onlineLabel = New-Object Windows.Forms.Label
 $onlineLabel.Text = 'Ready - choose PLAY ONLINE in the game menu.'; $onlineLabel.Location = '12,26'; $onlineLabel.AutoSize = $true
@@ -160,17 +167,17 @@ $onlineLabel.ForeColor = [Drawing.Color]::DarkGreen
 $netGroup.Controls.Add($onlineLabel)
 
 $prepare = New-Object Windows.Forms.Button
-$prepare.Text = 'Prepare game'; $prepare.Location = '20,498'; $prepare.Size = '150,44'
+$prepare.Text = 'Prepare game'; $prepare.Location = '20,532'; $prepare.Size = '150,44'
 $form.Controls.Add($prepare)
 
 $play = New-Object Windows.Forms.Button
-$play.Text = 'PLAY'; $play.Location = '338,498'; $play.Size = '150,44'
+$play.Text = 'PLAY'; $play.Location = '338,532'; $play.Size = '150,44'
 $play.Font = New-Object Drawing.Font('Segoe UI', 12, [Drawing.FontStyle]::Bold)
 $form.Controls.Add($play)
 
 $help = New-Object Windows.Forms.Label
 $help.Text = 'In game: F1 or hold START = graphics menu. Alt+Enter = window/fullscreen.'
-$help.Location = '20,550'; $help.AutoSize = $true; $help.ForeColor = [Drawing.Color]::DimGray
+$help.Location = '20,584'; $help.AutoSize = $true; $help.ForeColor = [Drawing.Color]::DimGray
 $form.Controls.Add($help)
 
 function Update-TextureCount {
@@ -213,6 +220,46 @@ $texFolder.Add_Click({
     $dialog = New-Object Windows.Forms.FolderBrowserDialog
     $dialog.Description = 'Choose the folder of an HD texture pack for NBA Street V3'
     if ($dialog.ShowDialog() -eq 'OK') { Install-TexturePack $dialog.SelectedPath }
+})
+
+# ---------------------------------------------------------------- NVIDIA DLSS runtime (nvngx_dlss.dll)
+$DlssDll = "$GsHost\nvngx_dlss.dll"
+function Update-DlssVersion {
+    if (Test-Path $DlssDll) {
+        $v = (Get-Item $DlssDll).VersionInfo.FileVersion -replace ',', '.' -replace ' ', ''
+        $dlssLabel.Text = "NVIDIA DLSS version: $v"
+    } else {
+        $dlssLabel.Text = 'NVIDIA DLSS: not installed (RTX only)'
+    }
+}
+# Only NVIDIA's own, untouched DLSS runtime is accepted: valid NVIDIA signature and the DLSS
+# product name. The previous file is kept as nvngx_dlss.prev.dll.
+function Install-DlssDll($file) {
+    $sig = Get-AuthenticodeSignature $file
+    $info = (Get-Item $file).VersionInfo
+    if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'O=NVIDIA Corporation') {
+        [Windows.Forms.MessageBox]::Show("This file is not signed by NVIDIA (or it was modified after signing), so it was not used.`n`nSignature: $($sig.Status)", 'NVIDIA DLSS') | Out-Null
+        return
+    }
+    if ($info.ProductName -notmatch 'Deep Learning SuperSampling') {
+        [Windows.Forms.MessageBox]::Show("This NVIDIA file is not the DLSS runtime (nvngx_dlss.dll):`n$($info.ProductName)", 'NVIDIA DLSS') | Out-Null
+        return
+    }
+    try {
+        New-Item -ItemType Directory -Force $GsHost | Out-Null
+        if (Test-Path $DlssDll) { Copy-Item $DlssDll "$GsHost\nvngx_dlss.prev.dll" -Force }
+        Copy-Item $file $DlssDll -Force
+        Update-DlssVersion
+        [Windows.Forms.MessageBox]::Show("DLSS $($info.FileVersion -replace ',', '.' -replace ' ', '') installed. It is used the next time you press PLAY (Upscaling: NVIDIA DLSS).", 'NVIDIA DLSS') | Out-Null
+    } catch {
+        [Windows.Forms.MessageBox]::Show("The DLSS file could not be installed (is the game running?):`n$($_.Exception.Message)", 'NVIDIA DLSS') | Out-Null
+    }
+}
+$dlssButton.Add_Click({
+    $dialog = New-Object Windows.Forms.OpenFileDialog
+    $dialog.Title = 'Choose an NVIDIA DLSS runtime (nvngx_dlss.dll)'
+    $dialog.Filter = 'NVIDIA DLSS (nvngx_dlss.dll)|nvngx_dlss.dll|DLL files (*.dll)|*.dll'
+    if ($dialog.ShowDialog() -eq 'OK') { Install-DlssDll $dialog.FileName }
 })
 
 function Load-Graphics {
@@ -296,5 +343,6 @@ $play.Add_Click({
 $form.Add_FormClosing({ Save-Graphics })
 Load-Graphics
 Update-TextureCount
+Update-DlssVersion
 Update-Status
 [void]$form.ShowDialog()
