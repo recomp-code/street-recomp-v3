@@ -770,7 +770,7 @@ index ebcf7a1..7a3cff9 100644
      bool m_insideInterrupt = false;
      uint32_t m_pendingEeTimerInterrupts = 0;
 diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
-index 8d6a8e7..14f9a83 100644
+index b53c0a6..df9d766 100644
 --- a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 +++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
 @@ -4,6 +4,7 @@
@@ -1001,7 +1001,7 @@ index 8d6a8e7..14f9a83 100644
 +                    static_cast<uint64_t>(header->writePos - header->readPos) < wakeBytes())
 +                    return;
 +                SetEvent(dataEvent);
-             }
++            }
 +
 +            // ReadFIFO2 replies (readFifoInto): the host copies the data, stores its size, bumps seq
 +            // and sets the readback event.
@@ -1011,7 +1011,7 @@ index 8d6a8e7..14f9a83 100644
 +            {
 +                MemoryBarrier();
 +                return ps2live::ringReadback(header)->seq;
-+            }
+             }
 +            uint32_t readbackBytes() const { return ps2live::ringReadback(header)->bytes; }
 +            const uint8_t *readbackPtr() const { return ps2live::readbackData(header); }
 +            void waitReadback(uint32_t ms) { WaitForSingleObject(readbackEvent, ms); }
@@ -1039,7 +1039,7 @@ index 8d6a8e7..14f9a83 100644
          };
  #elif defined(__APPLE__) || defined(__linux__)
          // POSIX version of the live ring above: shm_open mapping, events as shared words
-@@ -352,6 +473,9 @@ namespace ps2_gsdump
+@@ -362,6 +483,9 @@ namespace ps2_gsdump
                      argv.push_back(arg.data());
                  argv.push_back(nullptr);
  
@@ -1049,7 +1049,7 @@ index 8d6a8e7..14f9a83 100644
                  posix_spawn_file_actions_t actions;
                  posix_spawn_file_actions_init(&actions);
                  const std::string dir = std::filesystem::path(exe).parent_path().string();
-@@ -376,12 +500,14 @@ namespace ps2_gsdump
+@@ -386,12 +510,14 @@ namespace ps2_gsdump
                  return hostExited;
              }
  
@@ -1066,7 +1066,7 @@ index 8d6a8e7..14f9a83 100644
                      const int64_t r = header->readPos;
                      const uint64_t used = static_cast<uint64_t>(w - r);
                      const uint64_t freeBytes = capacity - used;
-@@ -389,6 +515,7 @@ namespace ps2_gsdump
+@@ -399,6 +525,7 @@ namespace ps2_gsdump
                      {
                          if (hostGone())
                              return false;
@@ -1074,7 +1074,7 @@ index 8d6a8e7..14f9a83 100644
                          ps2live::eventSet(&events->data);
                          const uint64_t waitStart = ps2xStatTicks();
                          header->producerWaiting = 1u;
-@@ -402,21 +529,44 @@ namespace ps2_gsdump
+@@ -412,21 +539,44 @@ namespace ps2_gsdump
                      const uint64_t offset = static_cast<uint64_t>(w) % capacity;
                      const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
                      std::memcpy(data + offset, src, chunk);
@@ -1125,35 +1125,29 @@ index 8d6a8e7..14f9a83 100644
          };
  #endif
  
-@@ -458,7 +608,7 @@ namespace ps2_gsdump
-                 return file != nullptr;
+@@ -492,7 +642,7 @@ namespace ps2_gsdump
              }
+ #endif
  
 -            void write(const void *data, size_t size)
 +            void write(const void *data, size_t size, bool publish = true)
              {
                  if (size == 0)
                      return;
-@@ -481,7 +631,7 @@ namespace ps2_gsdump
+@@ -515,8 +665,11 @@ namespace ps2_gsdump
                  }
                  if (liveActive)
                  {
 -                    if (!live.write(static_cast<const uint8_t *>(data), size))
 +                    if (!live.write(static_cast<const uint8_t *>(data), size, publish))
-                     {
- #if defined(_WIN32)
-                         DWORD exitCode = 0;
-@@ -501,6 +651,9 @@ namespace ps2_gsdump
-                         std::_Exit(0);
- #endif
-                     }
+                         hostClosed();
 +                    // PS2X_GS_DUMP with the live host: the dump gets the same stream.
 +                    if (file)
 +                        std::fwrite(data, 1, size, file);
                      bytes += size;
                      return;
                  }
-@@ -513,11 +666,15 @@ namespace ps2_gsdump
+@@ -529,11 +682,15 @@ namespace ps2_gsdump
              void writeByte(uint8_t value) { write(&value, 1); }
              void writeWord(uint32_t value) { write(&value, 4); }
  
@@ -1171,7 +1165,7 @@ index 8d6a8e7..14f9a83 100644
  #endif
              }
  
-@@ -528,6 +685,10 @@ namespace ps2_gsdump
+@@ -544,6 +701,10 @@ namespace ps2_gsdump
                      std::fclose(file);
                      file = nullptr;
                  }
@@ -1182,7 +1176,7 @@ index 8d6a8e7..14f9a83 100644
                  finished = true;
              }
  
-@@ -539,8 +700,8 @@ namespace ps2_gsdump
+@@ -555,8 +716,8 @@ namespace ps2_gsdump
                  if (headerWritten || !enabled())
                      return;
                  headerWritten = true;
@@ -1193,7 +1187,7 @@ index 8d6a8e7..14f9a83 100644
                  writeWord(0xFFFFFFFFu);
                  writeWord(static_cast<uint32_t>(sizeof(DumpHeader)) + serialSize);
                  DumpHeader header{};
-@@ -551,7 +712,7 @@ namespace ps2_gsdump
+@@ -567,7 +728,7 @@ namespace ps2_gsdump
                  header.crc = 0u;
                  header.screenshot_offset = header.serial_offset + serialSize;
                  write(&header, sizeof(header));
@@ -1202,7 +1196,7 @@ index 8d6a8e7..14f9a83 100644
                  write(regs.data(), regs.size());
              }
  
-@@ -591,7 +752,21 @@ namespace ps2_gsdump
+@@ -607,7 +768,21 @@ namespace ps2_gsdump
                      if (init.live.open() && init.live.launchHost())
                      {
                          init.liveActive = true;
@@ -1225,7 +1219,7 @@ index 8d6a8e7..14f9a83 100644
                      }
                      else
                      {
-@@ -673,6 +848,16 @@ namespace ps2_gsdump
+@@ -689,6 +864,16 @@ namespace ps2_gsdump
  #endif
      }
  
@@ -1242,7 +1236,7 @@ index 8d6a8e7..14f9a83 100644
      bool inputFocused()
      {
  #if defined(_WIN32)
-@@ -719,15 +904,44 @@ namespace ps2_gsdump
+@@ -735,15 +920,44 @@ namespace ps2_gsdump
  #endif
      }
  
@@ -1292,7 +1286,7 @@ index 8d6a8e7..14f9a83 100644
          }
  
          // Appends PATH3 data and sends every GIF packet completed so far (see Writer::path3Pending).
-@@ -863,6 +1077,70 @@ namespace ps2_gsdump
+@@ -879,6 +1093,70 @@ namespace ps2_gsdump
          w.endPacket();
      }
  
@@ -1363,7 +1357,7 @@ index 8d6a8e7..14f9a83 100644
      bool remoteVu()
      {
  #if defined(PS2X_GS_LIVE_RING)
-@@ -886,10 +1164,11 @@ namespace ps2_gsdump
+@@ -902,10 +1180,11 @@ namespace ps2_gsdump
          std::lock_guard<std::mutex> lock(w.mutex);
          if (!w.usable())
              return;
@@ -1379,7 +1373,7 @@ index 8d6a8e7..14f9a83 100644
      }
  
      void vif1(const Span *spans, size_t count)
-@@ -905,16 +1184,17 @@ namespace ps2_gsdump
+@@ -921,16 +1200,17 @@ namespace ps2_gsdump
          std::lock_guard<std::mutex> lock(w.mutex);
          if (!w.usable())
              return;
@@ -1401,7 +1395,7 @@ index 8d6a8e7..14f9a83 100644
      }
  
      void vif1Register(uint32_t address, uint32_t value)
-@@ -943,6 +1223,21 @@ namespace ps2_gsdump
+@@ -959,6 +1239,21 @@ namespace ps2_gsdump
          w.writeByte(kTypeVSync);
          w.writeByte(static_cast<uint8_t>(field & 1));
          w.endPacket();
@@ -4027,10 +4021,10 @@ index aaae6a6..2b1914a 100644
          {
              m_path3MaskedFifo.emplace_back(data, data + sizeBytes);
 diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
-index 7e83d49..60545d6 100644
+index 077a8a6..f07eef5 100644
 --- a/ps2xRuntime/src/lib/ps2_runtime.cpp
 +++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
-@@ -66,6 +66,54 @@ namespace
+@@ -81,6 +81,54 @@ namespace
          AudioStream stream{};
          bool ready = false;
          std::vector<int16_t> buffer;
@@ -4085,7 +4079,7 @@ index 7e83d49..60545d6 100644
  
          void start()
          {
-@@ -90,6 +138,7 @@ namespace
+@@ -105,6 +153,7 @@ namespace
              {
                  std::vector<int16_t> discard((queued - kTrimTo) * 2u);
                  (void)ps2x::iop::readAudioFrames(discard.data(), queued - kTrimTo);
@@ -4093,7 +4087,7 @@ index 7e83d49..60545d6 100644
              }
  #if defined(__EMSCRIPTEN__)
              // Browser: the ring buffer takes any amount, so only real samples go out (no zero
-@@ -109,12 +158,47 @@ namespace
+@@ -124,12 +173,47 @@ namespace
              {
                  const size_t got = ps2x::iop::readAudioFrames(buffer.data(), kFrames);
                  std::fill(buffer.begin() + static_cast<std::ptrdiff_t>(got * 2u), buffer.end(), int16_t{0});
@@ -4141,7 +4135,7 @@ index 7e83d49..60545d6 100644
              if (!ready)
                  return;
              StopAudioStream(stream);
-@@ -1767,8 +1851,17 @@ const char *ps2DispatchHistoryText()
+@@ -1786,8 +1870,17 @@ const char *ps2DispatchHistoryText()
      return text.c_str();
  }
  
@@ -4159,7 +4153,7 @@ index 7e83d49..60545d6 100644
      // The TSC is read on every guest dispatch, so it is converted to EE cycles with a ratio
      // calibrated once against the steady clock instead of calling the clock each time.
      struct CountClock
-@@ -3362,11 +3455,10 @@ void PS2Runtime::run()
+@@ -3381,11 +3474,10 @@ void PS2Runtime::run()
          spu2Output.pump();
          uint32_t presentWidth = FB_WIDTH;
          uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
