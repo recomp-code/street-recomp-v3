@@ -14,7 +14,7 @@ param(
 )
 $R = $Root
 $rt = "$R\PS2Recomp\out\build\ps2xRuntime\Release"
-$iso = 'C:\NBAStreetRecomp\game\iso'
+$iso = if ($env:NBA_TEST_DATA) { $env:NBA_TEST_DATA } else { 'C:\NBAStreetRecomp\game\iso' }
 $out = "$R\logs\$Tag"
 New-Item -ItemType Directory -Force $out | Out-Null
 Get-ChildItem $out -File -ErrorAction SilentlyContinue | Remove-Item -Force

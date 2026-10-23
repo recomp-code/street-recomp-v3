@@ -14,8 +14,12 @@ The EA online mode (PLAY ONLINE, the community lobby server) is untouched and wo
 ## Status
 
 Two games on one PC through a local relay: intros, menus, USER SETUP with player 2 on the other machine, CHOOSE
-TEAM, and a match, **226/226 equal state hashes, 0 desyncs**. Not in a release yet: the Recomp launcher profile
-and packs come next.
+TEAM, and a match, **226/226 equal state hashes, 0 desyncs**; then through two Recomp launchers against a local
+server (A invites B, both games start online by themselves): a match, 149/149 equal hashes.
+
+It is played from [Recomp](https://github.com/recomp-code/recomp-online/releases/latest) 3.2 or newer (**+ Agregar juego** ->
+NBA Street V3): the release carries `NBAStreetV3_Windows_Recomp.zip` and `recomp-game.json`, built by
+`tools/online/make_pack.ps1` (the runtime, the shared GS host and `tools/online/presets`).
 
 ## Build
 
