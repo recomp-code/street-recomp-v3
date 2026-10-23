@@ -1,0 +1,4258 @@
+diff --git a/ps2xIOP/include/ps2x/iop/iop_host.h b/ps2xIOP/include/ps2x/iop/iop_host.h
+index 1eceb08..1617c9b 100644
+--- a/ps2xIOP/include/ps2x/iop/iop_host.h
++++ b/ps2xIOP/include/ps2x/iop/iop_host.h
+@@ -5,6 +5,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <functional>
+ #include <string>
+ #include <string_view>
+ 
+@@ -53,6 +54,15 @@ namespace ps2x::iop
+         std::array<uint32_t, 5> arguments{};
+     };
+ 
++    // An RPC server the EE registered (sceSifRegisterRpc), as an IOP client binds it.
++    struct EeRpcServerInfo
++    {
++        uint32_t serverData = 0; // EE SifRpcServerData_t address (the client's "server")
++        uint32_t function = 0;
++        uint32_t buffer = 0;
++        uint32_t clientBuffer = 0;
++    };
++
+     class IopHost
+     {
+     public:
+@@ -109,6 +119,18 @@ namespace ps2x::iop
+ 
+         virtual int32_t memoryCard(const MemoryCardRequest &request) = 0;
+ 
++        // Disc sectors as the EE side numbers them (cdvdman reads by an IRX use LSNs the game got
++        // from its own sceCdSearchFile). False when the host has no such mapping: the IOP then
++        // reads the configured image or its virtual ISO.
++        virtual bool readCdSectors(uint32_t lsn, uint32_t sectors, void *destination, size_t size)
++        {
++            (void)lsn;
++            (void)sectors;
++            (void)destination;
++            (void)size;
++            return false;
++        }
++
+         virtual bool hasGuestFunction(uint32_t address) const = 0;
+         virtual bool invokeGuestFunction(uint64_t callToken,
+                                          uint32_t address,
+@@ -130,6 +152,30 @@ namespace ps2x::iop
+             return false;
+         }
+ 
++        // IOP -> EE RPC (an IRX binding/calling a server the EE game registered). The defaults
++        // report no EE servers, so sceSifBindRpc keeps retrying as on a host without them.
++        virtual bool findEeRpcServer(uint32_t sid, EeRpcServerInfo &info) const
++        {
++            (void)sid;
++            info = {};
++            return false;
++        }
++        // Copies sendSize bytes to the server buffer and runs its function (fno, buffer, sendSize)
++        // on the EE; onComplete gets the returned reply pointer (EE address) when it is done.
++        virtual bool callEeRpcServer(uint32_t sid,
++                                     uint32_t function,
++                                     const void *sendData,
++                                     size_t sendSize,
++                                     std::function<void(uint32_t resultAddress)> onComplete)
++        {
++            (void)sid;
++            (void)function;
++            (void)sendData;
++            (void)sendSize;
++            (void)onComplete;
++            return false;
++        }
++
+         virtual void log(LogLevel level, std::string_view message) = 0;
+     };
+ }
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.cpp b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+index cfdf0c2..b0f8455 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.cpp
++++ b/ps2xIOP/src/emulator/core/iop_kernel.cpp
+@@ -30,6 +30,8 @@ namespace ps2x::iop::detail
+         m_semaphores.clear();
+         m_eventFlags.clear();
+         m_messageBoxes.clear();
++        m_variablePools.clear(); // their RAM goes with IopMemory::reset()
++        m_nextVariablePoolId = 1;
+         m_nextThreadId = 1;
+         m_nextSemaphoreId = 1;
+         m_nextEventFlagId = 1;
+@@ -326,6 +328,7 @@ namespace ps2x::iop::detail
+         case IopThreadState::Semaphore:
+         case IopThreadState::EventFlag:
+         case IopThreadState::MessageBox:
++        case IopThreadState::RpcWait:
+             status = 0x04u;
+             break;
+         case IopThreadState::Suspended:
+@@ -673,6 +676,24 @@ namespace ps2x::iop::detail
+         cpu.yielded = true;
+     }
+ 
++    int IopKernel::blockCurrentOnRpc(IopCpuState &cpu)
++    {
++        // A synchronous guest call (interrupt handler, module start) runs on its own CpuState and
++        // cannot be suspended.
++        if (m_currentThread == nullptr || &m_currentThread->cpu != &cpu)
++            return 0;
++        m_currentThread->state = IopThreadState::RpcWait;
++        cpu.yielded = true;
++        return m_currentThread->id;
++    }
++
++    void IopKernel::resumeRpcWaiter(int id)
++    {
++        const auto it = m_threads.find(id);
++        if (it != m_threads.end() && it->second.state == IopThreadState::RpcWait)
++            it->second.state = IopThreadState::Ready;
++    }
++
+     IopThread *IopKernel::beginNextReady(uint64_t currentCycle)
+     {
+         for (auto &[id, thread] : m_threads)
+@@ -876,6 +897,178 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
++    uint32_t IopKernel::allocateFromPool(VariablePool &pool, uint32_t size)
++    {
++        const uint32_t wanted = alignUp(std::max<uint32_t>(size, 1u), 16u);
++        for (auto block = pool.freeBlocks.begin(); block != pool.freeBlocks.end(); ++block)
++        {
++            if (block->second < wanted)
++                continue;
++            const uint32_t address = block->first;
++            const uint32_t remaining = block->second - wanted;
++            pool.freeBlocks.erase(block);
++            if (remaining != 0u)
++                pool.freeBlocks.emplace(address + wanted, remaining);
++            pool.usedBlocks.emplace(address, wanted);
++            return address;
++        }
++        return 0u;
++    }
++
++    bool IopKernel::freeToPool(VariablePool &pool, uint32_t address)
++    {
++        const auto used = pool.usedBlocks.find(address);
++        if (used == pool.usedBlocks.end())
++            return false;
++        uint32_t start = used->first;
++        uint32_t size = used->second;
++        pool.usedBlocks.erase(used);
++
++        // Merge with the free neighbours on both sides.
++        auto next = pool.freeBlocks.lower_bound(start);
++        if (next != pool.freeBlocks.end() && next->first == start + size)
++        {
++            size += next->second;
++            next = pool.freeBlocks.erase(next);
++        }
++        if (next != pool.freeBlocks.begin())
++        {
++            auto previous = std::prev(next);
++            if (previous->first + previous->second == start)
++            {
++                start = previous->first;
++                size += previous->second;
++                pool.freeBlocks.erase(previous);
++            }
++        }
++        pool.freeBlocks.emplace(start, size);
++        return true;
++    }
++
++    // thvpool: CreateVpl(4) DeleteVpl(5) AllocateVpl(6) pAllocateVpl(7) ipAllocateVpl(8)
++    // FreeVpl(9) ReferVplStatus(11) iReferVplStatus(12). The pool is one allocation from the
++    // IOP heap; blocks are tracked host-side (16-byte granules), so the guest sees no headers.
++    bool IopKernel::dispatchVplImport(uint16_t ordinal, IopCpuState &cpu)
++    {
++        constexpr int32_t kErrorNoMemory = -400;    // KE_NO_MEMORY
++        constexpr int32_t kErrorIllegalSize = -404; // KE_ILLEGAL_SIZE
++        constexpr int32_t kErrorUnknownVpl = -411;  // KE_UNKNOWN_VPLID
++        constexpr int32_t kErrorIllegalBlock = -412;
++        const auto setV0 = [&](int32_t value)
++        {
++            cpu.gpr[2] = static_cast<uint32_t>(value);
++        };
++
++        switch (ordinal)
++        {
++        case 4: // CreateVpl(iop_vpl_param_t {attr, option, size})
++        {
++            const uint32_t descriptor = cpu.gpr[4];
++            VariablePool pool;
++            if (descriptor != 0u)
++            {
++                pool.attr = m_memory.read32(descriptor + 0u);
++                pool.option = m_memory.read32(descriptor + 4u);
++                pool.size = alignUp(m_memory.read32(descriptor + 8u), 16u);
++            }
++            if (pool.size == 0u)
++            {
++                setV0(kErrorIllegalSize);
++                return true;
++            }
++            pool.base = m_memory.allocate(pool.size, 16u);
++            if (pool.base == 0u)
++            {
++                setV0(kErrorNoMemory);
++                return true;
++            }
++            pool.id = static_cast<int>(m_nextVariablePoolId++);
++            pool.freeBlocks.emplace(pool.base, pool.size);
++            const int id = pool.id;
++            m_variablePools.emplace(id, std::move(pool));
++            setV0(id);
++            return true;
++        }
++        case 5: // DeleteVpl(id)
++        {
++            const auto it = m_variablePools.find(static_cast<int>(cpu.gpr[4]));
++            if (it == m_variablePools.end())
++            {
++                setV0(kErrorUnknownVpl);
++                return true;
++            }
++            (void)m_memory.freeAllocation(it->second.base);
++            m_variablePools.erase(it);
++            setV0(0);
++            return true;
++        }
++        case 6: // AllocateVpl(id, size)
++        case 7: // pAllocateVpl(id, size)
++        case 8: // ipAllocateVpl(id, size)
++        {
++            const auto it = m_variablePools.find(static_cast<int>(cpu.gpr[4]));
++            if (it == m_variablePools.end())
++            {
++                setV0(kErrorUnknownVpl);
++                return true;
++            }
++            const uint32_t address = allocateFromPool(it->second, cpu.gpr[5]);
++            if (address == 0u)
++            {
++                // AllocateVpl would wait for a FreeVpl; nothing here frees for it, so fail.
++                static uint32_t s_exhaustedLogs = 0;
++                if (s_exhaustedLogs < 8u)
++                {
++                    ++s_exhaustedLogs;
++                    std::fprintf(stderr, "[IOP] vpl %d exhausted: ordinal=%u size=0x%x pool=0x%x\n",
++                                 it->second.id, static_cast<unsigned>(ordinal), cpu.gpr[5], it->second.size);
++                }
++                setV0(kErrorNoMemory);
++                return true;
++            }
++            cpu.gpr[2] = address;
++            return true;
++        }
++        case 9: // FreeVpl(id, block)
++        {
++            const auto it = m_variablePools.find(static_cast<int>(cpu.gpr[4]));
++            if (it == m_variablePools.end())
++            {
++                setV0(kErrorUnknownVpl);
++                return true;
++            }
++            setV0(freeToPool(it->second, cpu.gpr[5]) ? 0 : kErrorIllegalBlock);
++            return true;
++        }
++        case 11: // ReferVplStatus(id, iop_vpl_info_t *)
++        case 12: // iReferVplStatus
++        {
++            const auto it = m_variablePools.find(static_cast<int>(cpu.gpr[4]));
++            if (it == m_variablePools.end())
++            {
++                setV0(kErrorUnknownVpl);
++                return true;
++            }
++            const uint32_t info = cpu.gpr[5];
++            if (info != 0u)
++            {
++                uint32_t freeSize = 0u;
++                for (const auto &[address, size] : it->second.freeBlocks)
++                    freeSize += size;
++                (void)m_memory.zeroRam(info, 32u);
++                m_memory.write32(info + 0u, it->second.attr);
++                m_memory.write32(info + 4u, it->second.option);
++                m_memory.write32(info + 8u, it->second.size);
++                m_memory.write32(info + 12u, freeSize);
++            }
++            setV0(0);
++            return true;
++        }
++        default:
++            return false;
++        }
++    }
++
+     std::string IopKernel::describeThreads() const
+     {
+         std::string out;
+diff --git a/ps2xIOP/src/emulator/core/iop_kernel.h b/ps2xIOP/src/emulator/core/iop_kernel.h
+index 6f5f995..e54ae23 100644
+--- a/ps2xIOP/src/emulator/core/iop_kernel.h
++++ b/ps2xIOP/src/emulator/core/iop_kernel.h
+@@ -24,6 +24,7 @@ namespace ps2x::iop::detail
+         Suspended,
+         Dead,
+         MessageBox,
++        RpcWait, // blocking sceSifCallRpc to an EE server, until its reply arrives
+     };
+ 
+     struct IopThread
+@@ -57,12 +58,16 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool dispatchSemaphoreImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] bool dispatchEventImport(uint16_t ordinal, IopCpuState &cpu);
+         [[nodiscard]] bool dispatchMessageBoxImport(uint16_t ordinal, IopCpuState &cpu);
++        [[nodiscard]] bool dispatchVplImport(uint16_t ordinal, IopCpuState &cpu);
+ 
+         [[nodiscard]] int createInternalEventFlag(uint32_t attr, uint32_t option, uint32_t bits);
+         [[nodiscard]] bool setInternalEventFlag(int id, uint32_t bits);
+ 
+         void sleepCurrent(IopCpuState &cpu);
+         void delayCurrentUntil(uint64_t wakeCycle, IopCpuState &cpu);
++        // Blocks the thread running on cpu until resumeRpcWaiter(id); 0 when cpu is not a thread's.
++        [[nodiscard]] int blockCurrentOnRpc(IopCpuState &cpu);
++        void resumeRpcWaiter(int id);
+ 
+         [[nodiscard]] IopThread *beginNextReady(uint64_t currentCycle);
+         [[nodiscard]] const IopThread *currentThread() const { return m_currentThread; }
+@@ -101,6 +106,21 @@ namespace ps2x::iop::detail
+             std::deque<uint32_t> messages; // guest addresses of iop_message_t
+         };
+ 
++        // Variable-length memory pool: one IOP allocation, first-fit inside it.
++        struct VariablePool
++        {
++            int id = 0;
++            uint32_t attr = 0;
++            uint32_t option = 0;
++            uint32_t base = 0;
++            uint32_t size = 0;
++            std::map<uint32_t, uint32_t> freeBlocks; // address -> size
++            std::map<uint32_t, uint32_t> usedBlocks; // address -> size
++        };
++
++        [[nodiscard]] static uint32_t allocateFromPool(VariablePool &pool, uint32_t size);
++        [[nodiscard]] static bool freeToPool(VariablePool &pool, uint32_t address);
++
+         [[nodiscard]] bool referThreadStatus(int id, uint32_t outputAddress);
+         void wakeOneSemaphore(int id);
+         [[nodiscard]] static bool eventSatisfied(const EventFlag &event, uint32_t bits, uint32_t mode);
+@@ -111,7 +131,9 @@ namespace ps2x::iop::detail
+         std::map<int, Semaphore> m_semaphores;
+         std::map<int, EventFlag> m_eventFlags;
+         std::map<int, MessageBox> m_messageBoxes;
++        std::map<int, VariablePool> m_variablePools;
+         uint32_t m_nextMessageBoxId = 1;
++        uint32_t m_nextVariablePoolId = 1;
+         uint32_t m_nextThreadId = 1;
+         uint32_t m_nextSemaphoreId = 1;
+         uint32_t m_nextEventFlagId = 1;
+diff --git a/ps2xIOP/src/emulator/core/iop_memory.h b/ps2xIOP/src/emulator/core/iop_memory.h
+index e0e61bd..2dc4241 100644
+--- a/ps2xIOP/src/emulator/core/iop_memory.h
++++ b/ps2xIOP/src/emulator/core/iop_memory.h
+@@ -25,6 +25,8 @@ namespace ps2x::iop::detail
+         static constexpr uint32_t Spu2End = 0x1FA00000u;
+         static constexpr uint32_t SifBase = 0x1D000000u;
+         static constexpr uint32_t SifEnd = 0x1D001000u;
++        // IRX images load from 0x10000 up to HeapBase: NBA Street V3 loads EA's modules and the network stack
++        // (Bloody Roar 4's port moves it to 0xA0000 for a bigger heap).
+         static constexpr uint32_t HeapBase = 0x00120000u;
+         static constexpr uint32_t HeapLimit = 0x001F0000u;
+ 
+@@ -62,6 +64,7 @@ namespace ps2x::iop::detail
+         [[nodiscard]] bool freeAllocation(uint32_t address);
+         [[nodiscard]] uint32_t maxFreeMemory() const;
+         [[nodiscard]] std::optional<Allocation> allocationContaining(uint32_t address) const;
++        [[nodiscard]] const std::vector<Allocation> &allocations() const noexcept { return m_allocations; }
+ 
+         [[nodiscard]] uint32_t interruptStatus() const noexcept { return m_interruptStatus; }
+         [[nodiscard]] uint32_t interruptMask() const noexcept { return m_interruptMask; }
+diff --git a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+index dcfd3d4..718c612 100644
+--- a/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_cdvd.cpp
+@@ -231,14 +231,15 @@ namespace ps2x::iop::detail
+ 
+             case 6: // sceCdRead
+             {
++                const bool ok = readSectors(a0, a1, a2);
+                 static uint32_t s_readLogs = 0u;
+                 if (s_readLogs < 2000u)
+                 {
+                     ++s_readLogs;
+-                    std::fprintf(stderr, "[iop:cdread] lsn=%u sectors=%u dst=0x%x ra=0x%x\n", a0, a1, a2, cpu.gpr[31]);
++                    std::fprintf(stderr, "[iop:cdread] lsn=%u sectors=%u dst=0x%x ra=0x%x mode=0x%x -> %s\n", a0, a1, a2, cpu.gpr[31],
++                                 cpu.gpr[7], ok ? "ok" : "error");
+                 }
+-            }
+-                if (readSectors(a0, a1, a2))
++                if (ok)
+                 {
+                     signalCommandComplete();
+                     if (callback.address != 0u)
+@@ -254,6 +255,7 @@ namespace ps2x::iop::detail
+                 else
+                     cpu.gpr[2] = 0u;
+                 return true;
++            }
+ 
+             case 7: // sceCdSeek
+                 currentLsn = a0;
+@@ -714,8 +716,10 @@ namespace ps2x::iop::detail
+             const size_t byteCount = static_cast<size_t>(byteCount64);
+             std::vector<uint8_t> bytes(byteCount, 0u);
+ 
+-            bool read = false;
+-            const std::string imagePath = host.hostPath(HostPathKind::CdImage);
++            // The host first: the LSNs come from the game's own sceCdSearchFile (pseudo LSNs for
++            // files the host serves from an extracted directory).
++            bool read = host.readCdSectors(lsn, sectors, bytes.data(), byteCount);
++            const std::string imagePath = read ? std::string() : host.hostPath(HostPathKind::CdImage);
+             if (!imagePath.empty())
+             {
+                 if (imageHandle == 0u)
+diff --git a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+index 83c801e..d267244 100644
+--- a/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
++++ b/ps2xIOP/src/emulator/imports/iop_sysmem.cpp
+@@ -4,6 +4,7 @@
+ #include "../core/iop_memory.h"
+ #include "ps2x/iop/iop_host.h"
+ 
++#include <cstdio>
+ #include <string>
+ 
+ namespace ps2x::iop::detail
+@@ -32,9 +33,20 @@ namespace ps2x::iop::detail
+                                          : m_memory.allocate(a1, 16u);
+             if (address == 0u)
+             {
++                // Which blocks hold the heap (16 KB and up), to tell leaks from a small heap.
++                std::string blocks;
++                char item[32];
++                for (const IopMemory::Allocation &block : m_memory.allocations())
++                {
++                    if (block.size < 0x4000u)
++                        continue;
++                    std::snprintf(item, sizeof(item), " %x+%x", block.address, block.size);
++                    blocks += item;
++                }
+                 m_host.log(LogLevel::Warning, "[IOP] AllocSysMemory failed: type=" + std::to_string(a0) +
+                                                   " size=" + std::to_string(a1) +
+-                                                  " maxFree=" + std::to_string(m_memory.maxFreeMemory()));
++                                                  " maxFree=" + std::to_string(m_memory.maxFreeMemory()) +
++                                                  " blocks:" + blocks);
+             }
+             setV0(address);
+             return true;
+diff --git a/ps2xIOP/src/emulator/iop_emulator.cpp b/ps2xIOP/src/emulator/iop_emulator.cpp
+index 5967477..ab6bf59 100644
+--- a/ps2xIOP/src/emulator/iop_emulator.cpp
++++ b/ps2xIOP/src/emulator/iop_emulator.cpp
+@@ -282,7 +282,7 @@ namespace ps2x::iop::detail
+             static constexpr std::string_view kHle[] = {
+                 "cdvdman", "dmacman", "heaplib", "intrman", "ioman", "loadcore", "modload",
+                 "secrman", "sifcmd", "sifman", "stdio", "sysclib", "sysmem", "thbase",
+-                "thevent", "thmsgbx", "threadman", "thsemap", "timrman", "vblank"};
++                "thevent", "thmsgbx", "threadman", "thsemap", "thvpool", "timrman", "vblank"};
+             for (const std::string_view name : kHle)
+                 if (iequals(library, name))
+                     return true;
+@@ -344,9 +344,15 @@ namespace ps2x::iop::detail
+                            ? ImportDisposition::Handled
+                            : ImportDisposition::Missing;
+             }
++            if (iequals(call.library, "thvpool"))
++            {
++                return kernel.dispatchVplImport(call.ordinal, cpu)
++                           ? ImportDisposition::Handled
++                           : ImportDisposition::Missing;
++            }
+             if (iequals(call.library, "sifcmd"))
+             {
+-                return rpc.dispatchSifCmdImport(call.ordinal, cpu)
++                return rpc.dispatchSifCmdImport(call.ordinal, cpu, *this)
+                            ? ImportDisposition::Handled
+                            : ImportDisposition::Missing;
+             }
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.cpp b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+index ba1037b..e8aee33 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.cpp
++++ b/ps2xIOP/src/emulator/services/iop_rpc.cpp
+@@ -8,6 +8,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
+ #include <limits>
+ #include <vector>
+@@ -23,6 +24,8 @@ namespace ps2x::iop::detail
+     {
+         m_servers.clear();
+         m_cmdHandlers.clear();
++        m_eeClients.clear();
++        ++m_generation;
+         std::fill(std::begin(m_sregs), std::end(m_sregs), 0u);
+         m_nextDmaId = 1u;
+         m_sifInitialized = false;
+@@ -165,7 +168,115 @@ namespace ps2x::iop::detail
+         }
+     }
+ 
+-    bool IopRpcBridge::dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu)
++    bool IopRpcBridge::bindEeRpc(IopCpuState &cpu)
++    {
++        // SifRpcClientData_t: hdr {pkt_addr, rpc_id, sema_id, mode} 0x00, command 0x10, buff 0x14,
++        // cbuff 0x18, end_function 0x1C, end_param 0x20, server 0x24.
++        const uint32_t client = cpu.gpr[4];
++        const uint32_t sid = cpu.gpr[5];
++        EeRpcServerInfo server{};
++        if (client == 0u || !m_memory.ownsRamRange(client, 0x28u) || !m_host.findEeRpcServer(sid, server))
++            return false;
++
++        m_memory.write32(client + 0x0Cu, cpu.gpr[6]);
++        m_memory.write32(client + 0x10u, 0u);
++        m_memory.write32(client + 0x14u, server.buffer);
++        m_memory.write32(client + 0x18u, server.clientBuffer);
++        m_memory.write32(client + 0x1Cu, 0u);
++        m_memory.write32(client + 0x20u, 0u);
++        m_memory.write32(client + 0x24u, server.serverData);
++        m_eeClients[client] = sid;
++
++        static uint32_t s_bindLogs = 0;
++        if (s_bindLogs < 16u)
++        {
++            ++s_bindLogs;
++            std::fprintf(stderr, "[IOP->EE rpc] bind client=0x%x sid=0x%x server=0x%x func=0x%x buff=0x%x\n",
++                         client, sid, server.serverData, server.function, server.buffer);
++        }
++        return true;
++    }
++
++    bool IopRpcBridge::callEeRpc(IopCpuState &cpu, IopGuestExecutor &executor)
++    {
++        const uint32_t client = cpu.gpr[4];
++        const auto bound = m_eeClients.find(client);
++        if (bound == m_eeClients.end())
++            return false;
++
++        const uint32_t sid = bound->second;
++        const uint32_t function = cpu.gpr[5];
++        const uint32_t mode = cpu.gpr[6];
++        const uint32_t send = cpu.gpr[7];
++        const uint32_t stackPointer = cpu.gpr[29];
++        const uint32_t sendSize = m_memory.read32(stackPointer + 16u);
++        const uint32_t receive = m_memory.read32(stackPointer + 20u);
++        const uint32_t receiveSize = m_memory.read32(stackPointer + 24u);
++        const uint32_t endFunction = m_memory.read32(stackPointer + 28u);
++        const uint32_t endParameter = m_memory.read32(stackPointer + 32u);
++        const uint32_t gp = cpu.gpr[28];
++
++        m_memory.write32(client + 0x0Cu, mode);
++        m_memory.write32(client + 0x10u, function);
++        m_memory.write32(client + 0x1Cu, endFunction);
++        m_memory.write32(client + 0x20u, endParameter);
++
++        std::vector<uint8_t> payload;
++        if (send != 0u && sendSize != 0u && m_memory.ownsRamRange(send, sendSize))
++        {
++            payload.resize(sendSize);
++            (void)m_memory.readRam(send, payload.data(), payload.size());
++        }
++
++        // Blocking mode: the caller sleeps until the EE server has run and the reply is copied.
++        // The IOP runs inline on the EE executor thread (EeScheduler::accountCycles), and the EE
++        // invocation's completion runs there too, outside any IOP slice.
++        const bool blocking = (mode & 1u) == 0u;
++        const int waiter = blocking ? m_kernel.blockCurrentOnRpc(cpu) : 0;
++        const uint32_t generation = m_generation;
++        IopGuestExecutor *const callbackExecutor = &executor;
++        auto complete = [this, generation, sid, function, sendSize, receive, receiveSize, endFunction, endParameter, gp, waiter,
++                         callbackExecutor](uint32_t result)
++        {
++            if (generation != m_generation)
++                return;
++            if (receive != 0u && receiveSize != 0u && result != 0u && m_memory.ownsRamRange(receive, receiveSize))
++            {
++                std::vector<uint8_t> reply(receiveSize);
++                if (m_host.readGuest(result, reply.data(), reply.size()))
++                    (void)m_memory.writeRam(receive, reply.data(), reply.size());
++            }
++
++            static uint32_t s_callLogs = 0;
++            if (s_callLogs < 32u)
++            {
++                ++s_callLogs;
++                std::fprintf(stderr, "[IOP->EE rpc] sid=0x%x fno=0x%x ssize=%u rsize=%u -> v0=0x%x\n",
++                             sid, function, sendSize, receiveSize, result);
++            }
++
++            // Like the SIF RPC end handler: end_function (both modes), then wake a blocked caller.
++            if (endFunction != 0u)
++                (void)callbackExecutor->executeGuestFunction(endFunction, endParameter, 0u, 0u, 0u, gp);
++            if (waiter != 0)
++                m_kernel.resumeRpcWaiter(waiter);
++        };
++
++        if (!m_host.callEeRpcServer(sid, function, payload.empty() ? nullptr : payload.data(), payload.size(), std::move(complete)))
++        {
++            static uint32_t s_failLogs = 0;
++            if (s_failLogs < 8u)
++            {
++                ++s_failLogs;
++                std::fprintf(stderr, "[IOP->EE rpc] sid=0x%x fno=0x%x: EE server unavailable\n", sid, function);
++            }
++            if (waiter != 0)
++                m_kernel.resumeRpcWaiter(waiter);
++        }
++        return true;
++    }
++
++    bool IopRpcBridge::dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor)
+     {
+         const auto setV0 = [&](uint32_t value)
+         {
+@@ -207,8 +318,14 @@ namespace ps2x::iop::detail
+         case 8:
+         case 9:
+         case 14: // InitRpc
+-        case 15:
+-        case 16:
++            setV0(0);
++            return true;
++        case 15: // sceSifBindRpc(client, sid, mode): EE-registered servers bind, others keep retrying
++            (void)bindEeRpc(cpu);
++            setV0(0);
++            return true;
++        case 16: // sceSifCallRpc(client, fno, mode, send, ssize, receive, rsize, end_function, end_param)
++            (void)callEeRpc(cpu, executor);
+             setV0(0);
+             return true;
+         case 12: // sceSifSendCmd
+@@ -351,17 +468,19 @@ namespace ps2x::iop::detail
+             }
+         }
+ 
++        // PS2X_IOP_RPC_LOG=n: log the first n calls (default 32) with their first send/reply words.
++        static const uint32_t s_rpcLogLimit = []
+         {
+-            static uint32_t s_rpcLogs = 0;
+-            if (s_rpcLogs < 32u)
+-            {
+-                ++s_rpcLogs;
+-                uint32_t firstWord = 0u;
+-                (void)m_memory.readRam(server.buffer, &firstWord, sizeof(firstWord));
+-                std::fprintf(stderr, "[IOP rpc] sid=0x%x fn=0x%x func=0x%x buffer=0x%x send=0x%x/0x%x first=0x%x\n",
+-                             request.sid, request.function, server.function, server.buffer,
+-                             request.send.address, request.send.size, firstWord);
+-            }
++            const char *value = std::getenv("PS2X_IOP_RPC_LOG");
++            return value ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 32u;
++        }();
++        static uint32_t s_rpcLogs = 0;
++        const bool logCall = s_rpcLogs < s_rpcLogLimit;
++        uint32_t sendWords[4] = {};
++        if (logCall)
++        {
++            ++s_rpcLogs;
++            (void)m_memory.readRam(server.buffer, sendWords, sizeof(sendWords));
+         }
+         uint32_t returnPointer = executor.executeGuestFunction(server.function,
+                                                                request.function,
+@@ -371,6 +490,15 @@ namespace ps2x::iop::detail
+                                                                server.gp);
+         if (returnPointer == 0u)
+             returnPointer = server.buffer;
++        if (logCall)
++        {
++            uint32_t replyWords[4] = {};
++            (void)m_memory.readRam(returnPointer, replyWords, sizeof(replyWords));
++            std::fprintf(stderr, "[IOP rpc] sid=0x%x fn=0x%x func=0x%x buffer=0x%x send=0x%x/0x%x [%x %x %x %x] -> 0x%x [%x %x %x %x]\n",
++                         request.sid, request.function, server.function, server.buffer, request.send.address, request.send.size,
++                         sendWords[0], sendWords[1], sendWords[2], sendWords[3], returnPointer,
++                         replyWords[0], replyWords[1], replyWords[2], replyWords[3]);
++        }
+         if (request.receive.address != 0u && request.receive.size != 0u && returnPointer != 0u)
+         {
+             const uint32_t physical = IopMemory::physicalAddress(returnPointer);
+diff --git a/ps2xIOP/src/emulator/services/iop_rpc.h b/ps2xIOP/src/emulator/services/iop_rpc.h
+index ec227da..d860cb3 100644
+--- a/ps2xIOP/src/emulator/services/iop_rpc.h
++++ b/ps2xIOP/src/emulator/services/iop_rpc.h
+@@ -47,7 +47,7 @@ namespace ps2x::iop::detail
+ 
+         void reset();
+         [[nodiscard]] bool dispatchSifManImport(uint16_t ordinal, IopCpuState &cpu);
+-        [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu);
++        [[nodiscard]] bool dispatchSifCmdImport(uint16_t ordinal, IopCpuState &cpu, IopGuestExecutor &executor);
+         [[nodiscard]] RpcResult handleRpc(const RpcRequest &request, IopGuestExecutor &executor);
+         void onSifTransfer(const SifTransfer &transfer);
+         void removeServersInRange(uint32_t base, uint32_t size);
+@@ -65,6 +65,10 @@ namespace ps2x::iop::detail
+                                             IopGuestExecutor &executor);
+ 
+     private:
++        // IOP -> EE RPC: sceSifBindRpc / sceSifCallRpc on a server the EE registered.
++        [[nodiscard]] bool bindEeRpc(IopCpuState &cpu);
++        [[nodiscard]] bool callEeRpc(IopCpuState &cpu, IopGuestExecutor &executor);
++
+         struct CmdHandler
+         {
+             uint32_t function = 0;
+@@ -88,6 +92,8 @@ namespace ps2x::iop::detail
+         IopKernel &m_kernel;
+         std::unordered_map<uint32_t, RpcServer> m_servers;
+         std::unordered_map<uint32_t, CmdHandler> m_cmdHandlers;
++        std::unordered_map<uint32_t, uint32_t> m_eeClients; // IOP client data address -> EE server sid
++        uint32_t m_generation = 0;                          // completions from before a reset are dropped
+         uint32_t m_sregs[32]{};
+         uint32_t m_nextDmaId = 1u;
+         bool m_sifInitialized = false;
+diff --git a/ps2xIOP/src/emulator/spu2/SPU2/Dma.cpp b/ps2xIOP/src/emulator/spu2/SPU2/Dma.cpp
+index 0027a59..39c6602 100644
+--- a/ps2xIOP/src/emulator/spu2/SPU2/Dma.cpp
++++ b/ps2xIOP/src/emulator/spu2/SPU2/Dma.cpp
+@@ -136,6 +136,12 @@ void V_Core::AutoDMAReadBuffer(int mode) //mode: 0= split stereo; 1 = do not spl
+ 
+ 			if (DMAPtr != nullptr)
+ 				memcpy(GetMemPtr(0x2000 + (Index << 10) + spos), DMAPtr + InputDataProgress, 0x200);
++			{ // ps2recomp: PS2X_ADMA_DUMP=<file>: core 0's AutoDMA input as it arrives (raw, 512-byte L/R blocks), to
++			  // compare with a movie's PCM (how Bloody Roar 4's lost movie audio packets were found)
++				static FILE* s_dump = [] { const char* p = std::getenv("PS2X_ADMA_DUMP"); return p && *p ? std::fopen(p, "wb") : nullptr; }();
++				if (s_dump && Index == 0 && DMAPtr != nullptr)
++					std::fwrite(DMAPtr + InputDataProgress, 1, 0x200, s_dump);
++			}
+ 			InputDataTransferred += 0x200;
+ 			InputDataLeft -= 0x100;
+ 			InputDataProgress += 0x100;
+diff --git a/ps2xRuntime/CMakeLists.txt b/ps2xRuntime/CMakeLists.txt
+index ec7a2c2..f5a174f 100644
+--- a/ps2xRuntime/CMakeLists.txt
++++ b/ps2xRuntime/CMakeLists.txt
+@@ -270,6 +270,10 @@ elseif(WIN32)
+     set(FFMPEG_PREBUILT_TAG "n7.1-241205")
+     set(FFMPEG_PREBUILT_URL
+         "https://github.com/System233/ffmpeg-msvc-prebuilt/releases/download/${FFMPEG_PREBUILT_TAG}/ffmpeg-${FFMPEG_PREBUILT_TAG}-lgpl-amd64-shared.zip")
++    # PS2X_FFMPEG_LOCAL_ZIP=<path>: use an already downloaded copy of that zip.
++    if(PS2X_FFMPEG_LOCAL_ZIP AND EXISTS "${PS2X_FFMPEG_LOCAL_ZIP}")
++        set(FFMPEG_PREBUILT_URL "${PS2X_FFMPEG_LOCAL_ZIP}")
++    endif()
+ 
+     set(FFMPEG_PREFIX_DIR "${CMAKE_BINARY_DIR}/ThirdParty/ffmpeg-prefix")
+     set(FFMPEG_SOURCE_DIR "${FFMPEG_PREFIX_DIR}/src/ffmpeg_external")
+diff --git a/ps2xRuntime/include/runtime/ee_scheduler.h b/ps2xRuntime/include/runtime/ee_scheduler.h
+index ebcf7a1..7a3cff9 100644
+--- a/ps2xRuntime/include/runtime/ee_scheduler.h
++++ b/ps2xRuntime/include/runtime/ee_scheduler.h
+@@ -462,6 +462,7 @@ private:
+     uint32_t m_enabledDmacMask = 0xFFFFFFFFu;
+     int m_currentThreadId = 0;
+     bool m_rescheduleRequested = false;
++    bool m_yieldServesInvocation = false; // a thread just yielded (RotateThreadReadyQueue): run a pending callback first
+     bool m_timeSliceExpired = false;
+     bool m_insideInterrupt = false;
+     uint32_t m_pendingEeTimerInterrupts = 0;
+diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
+index 8d6a8e7..14f9a83 100644
+--- a/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.cpp
+@@ -4,6 +4,7 @@
+ #include "runtime/ps2_memory.h"
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <cstring>
+@@ -86,23 +87,84 @@ namespace ps2_gsdump
+         };
+ #pragma pack(pop)
+ 
++        // [livebatch] the host, idle-waiting for data, is woken once this many bytes are unread (VSync and ReadFIFO2
++        // wake it at once). PS2X_GSLIVE_WAKE_BYTES=0: wake it for every packet, as before.
++        uint64_t wakeBytes()
++        {
++            static const uint64_t s_bytes = []
++            {
++                const char *v = std::getenv("PS2X_GSLIVE_WAKE_BYTES");
++                return v && v[0] ? std::strtoull(v, nullptr, 10) : 65536ull;
++            }();
++            return s_bytes;
++        }
++
++        // Game serial in the dump header; the live host also reads it (PCSX2 GameIndex fixes).
++        std::string liveSerial()
++        {
++            const char *v = std::getenv("PS2X_LIVE_SERIAL");
++            return (v && v[0]) ? std::string(v) : std::string("SLUS-21126");
++        }
++
+ #if defined(_WIN32)
+         // Live destination: the shared ring read by "pcsx2-gsrunner -live" (see ps2_live_ring.h).
++        // Ring version 2: the ReadFIFO2 readback block follows the data area (ps2live::ringReadback).
+         struct LiveRing
+         {
+             HANDLE mapping = nullptr;
+             HANDLE dataEvent = nullptr;
+             HANDLE spaceEvent = nullptr;
++            HANDLE readbackEvent = nullptr;
+             HANDLE hostProcess = nullptr;
+             ps2live::RingHeader *header = nullptr;
+             uint8_t *data = nullptr;
+             uint64_t capacity = 0;
+             std::wstring suffix = std::to_wstring(GetCurrentProcessId()); // this instance's ring names
++            bool attached = false; // [handover] took over the ring (and window) of the game before
++
++            // [handover] PS2X_LIVE_ATTACH=<suffix>: the ring of a game that left its window to this one. The host is
++            // already there, waiting: only the producer side is redone (the counters go on where they were).
++            bool attach(const char *existing)
++            {
++                suffix = std::filesystem::path(existing).wstring();
++                mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, ps2live::objectName(ps2live::kMappingName, suffix).c_str());
++                if (!mapping)
++                    return false;
++                void *view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);
++                if (!view)
++                    return false;
++                header = static_cast<ps2live::RingHeader *>(view);
++                if (header->magic != ps2live::kMagic || !header->handover)
++                    return false;
++                capacity = header->capacity;
++                data = ps2live::ringData(header);
++                dataEvent = OpenEventW(EVENT_ALL_ACCESS, FALSE, ps2live::objectName(ps2live::kDataEventName, suffix).c_str());
++                spaceEvent = OpenEventW(EVENT_ALL_ACCESS, FALSE, ps2live::objectName(ps2live::kSpaceEventName, suffix).c_str());
++                readbackEvent = OpenEventW(EVENT_ALL_ACCESS, FALSE, ps2live::objectName(ps2live::kReadbackEventName, suffix).c_str());
++                if (!dataEvent || !spaceEvent || !readbackEvent)
++                    return false;
++                header->producerAlive = 1u;
++                header->producerFlags = 1u;
++                header->netStatus = 0u;
++                header->producerPid = GetCurrentProcessId();
++                MemoryBarrier();
++                header->handover = 0u; // last: the host adopts this process
++                SetEvent(dataEvent);
++                attached = true;
++                return true;
++            }
+ 
+             bool open()
+             {
++                if (const char *existing = std::getenv("PS2X_LIVE_ATTACH"); existing && *existing)
++                {
++                    if (attach(existing))
++                        return true;
++                    std::fprintf(stderr, "[gslive] could not take over ring %s, opening a new window\n", existing);
++                    suffix = std::to_wstring(GetCurrentProcessId());
++                }
+                 capacity = ps2live::kDefaultCapacity;
+-                const uint64_t total = sizeof(ps2live::RingHeader) + capacity;
++                const uint64_t total = ps2live::mappingSize(capacity);
+                 mapping = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE,
+                                              static_cast<DWORD>(total >> 32), static_cast<DWORD>(total), ps2live::objectName(ps2live::kMappingName, suffix).c_str());
+                 if (!mapping)
+@@ -117,16 +179,21 @@ namespace ps2_gsdump
+                 header->version = ps2live::kVersion;
+                 header->producerAlive = 1u;
+                 header->producerFlags = 1u;
+-                MemoryBarrier();
+-                header->magic = ps2live::kMagic;
++                header->producerPid = GetCurrentProcessId();
+                 data = ps2live::ringData(header);
++                std::memset(ps2live::ringReadback(header), 0, sizeof(ps2live::RingReadback));
+                 dataEvent = CreateEventW(nullptr, FALSE, FALSE, ps2live::objectName(ps2live::kDataEventName, suffix).c_str());
+                 spaceEvent = CreateEventW(nullptr, FALSE, FALSE, ps2live::objectName(ps2live::kSpaceEventName, suffix).c_str());
+-                return dataEvent && spaceEvent;
++                readbackEvent = CreateEventW(nullptr, FALSE, FALSE, ps2live::objectName(ps2live::kReadbackEventName, suffix).c_str());
++                MemoryBarrier();
++                header->magic = ps2live::kMagic; // last: the host checks it
++                return dataEvent && spaceEvent && readbackEvent;
+             }
+ 
+             bool launchHost()
+             {
++                if (attached)
++                    return true; // [handover] the host is the previous game's
+                 std::wstring exe = L"C:\\NBAStreetRecomp\\gshost\\pcsx2-gsrunner.exe";
+                 if (const char *custom = std::getenv("PS2X_GSHOST"))
+                     exe = std::filesystem::path(custom).wstring();
+@@ -135,20 +202,40 @@ namespace ps2_gsdump
+                     args += L" " + std::filesystem::path(extra).wstring();
+                 else
+                     args += L" -renderer vulkan -ini nba_street.ini"; // quality settings next to the host (4K)
++                // The host inherits this environment: it reads PS2X_LIVE_SERIAL (its GameIndex fixes),
++                // PS2X_LIVE_TITLE (window title) and PS2X_HOST_WINDOW (client size, WxH) itself.
++                if (!std::getenv("PS2X_LIVE_SERIAL"))
++                    _putenv_s("PS2X_LIVE_SERIAL", liveSerial().c_str());
+                 std::wstring cmdline = L"\"" + exe + L"\" " + args;
+                 STARTUPINFOW si{};
+                 si.cb = sizeof(si);
+                 PROCESS_INFORMATION pi{};
+                 const std::wstring dir = std::filesystem::path(exe).parent_path().wstring();
+-                if (!CreateProcessW(exe.c_str(), cmdline.data(), nullptr, nullptr, FALSE, 0, nullptr, dir.c_str(), &si, &pi))
++                // CREATE_NO_WINDOW: pcsx2-gsrunner is a console program; PS2X_GSHOST_CONSOLE=1 keeps its console.
++                const char *console = std::getenv("PS2X_GSHOST_CONSOLE");
++                const DWORD flags = (console && console[0] && console[0] != '0') ? 0u : CREATE_NO_WINDOW;
++                if (!CreateProcessW(exe.c_str(), cmdline.data(), nullptr, nullptr, FALSE, flags, nullptr, dir.c_str(), &si, &pi))
+                 {
+                     std::fprintf(stderr, "[gslive] cannot start GS host (error %lu)\n", GetLastError());
+                     return false;
+                 }
+                 CloseHandle(pi.hThread);
+                 hostProcess = pi.hProcess;
++                hostPid = pi.dwProcessId;
+                 return true;
+             }
++            DWORD hostPid = 0;
++
++            // [handover] the old game's side: the window is left to the next game (the host waits for it), and this
++            // process ends at once.
++            [[noreturn]] void leaveWindow()
++            {
++                header->handover = 1u;
++                MemoryBarrier();
++                SetEvent(dataEvent);
++                std::fflush(stderr);
++                std::_Exit(0);
++            }
+ 
+             bool hostGone() const
+             {
+@@ -157,12 +244,15 @@ namespace ps2_gsdump
+                 return hostProcess && WaitForSingleObject(hostProcess, 0) == WAIT_OBJECT_0;
+             }
+ 
+-            // Blocks while the ring is full (the host draws slower than the game produces).
+-            bool write(const uint8_t *src, size_t size)
++            int64_t staged = -1; // [livebatch] end of the bytes copied but not yet published (-1: none)
++
++            // Blocks while the ring is full (the host draws slower than the game produces). publish = false leaves the
++            // bytes staged, so a packet's header and data reach the host with one writePos store ([livebatch]).
++            bool write(const uint8_t *src, size_t size, bool publish = true)
+             {
+                 while (size != 0u)
+                 {
+-                    const int64_t w = header->writePos;
++                    const int64_t w = staged >= 0 ? staged : header->writePos;
+                     const int64_t r = header->readPos;
+                     const uint64_t used = static_cast<uint64_t>(w - r);
+                     const uint64_t freeBytes = capacity - used;
+@@ -170,6 +260,7 @@ namespace ps2_gsdump
+                     {
+                         if (hostGone())
+                             return false;
++                        flush();
+                         SetEvent(dataEvent);
+                         const uint64_t waitStart = ps2xStatTicks();
+                         header->producerWaiting = 1u;
+@@ -183,22 +274,50 @@ namespace ps2_gsdump
+                     const uint64_t offset = static_cast<uint64_t>(w) % capacity;
+                     const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
+                     std::memcpy(data + offset, src, chunk);
+-                    MemoryBarrier();
+-                    header->writePos = w + static_cast<int64_t>(chunk);
++                    staged = w + static_cast<int64_t>(chunk);
+                     src += chunk;
+                     size -= chunk;
+                 }
++                if (publish)
++                    flush();
+                 return true;
+             }
+ 
++            void flush()
++            {
++                if (staged < 0)
++                    return;
++                MemoryBarrier();
++                header->writePos = staged;
++                staged = -1;
++            }
++
+             // Called after every packet: a kernel call each time is a measurable part of the game
+-            // thread's frame, so only wake the host when it is actually blocked on the event.
+-            void signal()
++            // thread's frame, so only wake the host when it is actually blocked on the event, and then
++            // ([livebatch]) only once it has wakeBytes() to read, unless forced (VSync, ReadFIFO2).
++            void signal(bool force)
+             {
+                 MemoryBarrier(); // writePos store before the consumerWaiting load (pairs with the host)
+-                if (!header->consumerFlags || header->consumerWaiting)
+-                    SetEvent(dataEvent);
++                if (header->consumerFlags && !header->consumerWaiting)
++                    return;
++                if (!force && header->consumerFlags &&
++                    static_cast<uint64_t>(header->writePos - header->readPos) < wakeBytes())
++                    return;
++                SetEvent(dataEvent);
+             }
++
++            // ReadFIFO2 replies (readFifoInto): the host copies the data, stores its size, bumps seq
++            // and sets the readback event.
++            static void fence() { MemoryBarrier(); }
++            void wakeData() { SetEvent(dataEvent); }
++            uint32_t readbackSeq() const
++            {
++                MemoryBarrier();
++                return ps2live::ringReadback(header)->seq;
++            }
++            uint32_t readbackBytes() const { return ps2live::ringReadback(header)->bytes; }
++            const uint8_t *readbackPtr() const { return ps2live::readbackData(header); }
++            void waitReadback(uint32_t ms) { WaitForSingleObject(readbackEvent, ms); }
+         };
+ #elif defined(__EMSCRIPTEN__)
+         // Browser: the GS host is the page itself (web/play_gs_host.cpp, on the browser's main
+@@ -241,8 +360,9 @@ namespace ps2_gsdump
+ 
+             bool hostGone() { return header && header->consumerQuit; }
+ 
+-            bool write(const uint8_t *src, size_t size)
++            bool write(const uint8_t *src, size_t size, bool publish = true)
+             {
++                (void)publish; // every chunk is published: the page reads whole packets only
+                 while (size != 0u)
+                 {
+                     // Atomics on both indices (see Available() in web/play_gs_host.cpp): the
+@@ -275,7 +395,8 @@ namespace ps2_gsdump
+                 return true;
+             }
+ 
+-            void signal() {} // the host polls once per browser frame
++            void flush() {}
++            void signal(bool) {} // the host polls once per browser frame
+         };
+ #elif defined(__APPLE__) || defined(__linux__)
+         // POSIX version of the live ring above: shm_open mapping, events as shared words
+@@ -352,6 +473,9 @@ namespace ps2_gsdump
+                     argv.push_back(arg.data());
+                 argv.push_back(nullptr);
+ 
++                // The host reads PS2X_LIVE_SERIAL (its GameIndex fixes), PS2X_LIVE_TITLE and PS2X_HOST_WINDOW.
++                setenv("PS2X_LIVE_SERIAL", liveSerial().c_str(), 0);
++
+                 posix_spawn_file_actions_t actions;
+                 posix_spawn_file_actions_init(&actions);
+                 const std::string dir = std::filesystem::path(exe).parent_path().string();
+@@ -376,12 +500,14 @@ namespace ps2_gsdump
+                 return hostExited;
+             }
+ 
++            int64_t staged = -1; // [livebatch] see the Windows version
++
+             // Blocks while the ring is full (the host draws slower than the game produces).
+-            bool write(const uint8_t *src, size_t size)
++            bool write(const uint8_t *src, size_t size, bool publish = true)
+             {
+                 while (size != 0u)
+                 {
+-                    const int64_t w = header->writePos;
++                    const int64_t w = staged >= 0 ? staged : header->writePos;
+                     const int64_t r = header->readPos;
+                     const uint64_t used = static_cast<uint64_t>(w - r);
+                     const uint64_t freeBytes = capacity - used;
+@@ -389,6 +515,7 @@ namespace ps2_gsdump
+                     {
+                         if (hostGone())
+                             return false;
++                        flush();
+                         ps2live::eventSet(&events->data);
+                         const uint64_t waitStart = ps2xStatTicks();
+                         header->producerWaiting = 1u;
+@@ -402,21 +529,44 @@ namespace ps2_gsdump
+                     const uint64_t offset = static_cast<uint64_t>(w) % capacity;
+                     const size_t chunk = static_cast<size_t>(std::min<uint64_t>({size, freeBytes, capacity - offset}));
+                     std::memcpy(data + offset, src, chunk);
+-                    __atomic_thread_fence(__ATOMIC_RELEASE);
+-                    header->writePos = w + static_cast<int64_t>(chunk);
++                    staged = w + static_cast<int64_t>(chunk);
+                     src += chunk;
+                     size -= chunk;
+                 }
++                if (publish)
++                    flush();
+                 return true;
+             }
+ 
+-            // See the Windows version: only wake the host when it is blocked on the data event.
+-            void signal()
++            void flush()
++            {
++                if (staged < 0)
++                    return;
++                __atomic_thread_fence(__ATOMIC_RELEASE);
++                header->writePos = staged;
++                staged = -1;
++            }
++
++            // See the Windows version: only wake the host when it is blocked on the data event, and has
++            // wakeBytes() to read unless forced.
++            void signal(bool force)
+             {
+                 __atomic_thread_fence(__ATOMIC_SEQ_CST); // writePos store before the consumerWaiting load
+-                if (!header->consumerFlags || header->consumerWaiting)
+-                    ps2live::eventSet(&events->data);
++                if (header->consumerFlags && !header->consumerWaiting)
++                    return;
++                if (!force && header->consumerFlags &&
++                    static_cast<uint64_t>(header->writePos - header->readPos) < wakeBytes())
++                    return;
++                ps2live::eventSet(&events->data);
+             }
++
++            // ReadFIFO2 replies (readFifoInto), see the Windows version.
++            static void fence() { __atomic_thread_fence(__ATOMIC_SEQ_CST); }
++            void wakeData() { ps2live::eventSet(&events->data); }
++            uint32_t readbackSeq() const { return __atomic_load_n(&events->readbackSeq, __ATOMIC_ACQUIRE); }
++            uint32_t readbackBytes() const { return events->readbackBytes; }
++            const uint8_t *readbackPtr() const { return ps2live::readbackData(header); }
++            void waitReadback(uint32_t ms) { ps2live::eventWait(&events->readback, ms); }
+         };
+ #endif
+ 
+@@ -458,7 +608,7 @@ namespace ps2_gsdump
+                 return file != nullptr;
+             }
+ 
+-            void write(const void *data, size_t size)
++            void write(const void *data, size_t size, bool publish = true)
+             {
+                 if (size == 0)
+                     return;
+@@ -481,7 +631,7 @@ namespace ps2_gsdump
+                 }
+                 if (liveActive)
+                 {
+-                    if (!live.write(static_cast<const uint8_t *>(data), size))
++                    if (!live.write(static_cast<const uint8_t *>(data), size, publish))
+                     {
+ #if defined(_WIN32)
+                         DWORD exitCode = 0;
+@@ -501,6 +651,9 @@ namespace ps2_gsdump
+                         std::_Exit(0);
+ #endif
+                     }
++                    // PS2X_GS_DUMP with the live host: the dump gets the same stream.
++                    if (file)
++                        std::fwrite(data, 1, size, file);
+                     bytes += size;
+                     return;
+                 }
+@@ -513,11 +666,15 @@ namespace ps2_gsdump
+             void writeByte(uint8_t value) { write(&value, 1); }
+             void writeWord(uint32_t value) { write(&value, 4); }
+ 
+-            void endPacket()
++            // force = false (GS transfers, VIF1 streams): the host is woken only once enough is queued ([livebatch]).
++            void endPacket(bool force = true)
+             {
+ #if defined(PS2X_GS_LIVE_RING)
+                 if (liveActive && !liveNull)
+-                    live.signal();
++                {
++                    live.flush();
++                    live.signal(force);
++                }
+ #endif
+             }
+ 
+@@ -528,6 +685,10 @@ namespace ps2_gsdump
+                     std::fclose(file);
+                     file = nullptr;
+                 }
++#if defined(PS2X_GS_LIVE_RING)
++                if (liveActive)
++                    return; // only the dump file ends, the live host keeps drawing
++#endif
+                 finished = true;
+             }
+ 
+@@ -539,8 +700,8 @@ namespace ps2_gsdump
+                 if (headerWritten || !enabled())
+                     return;
+                 headerWritten = true;
+-                static const char kSerial[] = "SLUS-21126";
+-                const uint32_t serialSize = static_cast<uint32_t>(sizeof(kSerial) - 1u);
++                const std::string serial = liveSerial();
++                const uint32_t serialSize = static_cast<uint32_t>(serial.size());
+                 writeWord(0xFFFFFFFFu);
+                 writeWord(static_cast<uint32_t>(sizeof(DumpHeader)) + serialSize);
+                 DumpHeader header{};
+@@ -551,7 +712,7 @@ namespace ps2_gsdump
+                 header.crc = 0u;
+                 header.screenshot_offset = header.serial_offset + serialSize;
+                 write(&header, sizeof(header));
+-                write(kSerial, serialSize);
++                write(serial.data(), serialSize);
+                 write(regs.data(), regs.size());
+             }
+ 
+@@ -591,7 +752,21 @@ namespace ps2_gsdump
+                     if (init.live.open() && init.live.launchHost())
+                     {
+                         init.liveActive = true;
+-                        std::fprintf(stderr, "[gslive] GS host started (PCSX2 renderer)\n");
++                        // [handover] the host read the stream's header from the game before: the stream goes on with packets
++                        if (init.live.attached)
++                            init.headerWritten = true;
++                        std::fprintf(stderr, init.live.attached ? "[gslive] took over the previous game's window\n" : "[gslive] GS host started (PCSX2 renderer)\n");
++#if defined(_WIN32)
++                        // [handover] PS2X_LIVE_RING_FILE: the ring's name (and the host's pid), for the launcher
++                        if (const char *ringFile = std::getenv("PS2X_LIVE_RING_FILE"); ringFile && *ringFile)
++                        {
++                            if (std::FILE *f = std::fopen(ringFile, "wb"))
++                            {
++                                std::fprintf(f, "%ls %lu\n", init.live.suffix.c_str(), static_cast<unsigned long>(init.live.hostPid));
++                                std::fclose(f);
++                            }
++                        }
++#endif
+                     }
+                     else
+                     {
+@@ -673,6 +848,16 @@ namespace ps2_gsdump
+ #endif
+     }
+ 
++    void setNetStatus(uint32_t status)
++    {
++#if defined(PS2X_GS_LIVE_RING)
++        Writer &w = writer();
++        if (w.liveActive && w.live.header)
++            w.live.header->netStatus = status;
++#else
++        (void)status;
++#endif
++    }
+     bool inputFocused()
+     {
+ #if defined(_WIN32)
+@@ -719,15 +904,44 @@ namespace ps2_gsdump
+ #endif
+     }
+ 
++    bool liveFps60Requested(bool current)
++    {
++#if defined(PS2X_GS_LIVE_RING)
++        Writer &w = writer();
++        if (!w.liveActive || !w.live.header)
++            return current;
++        ps2live::RingHeader *h = w.live.header;
++        const uint32_t req = h->fps60Request; // 1 = 30 fps, 2 = 60 fps, written by the host's options menu
++        if (req == 1u || req == 2u)
++        {
++            h->fps60Request = 0u; // consumed: the host sees the result through gameFps60
++            std::fprintf(stderr, "[fps60] host menu: %s\n", req == 2u ? "60 fps" : "30 fps");
++            return req == 2u;
++        }
++#endif
++        return current;
++    }
++
++    void publishLiveFps60(bool on)
++    {
++#if defined(PS2X_GS_LIVE_RING)
++        Writer &w = writer();
++        if (w.liveActive && w.live.header)
++            w.live.header->gameFps60 = on ? 2u : 1u;
++#else
++        (void)on;
++#endif
++    }
++
+     namespace
+     {
+         void writeTransferLocked(Writer &w, int path, const uint8_t *data, uint32_t size)
+         {
+-            w.writeByte(kTypeTransfer);
+-            w.writeByte(path == 1 ? kPath1New : (path == 2 ? kPath2 : kPath3));
+-            w.writeWord(size);
+-            w.write(data, size);
+-            w.endPacket();
++            uint8_t head[6] = {kTypeTransfer, path == 1 ? kPath1New : (path == 2 ? kPath2 : kPath3)};
++            std::memcpy(head + 2, &size, 4);
++            w.write(head, sizeof(head), false); // [livebatch] header and data published together
++            w.write(data, size, false);
++            w.endPacket(false);
+         }
+ 
+         // Appends PATH3 data and sends every GIF packet completed so far (see Writer::path3Pending).
+@@ -863,6 +1077,70 @@ namespace ps2_gsdump
+         w.endPacket();
+     }
+ 
++    bool readFifoInto(uint8_t *dst, uint32_t bytes)
++    {
++        const uint32_t qwc = bytes / 16u;
++        if (!dst || qwc == 0u || !active())
++            return false;
++        // PS2X_GSLIVE_READBACK=0: the host finishes the transfer, the runtime keeps its own bytes.
++        static const bool s_readback = []
++        {
++            const char *env = std::getenv("PS2X_GSLIVE_READBACK");
++            return !(env && env[0] == '0');
++        }();
++        if (!s_readback)
++        {
++            readFifo(qwc);
++            return false;
++        }
++#if defined(PS2X_GS_LIVE_RING) && !defined(__EMSCRIPTEN__) // the browser host does not answer (yet)
++        Writer &w = writer();
++        uint32_t seq0 = 0;
++        {
++            std::lock_guard<std::mutex> lock(w.mutex);
++            if (!w.usable())
++                return false;
++            const bool waitHost = w.liveActive && !w.liveNull && w.live.header;
++            if (waitHost)
++                seq0 = w.live.readbackSeq();
++            w.writeByte(kTypeReadFifo2);
++            w.writeWord(qwc);
++            w.endPacket();
++            if (!waitHost)
++                return false;
++            w.live.wakeData(); // the host may be idle-waiting with an old wake-up consumed
++        }
++        // The host answers once it has drawn everything queued before this packet (usually within a frame).
++        // PS2X_GSLIVE_READBACK_MS bounds the wait; on timeout the runtime's bytes stay.
++        static const uint32_t s_timeoutMs = []
++        {
++            const char *env = std::getenv("PS2X_GSLIVE_READBACK_MS");
++            return env && env[0] ? static_cast<uint32_t>(std::strtoul(env, nullptr, 10)) : 3000u;
++        }();
++        const auto t0 = std::chrono::steady_clock::now();
++        while (w.live.readbackSeq() == seq0)
++        {
++            if (w.live.hostGone() || std::chrono::steady_clock::now() - t0 > std::chrono::milliseconds(s_timeoutMs))
++            {
++                std::fprintf(stderr, "[gslive] readback of %u bytes: no answer from the GS host, keeping the runtime's data\n", bytes);
++                return false;
++            }
++            w.live.waitReadback(20);
++        }
++        LiveRing::fence(); // seq before the data
++        const uint32_t got = std::min<uint32_t>({bytes, w.live.readbackBytes(), static_cast<uint32_t>(ps2live::kReadbackCapacity)});
++        std::memcpy(dst, w.live.readbackPtr(), got);
++        static uint32_t s_logged = 0;
++        if (s_logged++ < 8u)
++            std::fprintf(stderr, "[gslive] readback %u bytes from the GS host in %.1f ms\n", got,
++                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
++        return got == bytes;
++#else
++        readFifo(qwc);
++        return false;
++#endif
++    }
++
+     bool remoteVu()
+     {
+ #if defined(PS2X_GS_LIVE_RING)
+@@ -886,10 +1164,11 @@ namespace ps2_gsdump
+         std::lock_guard<std::mutex> lock(w.mutex);
+         if (!w.usable())
+             return;
+-        w.writeByte(kTypeLiveVif1);
+-        w.writeWord(sizeBytes);
+-        w.write(data, sizeBytes);
+-        w.endPacket();
++        uint8_t head[5] = {kTypeLiveVif1};
++        std::memcpy(head + 1, &sizeBytes, 4);
++        w.write(head, sizeof(head), false); // [livebatch] published with the data by endPacket
++        w.write(data, sizeBytes, false);
++        w.endPacket(false);
+     }
+ 
+     void vif1(const Span *spans, size_t count)
+@@ -905,16 +1184,17 @@ namespace ps2_gsdump
+         std::lock_guard<std::mutex> lock(w.mutex);
+         if (!w.usable())
+             return;
+-        w.writeByte(kTypeLiveVif1);
+-        w.writeWord(sizeBytes);
++        uint8_t head[5] = {kTypeLiveVif1};
++        std::memcpy(head + 1, &sizeBytes, 4);
++        w.write(head, sizeof(head), false); // [livebatch] published with the data by endPacket
+         for (size_t i = 0; i < count && sizeBytes != 0u; ++i)
+         {
+             const uint32_t take = std::min(spans[i].size, sizeBytes);
+             if (take != 0u)
+-                w.write(spans[i].data, take);
++                w.write(spans[i].data, take, false);
+             sizeBytes -= take;
+         }
+-        w.endPacket();
++        w.endPacket(false);
+     }
+ 
+     void vif1Register(uint32_t address, uint32_t value)
+@@ -943,6 +1223,21 @@ namespace ps2_gsdump
+         w.writeByte(kTypeVSync);
+         w.writeByte(static_cast<uint8_t>(field & 1));
+         w.endPacket();
++#if defined(PS2X_GS_LIVE_RING) && defined(_WIN32)
++        // [handover] PS2X_HANDOVER_FILE appears: the launcher starts another game in this window (an online match
++        // accepted while playing). Here, under the writer's lock and right after a VSync, the stream is between packets.
++        static const char *s_handover = [] { const char *v = std::getenv("PS2X_HANDOVER_FILE"); return (v && *v) ? v : nullptr; }();
++        if (s_handover && w.liveActive && w.live.header && (w.frames % 10u) == 0u)
++        {
++            std::error_code ec;
++            if (std::filesystem::exists(s_handover, ec))
++            {
++                std::filesystem::remove(s_handover, ec);
++                std::fprintf(stderr, "[gslive] leaving the window to the next game at frame %u\n", w.frames);
++                w.live.leaveWindow();
++            }
++        }
++#endif
+         if (w.file && w.frames % 600u == 0u)
+             std::fflush(w.file);
+         ++w.frames;
+diff --git a/ps2xRuntime/src/lib/gs/gs_dump_writer.h b/ps2xRuntime/src/lib/gs/gs_dump_writer.h
+index e68a685..725c9a5 100644
+--- a/ps2xRuntime/src/lib/gs/gs_dump_writer.h
++++ b/ps2xRuntime/src/lib/gs/gs_dump_writer.h
+@@ -15,7 +15,9 @@ struct GSRegisters;
+ // PS2X_GS_LIVE=1 instead streams the same data, live, to the PCSX2 GS host window
+ // ("pcsx2-gsrunner -live", started automatically; PS2X_GSHOST / PS2X_GSHOST_ARGS override
+ // its path and arguments, default "-renderer vulkan -ini nba_street.ini": 4K, see gshost\nba_street.ini;
+-// add "-fullscreen" to start in fullscreen).
++// add "-fullscreen" to start in fullscreen; PS2X_GSHOST_CONSOLE=1 keeps the host's console window).
++// PS2X_LIVE_SERIAL sets the serial in the dump header and for the host (default SLUS-21126); the
++// host itself reads PS2X_LIVE_TITLE (window title) and PS2X_HOST_WINDOW (WxH client size).
+ namespace ps2_gsdump
+ {
+     bool active();
+@@ -25,15 +27,27 @@ namespace ps2_gsdump
+     bool remotePad(uint32_t &buttons, uint32_t &axes);
+     // The GS host's options menu is open (it owns keyboard and gamepad): give the game no input.
+     bool hostMenuOpen();
++    // [netplay] The online banner the GS host draws over the game (RingHeader::netStatus: 2 waiting for the other player,
++    // 3 connected, 4 could not connect, 6 the connection was lost; 0 none).
++    void setNetStatus(uint32_t status);
+     // The physical controller belongs to this instance: its GS host window (or no host) is in front.
+     // Two instances on one PC must not both follow the same gamepad.
+     bool inputFocused();
++    // 60 fps switch of the live host's options menu (ring version 2). liveFps60Requested returns the
++    // host's latest request (true = 60 fps) and consumes it, or current when there is none;
++    // publishLiveFps60 reports the game's mode back so the menu shows it. No-ops when not live.
++    bool liveFps60Requested(bool current);
++    void publishLiveFps60(bool on);
+     // path: 1, 2 or 3 (GIF PATH1 = VU1 XGKICK, PATH2 = VIF1 DIRECT, PATH3 = GIF DMA).
+     void transfer(int path, const uint8_t *data, uint32_t sizeBytes);
+     // A register written outside a GIF packet (HLE'd library code): recorded as an A+D packet.
+     void writeRegister(uint8_t reg, uint64_t value);
+     // GS -> EE (local -> host) transfer of qwc quadwords.
+     void readFifo(uint32_t qwc);
++    // readFifo for bytes / 16 quadwords, then (live) waits for the GS host's answer and copies it
++    // into dst. True when dst was filled entirely; false (dst untouched) without a live host, on timeout
++    // (PS2X_GSLIVE_READBACK_MS, default 3000) or with PS2X_GSLIVE_READBACK=0.
++    bool readFifoInto(uint8_t *dst, uint32_t bytes);
+     // Live only: the GS host also runs VIF1 + VU1 (PCSX2's microVU recompiler). The game's
+     // VIF1 stream is forwarded with vif1() and local VU1 execution / PATH1 / PATH2 output are
+     // skipped. Default on in live mode; PS2X_REMOTE_VU=0 keeps VU1 local.
+diff --git a/ps2xRuntime/src/lib/gs/gs_frontend.cpp b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+index 5658928..8ed19a8 100644
+--- a/ps2xRuntime/src/lib/gs/gs_frontend.cpp
++++ b/ps2xRuntime/src/lib/gs/gs_frontend.cpp
+@@ -1,5 +1,6 @@
+ #include "runtime/gs/gs_frontend.h"
+ #include "runtime/gs/gs_cpu_backend.h"
++#include "gs_dump_writer.h"
+ #include "ps2_log.h"
+ #include "runtime/ps2_memory.h"
+ #include <atomic>
+@@ -725,7 +726,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
+             if ((nloop * nreg) & 1)
+                 offset += 8;
+         }
+-        else if (flg == GIF_FMT_IMAGE)
++        else // GIF_FMT_IMAGE, and FLG=3, which the GIF also treats as IMAGE
+         {
+             uint32_t imageBytes = nloop * 16;
+             if (offset + imageBytes > sizeBytes)
+@@ -1572,7 +1573,14 @@ void GS::vertexKick(bool drawing)
+     if (m_vtxCount < needed)
+         return;
+ 
+-    if (drawing && m_backend)
++    // [livelite] When the PCSX2 GS host draws the game the backend drops the batch (GSCpuBackend::Submit), and the
++    // preferred display source only picks what this runtime presents: neither is built. The vertex queue still advances.
++    static const bool s_liveSkipDraw = []
++    {
++        const char *keep = std::getenv("PS2X_GS_KEEP_RASTER");
++        return ps2_gsdump::liveActive() && !(keep && *keep == '1');
++    }();
++    if (drawing && m_backend && !s_liveSkipDraw)
+     {
+         GSPrimitiveBatch batch = buildDrawBatch(needed);
+         updatePreferredDisplaySourceForDraw(batch);
+diff --git a/ps2xRuntime/src/lib/gs/ps2_live_ring.h b/ps2xRuntime/src/lib/gs/ps2_live_ring.h
+index b8c6172..68267c9 100644
+--- a/ps2xRuntime/src/lib/gs/ps2_live_ring.h
++++ b/ps2xRuntime/src/lib/gs/ps2_live_ring.h
+@@ -24,7 +24,7 @@
+ namespace ps2live
+ {
+     constexpr uint32_t kMagic = 0x50324C52u; // "RL2P"
+-    constexpr uint32_t kVersion = 1u;
++    constexpr uint32_t kVersion = 2u; // 2: ReadFIFO2 replies (readback area after the events)
+     constexpr uint64_t kDefaultCapacity = 256ull << 20;
+ 
+     constexpr const wchar_t *kMappingName = L"Local\\PS2RecompGsLiveRing";
+@@ -53,7 +53,21 @@ namespace ps2live
+         volatile uint32_t consumerWaiting; // host blocked on the data event
+         volatile uint32_t producerFlags;
+         volatile uint32_t producerWaiting; // game blocked on the space event (ring full)
++        // 60 fps fights from the host's options menu (DBZ BT4 / BT3-Recomp): the game publishes its mode in gameFps60
++        // (0 = no switch, e.g. an older runtime; 1 = 30 fps; 2 = 60 fps), the menu writes 1 or 2 into fps60Request and
++        // the game clears it once applied. Both fit in the padding of this cache line: the layout is unchanged.
++        volatile uint32_t gameFps60;
++        volatile uint32_t fps60Request;
++        // Online status the host draws as a banner over the game (same field as the shared host's Ps2LiveRing.h):
++        // 0 none, 2 waiting for the other player, 3 connected, 4 could not connect, 6 the connection was lost.
++        volatile uint32_t netStatus;
++        // [handover] (same fields as the shared host's): the game can be replaced under the same window. The old game sets
++        // handover = 1 and exits; the new one opens this ring by name (PS2X_LIVE_ATTACH=<suffix>), writes its pid into
++        // producerPid and clears handover; the host keeps its window meanwhile.
++        volatile uint32_t handover;
++        volatile uint32_t producerPid;
+     };
++    static_assert(sizeof(RingHeader) == 192, "the ring header layout is shared with older builds");
+ 
+     // Object names for one game instance: base name + "_" + suffix (the game's process id, passed
+     // to the host as "-livering <suffix>"), so several instances never share a ring.
+@@ -67,7 +81,35 @@ namespace ps2live
+         return reinterpret_cast<uint8_t *>(header) + sizeof(RingHeader);
+     }
+ 
+-#if !defined(_WIN32)
++#if defined(_WIN32)
++    // Windows, version 2: the events are named kernel objects (kDataEventName, kSpaceEventName, kReadbackEventName),
++    // so the readback block follows the data area directly. For each ReadFIFO2 packet the consumer copies PCSX2's FIFO
++    // data into it, stores its size, bumps seq and sets the readback event (the game waits for it).
++    // Version 1 mappings (NBA Street V3) end after the data area: the consumer never answers those.
++    constexpr const wchar_t *kReadbackEventName = L"Local\\PS2RecompGsLiveReadback";
++    constexpr uint64_t kReadbackCapacity = 8ull << 20; // a 1024x1024 32-bit download plus slack
++
++    struct alignas(64) RingReadback
++    {
++        volatile uint32_t seq;
++        volatile uint32_t bytes;
++    };
++
++    inline uint64_t mappingSize(uint64_t capacity)
++    {
++        return sizeof(RingHeader) + capacity + sizeof(RingReadback) + kReadbackCapacity;
++    }
++
++    inline RingReadback *ringReadback(RingHeader *header)
++    {
++        return reinterpret_cast<RingReadback *>(ringData(header) + header->capacity);
++    }
++
++    inline uint8_t *readbackData(RingHeader *header)
++    {
++        return reinterpret_cast<uint8_t *>(ringReadback(header)) + sizeof(RingReadback);
++    }
++#else
+     // POSIX: the ring is a shm_open object and the two Windows auto-reset events are words in
+     // the same mapping, after the data area (macOS: os_sync_wait_on_address, Linux: futex).
+     // macOS limits shm names to 31 characters, so the base name is short.
+@@ -77,7 +119,13 @@ namespace ps2live
+     {
+         alignas(64) uint32_t data;  // set by the producer: new bytes in the ring
+         alignas(64) uint32_t space; // set by the consumer: ring space freed
++        // GS -> EE downloads: for each ReadFIFO2 packet the consumer copies PCSX2's FIFO data into the readback
++        // area, stores its size, bumps readbackSeq and sets readback (the game waits for it).
++        alignas(64) uint32_t readback;
++        uint32_t readbackSeq;
++        uint32_t readbackBytes;
+     };
++    constexpr uint64_t kReadbackCapacity = 8ull << 20; // a 1024x1024 32-bit download plus slack
+ 
+     inline std::string objectName(const char *base, const std::string &suffix)
+     {
+@@ -86,7 +134,7 @@ namespace ps2live
+ 
+     inline uint64_t mappingSize(uint64_t capacity)
+     {
+-        return sizeof(RingHeader) + capacity + sizeof(RingEvents);
++        return sizeof(RingHeader) + capacity + sizeof(RingEvents) + kReadbackCapacity;
+     }
+ 
+     inline RingEvents *ringEvents(RingHeader *header)
+@@ -94,6 +142,11 @@ namespace ps2live
+         return reinterpret_cast<RingEvents *>(ringData(header) + header->capacity);
+     }
+ 
++    inline uint8_t *readbackData(RingHeader *header)
++    {
++        return reinterpret_cast<uint8_t *>(ringEvents(header)) + sizeof(RingEvents);
++    }
++
+     // SetEvent on an auto-reset event.
+     inline void eventSet(uint32_t *word)
+     {
+diff --git a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+index 01db8ac..b1865db 100644
+--- a/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
++++ b/ps2xRuntime/src/lib/Kernel/EeScheduler.cpp
+@@ -26,9 +26,80 @@ extern std::atomic<const uint32_t *> g_ps2ProfGuestPc;
+ #include <emscripten.h>
+ #endif
+ #include <stdexcept>
++#include "Net/NetPlay.h"
+ 
+ namespace
+ {
++    // [det] PS2X_DETERMINISTIC=1 (online play): emulated time is a function of the game's own work only -- never of
++    // the host's clock, which differs from one machine and one run to the next. Lockstep needs two machines to run the
++    // same frames identically. The host clock still holds the game back (pacing) so it never runs faster than a PS2,
++    // but it no longer decides how many cycles pass: the three places that let it are switched (see "[det]" below).
++    bool eeDeterministic()
++    {
++        static const bool s_on = [] { const char *e = std::getenv("PS2X_DETERMINISTIC"); return e && *e == '1'; }();
++        return s_on;
++    }
++
++    // [det] What one RotateThreadReadyQueue costs in emulated time: threads that only yield to each other (the movie
++    // loop) then reach the next event by their own work. ~14 us.
++    constexpr uint32_t kDetYieldCycles = 4096u;
++
++    // [det] The longest step emulated time takes at once in a wait (an idle yield, a registered wait loop): 1 ms, so
++    // interrupts and the threads they wake (the sound streamer) still run between steps. PS2X_DET_IDLE_STEP_US=0: no
++    // steps (a yield costs kDetYieldCycles, wait loops just run).
++    uint64_t detIdleStep()
++    {
++        static const uint64_t s_step = []
++        {
++            const char *env = std::getenv("PS2X_DET_IDLE_STEP_US");
++            return (env && *env ? std::strtoull(env, nullptr, 10) : 1000ull) * 294912ull / 1000ull;
++        }();
++        return s_step;
++    }
++
++    // [det] PS2X_DETHASH=N: a hash of all of EE RAM every N vblanks, and the EE cycle it happened at -- the test that
++    // two runs (or two machines online) are the same game: "[dethash] vsync V cycle C h=H". PS2X_DETDUMP=V adds one hash
++    // per MB at that vblank ("[detmb] V mm H"), to find WHERE two runs differ. At the vblank, not in game code, so it
++    // also covers the movies and loading screens, where the game reads no pad and calls no sceGsSyncV.
++    uint64_t detFnv64(const uint8_t *p, size_t n)
++    {
++        uint64_t h = 1469598103934665603ull;
++        const uint64_t *w = reinterpret_cast<const uint64_t *>(p);
++        for (size_t i = 0; i < n / 8u; ++i)
++            h = (h ^ w[i]) * 1099511628211ull;
++        return h;
++    }
++    void detHashVsync(const uint8_t *rdram, uint64_t vsync, uint64_t cycle)
++    {
++        static const long s_every = [] { const char *e = std::getenv("PS2X_DETHASH"); return (e && *e) ? std::atol(e) : 0l; }();
++        static const long long s_dumpAt = [] { const char *e = std::getenv("PS2X_DETDUMP"); return (e && *e) ? std::atoll(e) : -1ll; }();
++        // PS2X_DETCYCLES=1: the EE cycle at every vblank, no hash -- cheap enough not to change the timing it looks
++        // for: the first vblank where two runs' cycles differ is the frame they took different paths in
++        static const bool s_cycles = [] { const char *e = std::getenv("PS2X_DETCYCLES"); return e && *e == '1'; }();
++        if (s_cycles)
++            std::fprintf(stderr, "[detcyc] %llu %llu\n", static_cast<unsigned long long>(vsync), static_cast<unsigned long long>(cycle));
++        if (s_every <= 0 || rdram == nullptr || (vsync % static_cast<uint64_t>(s_every)) != 0u)
++            return;
++        std::fprintf(stderr, "[dethash] vsync %llu cycle %llu h=%016llx\n", static_cast<unsigned long long>(vsync),
++                     static_cast<unsigned long long>(cycle), static_cast<unsigned long long>(detFnv64(rdram, PS2_RAM_SIZE)));
++        if (static_cast<long long>(vsync) == s_dumpAt)
++        {
++            for (uint32_t mb = 0; mb < PS2_RAM_SIZE / 0x100000u; ++mb)
++                std::fprintf(stderr, "[detmb] %llu %02x %016llx\n", static_cast<unsigned long long>(vsync), mb,
++                             static_cast<unsigned long long>(detFnv64(rdram + mb * 0x100000u, 0x100000u)));
++            // PS2X_DETDUMPDIR=<dir>: and the RAM itself, <dir>/ram_<vsync>.bin, to diff two runs byte by byte
++            if (const char *dir = std::getenv("PS2X_DETDUMPDIR"); dir && *dir)
++            {
++                const std::string path = std::string(dir) + "/ram_" + std::to_string(vsync) + ".bin";
++                if (std::FILE *f = std::fopen(path.c_str(), "wb"))
++                {
++                    std::fwrite(rdram, 1, PS2_RAM_SIZE, f);
++                    std::fclose(f);
++                }
++            }
++        }
++    }
++
+     void invalidateThreadCache(); // EeScheduler::thread() cache, see below
+ 
+     // GuestInvocation::tag high word marking "low word = caller thread id" (same value in MPEG.cpp).
+@@ -254,7 +325,15 @@ void EeScheduler::run()
+ 
+         if (m_currentThreadId == 0)
+         {
+-            GuestThread *next = selectReady();
++            // A callback tagged with its caller waits for a moment when no thread is ready (see below), but threads
++            // that wait by yielding to each other are always ready: Bloody Roar 4's waited for its RPC callbacks
++            // (0x21c660) for seconds, spinning through the scheduler. On a PS2 the callback comes as an interrupt,
++            // whatever is ready; a yield is a safe point to run it (the yielding thread is inside a syscall).
++            // PS2X_YIELD_CALLBACKS=0: the old order.
++            static const bool s_yieldCallbacks = [] { const char *e = std::getenv("PS2X_YIELD_CALLBACKS"); return !(e && *e == '0'); }();
++            const bool serveInvocation = s_yieldCallbacks && m_yieldServesInvocation && !m_pendingInvocations.empty();
++            m_yieldServesInvocation = false;
++            GuestThread *next = serveInvocation ? nullptr : selectReady();
+             if (!next && m_pendingInvocations.empty())
+             {
+                 copyMainContextToRuntime();
+@@ -651,11 +730,47 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+         return true;
+     }
+ 
++    // [det] A registered wait loop goes on to the next timed event (in cycle order: only emulated state decides), at
++    // most detIdleStep() at a time so interrupts and the threads they wake (the sound streamer) run between steps, and
++    // whatever the host's clock says (the pacing in processDueDeadlines then waits for its wall-clock time). Checked at
++    // every dispatch, not only at slice ends: Bloody Roar 4's loop at 0x29e6c0 spent 3/4 of the game thread spinning
++    // through the dispatcher. Any other code just runs: no catch-up by the clock, no sleeping that turns host time into
++    // cycles.
++    if (eeDeterministic() && !g_eeIdleLoops.empty() && detIdleStep() != 0u)
++    {
++        const uint64_t nextEvent = m_nextDeadlineCycle.load(std::memory_order_acquire);
++        const GuestThread *running = currentThread();
++        // (only with nothing else to run: what the loop waits for may be a thread of its own priority, which gets the
++        // CPU at the slice end below)
++        if (running != nullptr && nextEvent > m_eeCycle && eeIdleLoopAt(running->activeContext().pc) &&
++            !hasReadyAtOrAbovePriority(running->currentPriority) && m_pendingInvocations.empty())
++        {
++            accountCycles(static_cast<uint32_t>(std::min<uint64_t>(nextEvent - m_eeCycle, detIdleStep())));
++            if (m_eeCycle >= nextEvent)
++                markCheckpointPending();
++            // the loop's code runs again (it re-reads what it waits for) unless something is due now
++            return m_checkpointPending.load(std::memory_order_acquire) || m_pendingEeTimerInterrupts != 0u;
++        }
++    }
++
+     if (m_eeCycle < m_sliceEndCycle)
+     {
+         return false;
+     }
+ 
++    if (eeDeterministic())
++    {
++        const GuestThread *running = currentThread();
++        if (running != nullptr && hasReadyAtOrAbovePriority(running->currentPriority))
++        {
++            m_rescheduleRequested = true;
++            m_timeSliceExpired = true;
++            return true;
++        }
++        renewTimeSlice();
++        return false;
++    }
++
+     // Wait-loop catch-up: generated code charges a flat 32 cycles per loop back-edge, far less
+     // than the real cost of e.g. a 256-NOP spin, and IOP work done inside syscalls takes host
+     // time without charging EE cycles. If an event is already overdue in wall-clock time, jump
+@@ -829,6 +944,10 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
+     return false;
+ }
+ 
++// [det] The EE cycle as of the last accounting, for COP0 Count in deterministic mode (ps2UpdateCop0Count): the
++// host's TSC there made every read of Count depend on the host's speed.
++std::atomic<uint64_t> g_ps2EeCycleNow{0};
++
+ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+ {
+ #if defined(__EMSCRIPTEN__)
+@@ -843,6 +962,7 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
+     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
+     m_eeCycle += elapsed;
+ #endif
++    g_ps2EeCycleNow.store(m_eeCycle, std::memory_order_relaxed);
+     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
+     // The IOP only runs once 8192 EE cycles have accumulated (IopEmulator::runEeCycles keeps a
+     // carry), and this is called at every generated checkpoint (~7.6 M times/s in a match):
+@@ -1217,11 +1337,16 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
+     }
+ 
+     GuestThread *self = currentThread();
++    // [det] an idle yield: the caller would run again at once (nothing else ready at its priority or above)
++    const bool idleYield = self && self->currentPriority == priority && !hasReadyAtOrAbovePriority(priority) &&
++                           m_pendingInvocations.empty() && m_pendingEeTimerInterrupts == 0u &&
++                           !m_checkpointPending.load(std::memory_order_acquire);
+     if (self && self->currentPriority == priority)
+     {
+         enqueueReady(*self);
+         m_currentThreadId = 0;
+         m_rescheduleRequested = true;
++        m_yieldServesInvocation = !m_pendingInvocations.empty();
+     }
+     else
+     {
+@@ -1234,6 +1359,40 @@ int EeScheduler::rotateReadyQueue(int priority, bool interruptSafe)
+         }
+     }
+     (void)interruptSafe;
++
++    // Threads that only yield to each other (Bloody Roar 4's movie loop and its idle thread, both
++    // spinning on RotateThreadReadyQueue) renew their time slice at every switch, so checkpointDue()
++    // never reaches the slice end where emulated time catches up with an overdue host deadline, and
++    // the vsyncs came at ~3 Hz. Catch up here too (PS2X_YIELD_CATCHUP=0 turns it off).
++    static const bool s_catchUp = []
++    {
++        const char *env = std::getenv("PS2X_YIELD_CATCHUP");
++        return !(env && env[0] == '0');
++    }();
++    const int64_t hostDeadline = m_nextHostDeadlineRep.load(std::memory_order_acquire);
++    const uint64_t targetCycle = m_nextHostDeadlineCycle.load(std::memory_order_acquire);
++    if (eeDeterministic())
++    {
++        // [det] a fixed price per yield instead of "however late the clock says we are". An idle yield (Bloody Roar 4's
++        // idle thread, between the end of a frame's work and the vblank) goes on to the next timed event, at most
++        // detIdleStep() at a time, so interrupts and the threads they wake (the sound streamer) still run between steps,
++        // instead of thousands of trips through the scheduler a frame. Only emulated state decides the step: the same on
++        // both machines.
++        uint64_t charge = kDetYieldCycles;
++        const uint64_t nextEvent = m_nextDeadlineCycle.load(std::memory_order_acquire);
++        if (idleYield && detIdleStep() != 0u && nextEvent > m_eeCycle + kDetYieldCycles)
++            charge = std::min<uint64_t>(nextEvent - m_eeCycle, detIdleStep());
++        accountCycles(static_cast<uint32_t>(charge));
++        if (m_nextDeadlineCycle.load(std::memory_order_acquire) != 0u && m_eeCycle >= m_nextDeadlineCycle.load(std::memory_order_acquire))
++            markCheckpointPending();
++    }
++    else if (s_catchUp && hostDeadline != INT64_MAX && targetCycle > m_eeCycle &&
++        std::chrono::steady_clock::now().time_since_epoch().count() >= hostDeadline)
++    {
++        accountCycles(static_cast<uint32_t>(std::min<uint64_t>(targetCycle - m_eeCycle, 0xFFFFFFFFull)));
++        markCheckpointPending();
++    }
++
+     publishSnapshot();
+     return KE_OK;
+ }
+@@ -2461,11 +2620,14 @@ void EeScheduler::processDueDeadlines()
+                 }
+             }
+ 
++            // [det] due by cycle alone: the wait above already held the game back to the clock, and which events run
++            // now (rather than at some later check) must not depend on how far each host deadline happens to be.
+             const auto pacedNow = std::chrono::steady_clock::now();
++            const bool det = eeDeterministic();
+             auto firstFuture = std::partition(m_deadlines.begin(), m_deadlines.end(),
+-                                              [this, pacedNow](const ScheduledEvent &item)
++                                              [this, pacedNow, det](const ScheduledEvent &item)
+                                               { return item.deadlineCycle <= m_eeCycle &&
+-                                                       item.hostDeadline <= pacedNow; });
++                                                       (det || item.hostDeadline <= pacedNow); });
+             due.insert(due.end(),
+                        std::make_move_iterator(m_deadlines.begin()),
+                        std::make_move_iterator(firstFuture));
+@@ -2525,6 +2687,10 @@ void EeScheduler::processEvent(const EeEvent &event)
+         break;
+     case EeEventType::VBlankStart:
+         ++m_vsyncTick;
++        detHashVsync(m_runtime.memory().getRDRAM(), m_vsyncTick, m_eeCycle);
++        // [netplay] online: this frame's pads (sends ours, waits for the other player's). Before the vblank interrupt,
++        // so the game's vblank handlers already read the frame's inputs.
++        ps2_net::onVsync(m_vsyncTick, m_runtime.memory().getRDRAM(), &m_runtime);
+         ps2_gsdump::vsync(m_runtime.memory().gs(), static_cast<int>(m_vsyncTick & 1u));
+         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
+         // GS CSR.VSINT latches at every vblank start until the CPU writes 1 to clear it.
+@@ -2717,7 +2883,12 @@ void EeScheduler::waitForEvent()
+     if (hasTimerDeadline)
+     {
+         const auto timerHostDeadline = std::chrono::steady_clock::now() + eeCyclesToHostDuration(timerCycles);
+-        if (timerHostDeadline < hostDeadline)
++        // [det] which comes first is decided by cycles, not by wall-clock times that depend on how far behind the
++        // host happens to be
++        const bool timerFirst = eeDeterministic()
++                                    ? (m_deadlines.empty() || m_eeCycle + timerCycles < deadlineCycle)
++                                    : timerHostDeadline < hostDeadline;
++        if (timerFirst)
+         {
+             deadlineCycle = m_eeCycle + timerCycles;
+             hostDeadline = timerHostDeadline;
+diff --git a/C:/NBAOnline/PS2Recomp/ps2xRuntime/src/lib/Kernel/Net/NetPlay.cpp b/ps2xRuntime/src/lib/Kernel/Net/NetPlay.cpp
+new file mode 100644
+index 0000000..012456b
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/Net/NetPlay.cpp
+@@ -0,0 +1,656 @@
++// [netplay] Online play for two players by input lockstep.
++//
++// MODEL: the two games never exchange game state, only the pads. With PS2X_DETERMINISTIC=1 a game is a function of its
++// pad inputs (and PS2X_RTC, and its memory card), so two machines that feed the same inputs on the same frames run the
++// same game. Both boot on their own and meet at the first vblank: from there each frame is numbered by the vblank
++// count, which is the same on both.
++//
++// TIMING: the input sampled at vblank F is applied at vblank F + delay, which gives the network delay * 16.7 ms to
++// carry it. A game that does not have the other player's input for the frame waits for it (lockstep). Each packet
++// repeats the last kRedundancy inputs, so a lost datagram heals with the next one: UDP, no retransmits.
++//
++// CHECK: every PS2X_NET_CHECKEVERY frames (60) both hash all of EE RAM at the vblank and compare: a difference is a
++// desync, logged with its frame.
++//
++//   PS2X_NET_PLAYER=1|2                 which player is local (1 = port 1, 2 = port 2)
++//   PS2X_NET_RELAY=<host:port> PS2X_NET_TOKEN=<32 hex>   through the online server's relay (RLY1, see server/relay.go)
++//   PS2X_NET=<host:port> / PS2X_NET_LISTEN=<port>        direct, for tests on one machine or a LAN
++//   PS2X_NET_DELAY=<frames>|auto        input delay (auto: player 1 measures the round trip and tells player 2)
++//   PS2X_NET_WAIT_MS=<ms>               how long to wait for the other player at the start (default 60000)
++//   PS2X_NET_TIMEOUT=<ms>               silence that ends the match during play (default 10000)
++//   PS2X_NET_STATUS_FILE=<path>         "online" once both play, "offline <why>" when the match ends (the launcher)
++
++#include "NetPlay.h"
++
++#include <algorithm>
++#include <array>
++#include <chrono>
++#include <cmath>
++#include <cstddef>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <thread>
++#include <vector>
++
++#if defined(_WIN32)
++#  define WIN32_LEAN_AND_MEAN
++#  define NOMINMAX
++#  include <winsock2.h>
++#  include <ws2tcpip.h>
++#  if defined(_MSC_VER)
++#    pragma comment(lib, "ws2_32.lib")
++#  endif
++using socklen_t = int;
++#  define PS2X_NET_CLOSE closesocket
++#else
++#  include <arpa/inet.h>
++#  include <fcntl.h>
++#  include <netdb.h>
++#  include <netinet/in.h>
++#  include <sys/socket.h>
++#  include <unistd.h>
++using SOCKET = int;
++#  define INVALID_SOCKET (-1)
++#  define PS2X_NET_CLOSE ::close
++#endif
++
++
++namespace ps2_gsdump
++{
++    void setNetStatus(uint32_t status); // gs_dump_writer.h (not included: its headers clash with winsock's macros)
++}
++
++namespace ps2_net
++{
++    namespace
++    {
++        using Clock = std::chrono::steady_clock;
++
++        constexpr uint32_t kMagic = 0x4e345242u; // 'BR4N'
++        constexpr uint8_t kVersion = 2u; // 2: the RAM hash in 8 lanes (hashRam)
++        constexpr uint32_t kRedundancy = 8u;
++        constexpr uint32_t kRing = 512u; // frames kept per side
++        constexpr size_t kEeRamSize = 32u * 1024u * 1024u; // PS2_RAM_SIZE (ps2_runtime.h clashes with winsock's macros)
++
++        enum Kind : uint8_t
++        {
++            kInputs = 0,
++            kPing = 1,
++            kPong = 2,
++            kDelay = 3,
++            kDelayAck = 4,
++            kBye = 5,
++        };
++
++#pragma pack(push, 1)
++        struct WireInput
++        {
++            uint16_t buttons;
++            uint8_t lx, ly, rx, ry;
++        };
++        struct Packet
++        {
++            uint32_t magic;
++            uint8_t version;
++            uint8_t kind;
++            uint8_t player;    // the sender, 1 or 2
++            uint8_t count;     // inputs carried, oldest first
++            uint32_t base;     // frame of inputs[0]
++            uint32_t checkFrame; // frame of checksum (0 = none)
++            uint64_t checksum; // hash of EE RAM at checkFrame's vblank
++            uint64_t value;    // ping/pong: the sender's clock in us; delay: the frames
++            WireInput inputs[kRedundancy];
++        };
++#pragma pack(pop)
++
++        struct Slot
++        {
++            uint32_t frame = 0xFFFFFFFFu;
++            PadSample pad;
++        };
++
++        struct State
++        {
++            bool configured = false, started = false, online = false, ended = false;
++            int player = 1;
++            SOCKET sock = INVALID_SOCKET;
++            sockaddr_in peer{};
++            bool peerKnown = false;
++            bool relay = false;
++            bool listen = false;
++            char token[33] = {};
++            bool autoDelay = false;
++            uint32_t delay = 3;
++            uint32_t waitMs = 60000, timeoutMs = 10000, checkEvery = 60;
++            std::string statusPath;
++
++            std::array<Slot, kRing> local{}, remote{};
++            uint32_t firstFrame = 0;  // the vblank lockstep started at
++            uint32_t frame = 0;       // the vblank being played
++            PadSample current[2];     // this frame's input per port
++
++            std::array<std::pair<uint32_t, uint64_t>, 16> ourHash{};
++            uint32_t peerCheckFrame = 0;
++            uint64_t peerChecksum = 0;
++            uint32_t lastCompared = 0;
++            uint64_t desyncs = 0;
++            uint32_t ourCheckFrame = 0;
++            uint64_t ourChecksum = 0;
++
++            Clock::time_point lastRx{};
++            uint64_t stalls = 0, stallUs = 0, rx = 0, tx = 0;
++            uint32_t peerDelay = 0; // player 2: the delay player 1 announced
++            bool delayAcked = false;
++            // the banner the GS host draws (RingHeader::netStatus) and until which vblank
++            uint32_t banner = 0, bannerUntil = 0, lastVsync = 0;
++        };
++
++        State g;
++
++        uint64_t nowUs()
++        {
++            return static_cast<uint64_t>(
++                std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count());
++        }
++
++        const char *env(const char *name)
++        {
++            const char *v = std::getenv(name);
++            return (v && *v) ? v : nullptr;
++        }
++
++        void showBanner(uint32_t status, uint32_t frames)
++        {
++            g.banner = status;
++            g.bannerUntil = g.lastVsync + frames;
++            ps2_gsdump::setNetStatus(status);
++        }
++
++        void writeStatus(const char *line)
++        {
++            if (g.statusPath.empty())
++                return;
++            if (std::FILE *f = std::fopen(g.statusPath.c_str(), "wb"))
++            {
++                std::fputs(line, f);
++                std::fputc('\n', f);
++                std::fclose(f);
++            }
++        }
++
++        bool resolve(const char *hostPort, sockaddr_in &out)
++        {
++            std::string s(hostPort);
++            const size_t colon = s.rfind(':');
++            if (colon == std::string::npos)
++                return false;
++            const std::string host = s.substr(0, colon), port = s.substr(colon + 1);
++            addrinfo hints{};
++            hints.ai_family = AF_INET;
++            hints.ai_socktype = SOCK_DGRAM;
++            addrinfo *res = nullptr;
++            if (getaddrinfo(host.c_str(), port.c_str(), &hints, &res) != 0 || !res)
++                return false;
++            std::memcpy(&out, res->ai_addr, sizeof(sockaddr_in));
++            freeaddrinfo(res);
++            return true;
++        }
++
++        void configure()
++        {
++            static bool s_done = false;
++            if (s_done)
++                return;
++            s_done = true;
++            const char *p = env("PS2X_NET_PLAYER");
++            if (!p || (p[0] != '1' && p[0] != '2'))
++                return;
++            g.player = p[0] - '0';
++            const char *relay = env("PS2X_NET_RELAY"), *token = env("PS2X_NET_TOKEN");
++            const char *direct = env("PS2X_NET"), *listen = env("PS2X_NET_LISTEN");
++            if (!(relay && token && std::strlen(token) == 32) && !direct && !listen)
++                return;
++            if (const char *d = env("PS2X_NET_DELAY"))
++            {
++                if (std::strcmp(d, "auto") == 0)
++                    g.autoDelay = true;
++                else
++                    g.delay = static_cast<uint32_t>(std::clamp(std::atoi(d), 1, 10));
++            }
++            if (const char *v = env("PS2X_NET_WAIT_MS"))
++                g.waitMs = static_cast<uint32_t>(std::max(1000, std::atoi(v)));
++            if (const char *v = env("PS2X_NET_TIMEOUT"))
++                g.timeoutMs = static_cast<uint32_t>(std::max(1000, std::atoi(v)));
++            if (const char *v = env("PS2X_NET_CHECKEVERY"))
++                g.checkEvery = static_cast<uint32_t>(std::max(1, std::atoi(v)));
++            if (const char *v = env("PS2X_NET_STATUS_FILE"))
++                g.statusPath = v;
++            if (const char *v = env("PS2X_DETERMINISTIC"); !v || v[0] != '1')
++                std::fprintf(stderr, "[net] warning: PS2X_DETERMINISTIC=1 is not set, the two games will not stay the same\n");
++
++#if defined(_WIN32)
++            WSADATA wsa;
++            if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
++                return;
++#endif
++            g.sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++            if (g.sock == INVALID_SOCKET)
++                return;
++#if defined(_WIN32)
++            u_long nb = 1;
++            ioctlsocket(g.sock, FIONBIO, &nb);
++#else
++            fcntl(g.sock, F_SETFL, fcntl(g.sock, F_GETFL, 0) | O_NONBLOCK);
++#endif
++            if (relay && token && std::strlen(token) == 32)
++            {
++                g.relay = true;
++                std::memcpy(g.token, token, 32);
++                g.peerKnown = resolve(relay, g.peer);
++            }
++            else if (listen)
++            {
++                sockaddr_in a{};
++                a.sin_family = AF_INET;
++                a.sin_addr.s_addr = htonl(INADDR_ANY);
++                a.sin_port = htons(static_cast<uint16_t>(std::atoi(listen)));
++                if (::bind(g.sock, reinterpret_cast<sockaddr *>(&a), sizeof a) != 0)
++                {
++                    std::fprintf(stderr, "[net] cannot listen on UDP %s\n", listen);
++                    return;
++                }
++                g.listen = true;
++            }
++            else
++            {
++                g.peerKnown = resolve(direct, g.peer);
++            }
++            if (!g.relay && !g.listen && !g.peerKnown)
++            {
++                std::fprintf(stderr, "[net] cannot resolve the peer\n");
++                return;
++            }
++            g.configured = true;
++            std::fprintf(stderr, "[net] player %d via %s, delay %s\n", g.player, g.relay ? "relay" : (g.listen ? "listen" : "direct"),
++                         g.autoDelay ? "auto" : std::to_string(g.delay).c_str());
++        }
++
++        void sendRaw(const void *data, size_t n)
++        {
++            if (!g.peerKnown)
++                return;
++            ::sendto(g.sock, static_cast<const char *>(data), static_cast<int>(n), 0, reinterpret_cast<const sockaddr *>(&g.peer),
++                     sizeof g.peer);
++            ++g.tx;
++        }
++
++        void sendRelayRegistration()
++        {
++            char reg[37];
++            std::memcpy(reg, "RLY1", 4);
++            std::memcpy(reg + 4, g.token, 32);
++            reg[36] = static_cast<char>('0' + g.player);
++            sendRaw(reg, sizeof reg);
++        }
++
++        Packet header(uint8_t kind)
++        {
++            Packet p{};
++            p.magic = kMagic;
++            p.version = kVersion;
++            p.kind = kind;
++            p.player = static_cast<uint8_t>(g.player);
++            p.checkFrame = g.ourCheckFrame;
++            p.checksum = g.ourChecksum;
++            return p;
++        }
++
++        void sendControl(uint8_t kind, uint64_t value)
++        {
++            Packet p = header(kind);
++            p.value = value;
++            sendRaw(&p, sizeof p);
++        }
++
++        // Our inputs up to frame `last` (the newest is the one for frame + delay).
++        void sendInputs(uint32_t last)
++        {
++            Packet p = header(kInputs);
++            const uint32_t first = std::max(g.firstFrame, last >= kRedundancy - 1 ? last - (kRedundancy - 1) : 0u);
++            uint32_t n = 0;
++            for (uint32_t f = first; f <= last && n < kRedundancy; ++f)
++            {
++                const Slot &s = g.local[f % kRing];
++                if (s.frame != f)
++                    continue;
++                if (n == 0)
++                    p.base = f;
++                p.inputs[n++] = WireInput{s.pad.buttons, s.pad.lx, s.pad.ly, s.pad.rx, s.pad.ry};
++            }
++            p.count = static_cast<uint8_t>(n);
++            sendRaw(&p, sizeof p);
++        }
++
++        void compareChecks()
++        {
++            if (g.peerCheckFrame == 0 || g.peerCheckFrame == g.lastCompared)
++                return;
++            for (const auto &[f, h] : g.ourHash)
++            {
++                if (f != g.peerCheckFrame)
++                    continue;
++                g.lastCompared = f;
++                if (h != g.peerChecksum)
++                {
++                    ++g.desyncs;
++                    std::fprintf(stderr, "[net] *** DESYNC at frame %u: ours %016llx, theirs %016llx\n", f,
++                                 static_cast<unsigned long long>(h), static_cast<unsigned long long>(g.peerChecksum));
++                }
++                return;
++            }
++        }
++
++        void handle(const Packet &p, size_t n, std::vector<uint64_t> *rtts)
++        {
++            if (n < offsetof(Packet, inputs) || p.magic != kMagic || p.version != kVersion || p.player != 3 - g.player)
++                return;
++            g.lastRx = Clock::now();
++            ++g.rx;
++            if (p.checkFrame != 0 && p.checkFrame > g.peerCheckFrame)
++            {
++                g.peerCheckFrame = p.checkFrame;
++                g.peerChecksum = p.checksum;
++            }
++            switch (p.kind)
++            {
++            case kInputs:
++                for (uint32_t i = 0; i < p.count && i < kRedundancy; ++i)
++                {
++                    const uint32_t f = p.base + i;
++                    Slot &s = g.remote[f % kRing];
++                    s.frame = f;
++                    s.pad = PadSample{p.inputs[i].buttons, p.inputs[i].lx, p.inputs[i].ly, p.inputs[i].rx, p.inputs[i].ry};
++                }
++                break;
++            case kPing:
++                sendControl(kPong, p.value);
++                break;
++            case kPong:
++                if (rtts && p.value != 0)
++                    rtts->push_back(nowUs() - p.value);
++                break;
++            case kDelay:
++                if (g.player == 2 && p.value >= 1 && p.value <= 10)
++                {
++                    g.peerDelay = static_cast<uint32_t>(p.value);
++                    sendControl(kDelayAck, p.value);
++                }
++                break;
++            case kDelayAck:
++                if (g.player == 1 && p.value == g.delay)
++                    g.delayAcked = true;
++                break;
++            case kBye:
++                if (g.online && !g.ended)
++                {
++                    g.ended = true;
++                    std::fprintf(stderr, "[net] the other player left\n");
++                    writeStatus("offline the other player left");
++                    showBanner(6, 300);
++                }
++                break;
++            default:
++                break;
++            }
++            compareChecks();
++        }
++
++        // Reads every datagram waiting. In listen mode the first valid sender becomes the peer.
++        void pump(std::vector<uint64_t> *rtts = nullptr)
++        {
++            for (;;)
++            {
++                char buf[512];
++                sockaddr_in from{};
++                socklen_t len = sizeof from;
++                const int n = ::recvfrom(g.sock, buf, sizeof buf, 0, reinterpret_cast<sockaddr *>(&from), &len);
++                if (n <= 0)
++                    return;
++                if (g.relay && n == 6 && std::memcmp(buf, "RLYA", 4) == 0)
++                    continue; // the relay's answer to the registration
++                if (static_cast<size_t>(n) < offsetof(Packet, inputs))
++                    continue;
++                Packet p{};
++                std::memcpy(&p, buf, std::min(static_cast<size_t>(n), sizeof p));
++                if (g.listen && !g.peerKnown && p.magic == kMagic && p.player == 3 - g.player)
++                {
++                    g.peer = from;
++                    g.peerKnown = true;
++                }
++                handle(p, static_cast<size_t>(n), rtts);
++            }
++        }
++
++        void sleepMs(int ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
++
++        void goOffline(const char *why)
++        {
++            if (g.ended)
++                return;
++            g.ended = true;
++            std::fprintf(stderr, "[net] match over: %s (frame %u, stalls %llu, %.1f s waited, desyncs %llu)\n", why, g.frame,
++                         static_cast<unsigned long long>(g.stalls), g.stallUs / 1e6, static_cast<unsigned long long>(g.desyncs));
++            const std::string line = std::string("offline ") + why;
++            writeStatus(line.c_str());
++            showBanner(6, 300);
++            for (int i = 0; i < 3; ++i)
++                sendControl(kBye, 0);
++        }
++
++        void sendByeAtExit()
++        {
++            if (g.online && !g.ended)
++                for (int i = 0; i < 3; ++i)
++                    sendControl(kBye, 0);
++        }
++
++        // The start: both games wait here (their first vblank) for each other, then agree on the delay.
++        void meet(uint32_t vsync)
++        {
++            g.started = true;
++            std::fprintf(stderr, "[net] waiting for the other player (up to %u s)\n", g.waitMs / 1000u);
++            writeStatus("waiting");
++            const auto t0 = Clock::now();
++            auto lastSend = Clock::time_point{};
++            auto lastReg = Clock::time_point{};
++            std::vector<uint64_t> rtts;
++            bool heard = false;
++            for (;;)
++            {
++                const auto now = Clock::now();
++                if (now - t0 > std::chrono::milliseconds(g.waitMs))
++                {
++                    std::fprintf(stderr, "[net] the other player never came\n");
++                    g.ended = true;
++                    writeStatus("offline the other player never came");
++                    showBanner(4, 300);
++                    return;
++                }
++                if (g.relay && now - lastReg > std::chrono::milliseconds(500))
++                {
++                    sendRelayRegistration();
++                    lastReg = now;
++                }
++                if (now - lastSend > std::chrono::milliseconds(heard ? 20 : 100))
++                {
++                    sendControl(kPing, nowUs());
++                    if (g.player == 1 && g.autoDelay && rtts.size() >= 8)
++                        sendControl(kDelay, g.delay);
++                    lastSend = now;
++                }
++                pump(&rtts);
++                heard = g.rx > 0;
++                ps2_gsdump::setNetStatus(2); // every pass: the GS host's ring may open while we wait
++                if (heard)
++                {
++                    if (g.player == 1 && g.autoDelay && rtts.size() >= 8 && !g.delayAcked)
++                    {
++                        std::vector<uint64_t> s(rtts.begin(), rtts.begin() + 8);
++                        std::sort(s.begin(), s.end());
++                        const double oneWayMs = s[4] / 2000.0;
++                        g.delay = static_cast<uint32_t>(std::clamp(static_cast<int>(std::ceil((oneWayMs + 8.0) / 16.667)), 1, 8));
++                    }
++                    const bool delayAgreed = !g.autoDelay || (g.player == 1 ? g.delayAcked : g.peerDelay != 0);
++                    if (delayAgreed)
++                        break;
++                }
++                sleepMs(2);
++            }
++            if (g.autoDelay && g.player == 2)
++                g.delay = g.peerDelay;
++            g.firstFrame = vsync;
++            g.online = true;
++            g.lastRx = Clock::now();
++            std::atexit(sendByeAtExit);
++            showBanner(3, 180);
++            std::fprintf(stderr, "[net] online from frame %u, delay %u frames, waited %.1f s\n", vsync, g.delay,
++                         std::chrono::duration<double>(Clock::now() - t0).count());
++            writeStatus("online");
++        }
++
++        // FNV-1a over 64-bit words in 8 independent lanes (word i goes to lane i % 8), folded at the end. One chain of 4M
++        // dependent multiplies took ~4.5 ms at the vblank once a second; the lanes run side by side, so the 32 MB read
++        // is the limit. Integers only: the same value on every machine. Protocol version 2 (version 1 was one lane).
++        uint64_t hashRam(const uint8_t *p, size_t n)
++        {
++            constexpr uint64_t kBasis = 1469598103934665603ull, kPrime = 1099511628211ull;
++            uint64_t h[8];
++            for (uint64_t &x : h)
++                x = kBasis;
++            const uint64_t *w = reinterpret_cast<const uint64_t *>(p);
++            const size_t words = n / 8u;
++            size_t i = 0;
++            for (; i + 8u <= words; i += 8u)
++                for (size_t l = 0; l < 8u; ++l)
++                    h[l] = (h[l] ^ w[i + l]) * kPrime;
++            for (; i < words; ++i)
++                h[0] = (h[0] ^ w[i]) * kPrime;
++            uint64_t r = kBasis;
++            for (uint64_t x : h)
++                r = (r ^ x) * kPrime;
++            return r;
++        }
++    }
++
++    bool enabled()
++    {
++        configure();
++        return g.configured;
++    }
++
++    void onVsync(uint64_t vsync64, const uint8_t *rdram, PS2Runtime *runtime)
++    {
++        if (!enabled())
++            return;
++        const uint32_t vsync = static_cast<uint32_t>(vsync64);
++        g.lastVsync = vsync;
++        if (!g.started)
++            meet(vsync);
++        if (g.banner != 0 && vsync >= g.bannerUntil)
++            g.banner = 0;
++        ps2_gsdump::setNetStatus(g.banner);
++        const PadSample mine = sampleLocalPad(runtime);
++        const int myPort = g.player - 1;
++        if (!g.online || g.ended)
++        {
++            // offline (the other player never came or left): the local pad plays its own port, the other one idles
++            g.current[myPort] = mine;
++            g.current[1 - myPort] = PadSample{};
++            return;
++        }
++        g.frame = vsync;
++
++        // the hash first: it is the state both games reached with the same inputs
++        if (rdram && ((vsync - g.firstFrame) % g.checkEvery) == 0u && vsync != g.firstFrame)
++        {
++            const uint64_t h = hashRam(rdram, kEeRamSize);
++            g.ourHash[(vsync / g.checkEvery) % g.ourHash.size()] = {vsync, h};
++            g.ourCheckFrame = vsync;
++            g.ourChecksum = h;
++            compareChecks();
++        }
++
++        const uint32_t target = vsync + g.delay;
++        g.local[target % kRing] = Slot{target, mine};
++        sendInputs(target);
++
++        PadSample theirs{};
++        if (vsync >= g.firstFrame + g.delay)
++        {
++            const auto t0 = Clock::now();
++            auto lastSend = t0;
++            bool stalled = false;
++            for (;;)
++            {
++                pump();
++                if (g.ended)
++                    break;
++                const Slot &s = g.remote[vsync % kRing];
++                if (s.frame == vsync)
++                {
++                    theirs = s.pad;
++                    break;
++                }
++                const auto now = Clock::now();
++                if (!stalled)
++                {
++                    stalled = true;
++                    ++g.stalls;
++                }
++                if (now - g.lastRx > std::chrono::milliseconds(g.timeoutMs))
++                {
++                    goOffline("the other player stopped answering");
++                    break;
++                }
++                if (now - lastSend > std::chrono::milliseconds(15))
++                {
++                    sendInputs(target); // the other side may have lost ours
++                    lastSend = now;
++                }
++                std::this_thread::sleep_for(std::chrono::microseconds(500));
++            }
++            if (stalled)
++                g.stallUs += static_cast<uint64_t>(
++                    std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count());
++        }
++        else
++        {
++            pump();
++        }
++        if (g.ended)
++        {
++            g.current[myPort] = mine;
++            g.current[1 - myPort] = PadSample{};
++            return;
++        }
++
++        const Slot &own = g.local[vsync % kRing];
++        g.current[myPort] = own.frame == vsync ? own.pad : PadSample{};
++        g.current[1 - myPort] = theirs;
++
++        if (((vsync - g.firstFrame) % 600u) == 0u && vsync != g.firstFrame)
++            std::fprintf(stderr, "[net] frame %u: stalls %llu (%.1f s), rx %llu tx %llu, desyncs %llu\n", vsync,
++                         static_cast<unsigned long long>(g.stalls), g.stallUs / 1e6, static_cast<unsigned long long>(g.rx),
++                         static_cast<unsigned long long>(g.tx), static_cast<unsigned long long>(g.desyncs));
++    }
++
++    bool padFor(int port, PadSample &out)
++    {
++        if (!g.configured || port < 0 || port > 1)
++            return false;
++        out = g.current[port];
++        return true;
++    }
++}
+diff --git a/C:/NBAOnline/PS2Recomp/ps2xRuntime/src/lib/Kernel/Net/NetPlay.h b/ps2xRuntime/src/lib/Kernel/Net/NetPlay.h
+new file mode 100644
+index 0000000..653d0f6
+--- /dev/null
++++ b/ps2xRuntime/src/lib/Kernel/Net/NetPlay.h
+@@ -0,0 +1,32 @@
++#pragma once
++
++// [netplay] Two-player online play by input lockstep (PS2X_DETERMINISTIC=1 makes both games the same function of
++// their inputs; see NetPlay.cpp).
++
++#include <cstdint>
++
++class PS2Runtime;
++
++namespace ps2_net
++{
++    // One pad's input for one frame: what crosses the network.
++    struct PadSample
++    {
++        uint16_t buttons = 0xFFFFu; // active-low, as the pad reports it
++        uint8_t lx = 0x80u, ly = 0x80u, rx = 0x80u, ry = 0x80u;
++    };
++
++    // PS2X_NET_PLAYER=1|2 and a transport (PS2X_NET_RELAY + PS2X_NET_TOKEN, PS2X_NET=<host:port> or
++    // PS2X_NET_LISTEN=<port>). Read once.
++    bool enabled();
++
++    // The local player's pad right now (host controller, keyboard, GS host window, PS2X_PAD_SCRIPT). In Pad.cpp.
++    PadSample sampleLocalPad(PS2Runtime *runtime);
++
++    // At every VBlankStart, on the EE executor thread: sends this frame's local input and waits for the other
++    // player's. Blocks the game while the other one is behind.
++    void onVsync(uint64_t vsync, const uint8_t *rdram, PS2Runtime *runtime);
++
++    // The input a pad port reads this frame while netplay runs (port 0 = player 1, port 1 = player 2).
++    bool padFor(int port, PadSample &out);
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+index d29ccdf..8150405 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.cpp
+@@ -342,6 +342,11 @@ namespace ps2_stubs
+         return readCdSectors(lbn, sectors, dst, bytes);
+     }
+ 
++    bool readCdSectorsForIop(uint32_t lbn, uint32_t sectors, void *dst, size_t bytes)
++    {
++        return dst && readCdSectorsAfterQueued(lbn, sectors, static_cast<uint8_t *>(dst), bytes);
++    }
++
+     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         struct CompletionNotifier
+@@ -714,11 +719,26 @@ namespace ps2_stubs
+ 
+         std::time_t now = std::time(nullptr);
+         std::tm localTm{};
++        // [det] PS2X_RTC=<unix seconds> (online): the same date on both machines, in UTC, moving with the frames
++        // (60 vblanks a second) rather than with the host's clock -- the game seeds its random numbers from it.
++        static const long long s_rtc = [] { const char *e = std::getenv("PS2X_RTC"); return (e && *e) ? std::atoll(e) : -1ll; }();
++        if (s_rtc >= 0)
++        {
++            now = static_cast<std::time_t>(s_rtc + static_cast<long long>(runtime ? runtime->eeScheduler().currentVSyncTick() / 60u : 0u));
++#ifdef _WIN32
++            gmtime_s(&localTm, &now);
++#else
++            gmtime_r(&now, &localTm);
++#endif
++        }
++        else
++        {
+ #ifdef _WIN32
+-        localtime_s(&localTm, &now);
++            localtime_s(&localTm, &now);
+ #else
+-        localtime_r(&now, &localTm);
++            localtime_r(&now, &localTm);
+ #endif
++        }
+ 
+         // sceCdCLOCK format (BCD fields).
+         clockData[0] = 0;
+@@ -837,7 +857,7 @@ namespace ps2_stubs
+             {
+                 std::cerr << "sceCdSearchFile failed: " << sanitizeForLog(path)
+                           << " (root: " << getCdRootPath().string()
+-                          << ", repeat=" << samePathFailCount << ")" << std::endl;
++                          << ", repeat=" << samePathFailCount << ", ra=0x" << std::hex << callerRa << std::dec << ")" << std::endl;
+             }
+             setReturnS32(ctx, 0);
+             return;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/CD.h b/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
+index b35fc80..1e128c8 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/CD.h
+@@ -82,4 +82,8 @@ namespace ps2_stubs
+     void sceCdStStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdSyncS(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void sceCdTrayReq(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
++
++    // IOP cdvdman reads (ps2xIOP through the host adapter): an IRX gets its LSNs from the game's
++    // sceCdSearchFile, i.e. this runtime's LSNs (extracted files sit at pseudo LSNs past the image).
++    bool readCdSectorsForIop(uint32_t lbn, uint32_t sectors, void *dst, size_t bytes);
+ }
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+index 37c6b56..69f2c33 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/GS.cpp
+@@ -129,8 +129,8 @@ namespace ps2_stubs
+             ps2_gsdump::writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
+         }
+ 
+-        void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
+         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr);
++        void writeGuestU32(uint8_t *rdram, PS2Runtime *runtime, uint32_t addr, uint32_t value);
+ 
+         void initPacketBuilderState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+         {
+@@ -164,6 +164,20 @@ namespace ps2_stubs
+                 currentAddr += 4u;
+             }
+ 
++            // As the SDK's libgifpk terminate: the open DMA tag (state +8) gets the qwords written
++            // after it ADDED to the count it was created with. Games mix their own (recompiled)
++            // packet functions with these HLE ones (Bloody Roar 4 only HLEs AddGsAD and
++            // CloseGifTag), so both must follow the SDK; a count kept up to date on every write
++            // here was then added again by the game's terminate (its movie upload chain sent
++            // twice the qwords of its first DMA tag and lost the rest: black movies).
++            uint32_t tagAddr = 0u;
++            if (tryReadWordFromGuest(rdram, runtime, stateAddr + 8u, tagAddr) && tagAddr != 0u && currentAddr > tagAddr)
++            {
++                uint32_t tagWord = 0u;
++                if (tryReadWordFromGuest(rdram, runtime, tagAddr, tagWord))
++                    writeGuestU32(rdram, runtime, tagAddr, tagWord + ((currentAddr - tagAddr) >> 4u) - 1u);
++            }
++
+             writePacketBuilderCurrent(rdram, runtime, stateAddr, currentAddr);
+             writeGuestBytes(rdram,
+                             runtime,
+@@ -234,39 +248,10 @@ namespace ps2_stubs
+                             sizeof(temp));
+         }
+ 
+-        void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr)
+-        {
+-            uint32_t currentAddr = 0u;
+-            uint32_t pendingCountAddr = 0u;
+-            if (!tryReadWordFromGuest(rdram, runtime, stateAddr, currentAddr) ||
+-                !tryReadWordFromGuest(rdram, runtime, stateAddr + 8u, pendingCountAddr) ||
+-                pendingCountAddr == 0u ||
+-                currentAddr <= pendingCountAddr)
+-            {
+-                return;
+-            }
+-
+-            uint32_t countWord = 0u;
+-            if (!tryReadWordFromGuest(rdram, runtime, pendingCountAddr, countWord))
+-            {
+-                return;
+-            }
+-
+-            const uint32_t deltaBytes = currentAddr - pendingCountAddr;
+-            uint32_t deltaQwords = 0u;
+-            if (deltaBytes >= 16u)
+-            {
+-                deltaQwords = (deltaBytes >> 4u) - 1u;
+-            }
+-
+-            countWord = (countWord & 0xFFFF0000u) | (deltaQwords & 0xFFFFu);
+-            writeGuestU32(rdram, runtime, pendingCountAddr, countWord);
+-        }
+-
++        // The open DMA tag's count is settled by terminatePacketBuilderState, as in the SDK.
+         void writePacketBuilderCurrent(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t currentAddr)
+         {
+             writeGuestU32(rdram, runtime, stateAddr, currentAddr);
+-            refreshPacketBuilderPendingCount(rdram, runtime, stateAddr);
+         }
+ 
+         uint32_t reservePacketBuilderWords(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr, uint32_t wordCount)
+@@ -753,6 +738,9 @@ namespace ps2_stubs
+ 
+         ps2TraceGuestRangeWrite(rdram, dstAddr, totalImageBytes, "sceGsExecStoreImage", ctx);
+         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
++        // The GS host's PCSX2 GS finishes the same local->host transfer; what it drew never reached
++        // the runtime's VRAM, so its answer replaces the runtime's bytes (PS2X_GSLIVE_READBACK=0: off).
++        ps2_gsdump::readFifoInto(dst, totalImageBytes);
+         runtime->guestFree(pktAddr);
+ 
+         setReturnS32(ctx, 0);
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+index 721e03b..dd98483 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Helpers/Support.h
+@@ -1794,8 +1794,13 @@ namespace
+         uint64_t bytes = 0;
+         switch (psm)
+         {
++        case 1:  // PSMCT24
++        case 49: // PSMZ24
++            // Host<->local transfers carry 24-bit formats packed, 3 bytes per pixel (the GS, PCSX2 and this
++            // runtime's GS all do). Counting 4 overruns the guest buffer once the GS host answers a download.
++            bytes = pixels * 3ull;
++            break;
+         case 0:  // PSMCT32
+-        case 1:  // PSMCT24 (treat as 32)
+         case 27: // PSMT8H (packed in 32-bit lanes)
+         case 36: // PSMT4HL (packed in 32-bit lanes)
+         case 44: // PSMT4HH (packed in 32-bit lanes)
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+index 4e6b885..a414c54 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MemoryCard.cpp
+@@ -286,8 +286,24 @@ namespace ps2_stubs
+ 
+         void writeMcDateTime(SceMcStDateTime &out, std::time_t value)
+         {
++            // [det] PS2X_RTC set (online): every file reports that date, in UTC. The host's file times differ per
++            // machine and per run (each one copied the card at its own moment), and the game keeps the directory
++            // table it gets -- the same fix as DBZ BT4's.
++            static const long long s_rtc = [] { const char *e = std::getenv("PS2X_RTC"); return (e && *e) ? std::atoll(e) : -1ll; }();
+             std::tm tm{};
+-            if (!localtimeSafeMc(&value, &tm))
++            bool ok;
++            if (s_rtc >= 0)
++            {
++                value = static_cast<std::time_t>(s_rtc);
++#ifdef _WIN32
++                ok = gmtime_s(&tm, &value) == 0;
++#else
++                ok = gmtime_r(&value, &tm) != nullptr;
++#endif
++            }
++            else
++                ok = localtimeSafeMc(&value, &tm);
++            if (!ok)
+             {
+                 std::memset(&out, 0, sizeof(out));
+                 return;
+@@ -819,6 +835,13 @@ namespace ps2_stubs
+                             {
+                                 continue;
+                             }
++                            // [det] the host's own files (.DS_Store, ._*, Thumbs.db, desktop.ini) are not on a PS2
++                            // card: listed, they make the card a different card on each machine (DBZ BT4's desync)
++                            const std::string lower = toLowerAscii(name);
++                            if (name[0] == '.' || lower == "thumbs.db" || lower == "desktop.ini")
++                            {
++                                continue;
++                            }
+ 
+                             std::error_code entryEc;
+                             const bool isDirectory = entry.is_directory(entryEc) && !entryEc;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+index 30806ea..ffaf83c 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/MPEG.cpp
+@@ -21,6 +21,8 @@ extern "C"
+ 
+ #include "Syscalls/Helpers/State.h"
+ 
++extern std::atomic<uint64_t> g_ps2EeCycleNow; // EeScheduler.cpp: the emulated EE cycle ([det] sceMpegAddBs)
++
+ namespace ps2_stubs
+ {
+     namespace
+@@ -483,6 +485,21 @@ namespace ps2_stubs
+         constexpr uint64_t kDefaultPictureIntervalQ32 = 2ull * kPictureClockOne;
+         constexpr size_t kMpegTimingScanLimit = 4096u;
+         constexpr size_t kMaxDecodedPicturesAhead = 8u;
++        // Video packets demuxed while kMaxDecodedPicturesAhead pictures wait, kept compressed until
++        // the queue drains. The demuxer must keep consuming meanwhile: the same PSS carries the audio
++        // (Bloody Roar 4 interleaves it well ahead of the video and clocks the pictures by the audio
++        // position, so holding the stream back for video starved the audio and froze the movie).
++        // The cap is above any movie's size (compressed bytes only): at 8 MB, Bloody Roar 4's long attract movie (31 MB)
++        // hit it, demux returned 0 consumed, the game's stream ring (0x50000) stayed full, sceCdStRead stopped, the
++        // game never called demux again and GetPicture waited forever on one frame.
++        constexpr size_t kMaxPendingVideoBytes = 256u * 1024u * 1024u;
++
++        struct MpegPendingVideo
++        {
++            std::vector<uint8_t> data;
++            int64_t pts90k = -1;
++            int64_t dts90k = -1;
++        };
+ 
+         struct MpegPlaybackState
+         {
+@@ -496,6 +513,7 @@ namespace ps2_stubs
+             // momentarily empty (the CD read is behind); see sceMpegAddBs.
+             bool lastFeedStarved = false;
+             std::chrono::steady_clock::time_point starvedSince{};
++            uint64_t starvedSinceCycle = 0u; // [det] the same in emulated time
+             // Set when the nodata callback came back empty: like real libmpeg, the pending
+             // sceMpegGetPicture returns without a picture (the caller may hold locks the
+             // streaming thread needs to deliver more data).
+@@ -509,6 +527,8 @@ namespace ps2_stubs
+             std::vector<uint8_t> pssBuffer;
+             std::vector<uint32_t> pssGuestAddrs;
+             std::deque<MpegDecodedFrame> decodedFrames;
++            std::deque<MpegPendingVideo> pendingVideo;
++            size_t pendingVideoBytes = 0u;
+             std::unique_ptr<MpegFfmpegDecoder> decoder;
+             uint8_t frameRateCode = 0u;
+             uint8_t frameRateExtensionN = 0u;
+@@ -804,9 +824,15 @@ namespace ps2_stubs
+             return readStackArg(rdram, ctx, 0x10u);
+         }
+ 
++        void drainPendingVideo(MpegPlaybackState &playback);
++
++        // Every entry point reads the playback state through here: deferred video is decoded first,
++        // so the picture queue and end-of-stream checks see it.
+         MpegPlaybackState &getPlaybackState(uint32_t mpegAddr)
+         {
+-            return g_mpeg_stub_state.playbackByMpeg[mpegAddr];
++            MpegPlaybackState &playback = g_mpeg_stub_state.playbackByMpeg[mpegAddr];
++            drainPendingVideo(playback);
++            return playback;
+         }
+ 
+         MpegPlaybackState makeFreshPlaybackState()
+@@ -1014,7 +1040,7 @@ namespace ps2_stubs
+ 
+         void flushDecoderIfEnded(MpegPlaybackState &playback)
+         {
+-            if (playback.streamEnded && playback.decoder)
++            if (playback.streamEnded && playback.decoder && playback.pendingVideo.empty())
+             {
+                 playback.decoder->flush(playback.decodedFrames);
+             }
+@@ -1118,6 +1144,35 @@ namespace ps2_stubs
+             flushDecoderIfEnded(playback);
+         }
+ 
++        void drainPendingVideo(MpegPlaybackState &playback)
++        {
++            if (playback.pendingVideo.empty())
++                return;
++            while (!playback.pendingVideo.empty() && playback.decodedFrames.size() < kMaxDecodedPicturesAhead)
++            {
++                MpegPendingVideo packet = std::move(playback.pendingVideo.front());
++                playback.pendingVideo.pop_front();
++                playback.pendingVideoBytes -= std::min(playback.pendingVideoBytes, packet.data.size());
++                feedElementaryStream(playback, packet.data.data(), packet.data.size(), packet.pts90k, packet.dts90k);
++            }
++            flushDecoderIfEnded(playback);
++        }
++
++        void feedOrDeferVideo(MpegPlaybackState &playback, const uint8_t *data, size_t size, int64_t pts90k, int64_t dts90k)
++        {
++            if (playback.pendingVideo.empty() && playback.decodedFrames.size() < kMaxDecodedPicturesAhead)
++            {
++                feedElementaryStream(playback, data, size, pts90k, dts90k);
++                return;
++            }
++            MpegPendingVideo packet;
++            packet.data.assign(data, data + size);
++            packet.pts90k = pts90k;
++            packet.dts90k = dts90k;
++            playback.pendingVideoBytes += size;
++            playback.pendingVideo.push_back(std::move(packet));
++        }
++
+         void erasePssPrefix(MpegPlaybackState &playback, size_t count)
+         {
+             std::vector<uint8_t> &buffer = playback.pssBuffer;
+@@ -1339,7 +1394,7 @@ namespace ps2_stubs
+                                 pes.pts90k,
+                                 pes.dts90k);
+                         }
+-                        feedElementaryStream(
++                        feedOrDeferVideo(
+                             playback,
+                             buffer.data() + payloadStart,
+                             packetEnd - payloadStart,
+@@ -1402,6 +1457,35 @@ namespace ps2_stubs
+             }
+         }
+ 
++        // Playback activity, reported every 2 s while a movie runs (the per-call traces stop after 32).
++        struct MpegActivity
++        {
++            uint64_t demuxCalls = 0u;
++            uint64_t demuxBackpressured = 0u;
++            uint64_t demuxBytes = 0u;
++            uint64_t pictures = 0u;
++            uint64_t pictureWaits = 0u;
++        } g_mpegActivity;
++
++        void reportMpegActivityUnlocked(uint32_t mpegAddr, const MpegPlaybackState &playback)
++        {
++            static auto s_last = std::chrono::steady_clock::now();
++            const auto now = std::chrono::steady_clock::now();
++            if (now - s_last < std::chrono::seconds(2))
++                return;
++            s_last = now;
++            std::cerr << "[MPEG:status] mpeg=0x" << std::hex << mpegAddr << std::dec
++                      << " demux=" << g_mpegActivity.demuxCalls << "/" << g_mpegActivity.demuxBackpressured
++                      << " bytes=" << g_mpegActivity.demuxBytes
++                      << " pictures=" << g_mpegActivity.pictures << " waits=" << g_mpegActivity.pictureWaits
++                      << " served=" << playback.picturesServed << " queued=" << playback.decodedFrames.size()
++                      << " pendingVideo=" << playback.pendingVideoBytes
++                      << " ended=" << playback.streamEnded << " failed=" << playback.decoderFailed
++                      << " eof=" << g_mpeg_stub_state.currentCdStreamEofSeen
++                      << " cd=" << g_mpeg_stub_state.cdStreamBytesDemuxed << "/" << g_mpeg_stub_state.cdStreamBytesProduced
++                      << std::endl;
++        }
++
+         bool mpegDemuxBackpressured(const MpegPlaybackState &playback)
+         {
+             // Let EOF finalization drain any tail that is already in the guest
+@@ -1417,8 +1501,10 @@ namespace ps2_stubs
+             // lets the game's producer loop wake the consumer again. Backpressure
+             // still propagates naturally to sceCdStRead because the ring does not
+             // advance while this is true.
++            // Pictures beyond kMaxDecodedPicturesAhead wait compressed (feedOrDeferVideo), so the
++            // limit here is on those bytes: the audio interleaved in the stream keeps flowing.
+             return !g_mpeg_stub_state.currentCdStreamEofSeen &&
+-                   playback.decodedFrames.size() >= kMaxDecodedPicturesAhead;
++                   playback.pendingVideoBytes >= kMaxPendingVideoBytes;
+         }
+ 
+         void recordCdStreamBytesDemuxedUnlocked(
+@@ -1726,6 +1812,87 @@ namespace ps2_stubs
+             return true;
+         }
+ 
++        // [audiofifo] A movie's audio packets go to the game's callback one at a time, and a packet the callback refuses
++        // (returns 0: its sound buffer is full) is offered again later, as libmpeg does (it stops demuxing there). The
++        // callbacks used to be fired for every packet at once with the answer ignored: Bloody Roar 4's copies a packet
++        // whole or not at all, so packets were lost whenever its buffer was full, and as each holds an odd number of bytes
++        // (4073) the 16-bit PCM after them was off by one byte -- loud noise over the Hudson logo and the opening movie,
++        // which then looped on in the SPU2's input. As libmpeg does, the demux does not tell the game the bytes are consumed
++        // until their audio is taken (sceMpegDemuxPssRing returns 0 meanwhile and the game offers the same bytes again), so
++        // the packets stay valid in the game's ring and the video waits for the sound as on a PS2.
++        // PS2X_MPEG_AUDIO_FIFO=0: the old way.
++        struct MpegAudioFifo
++        {
++            std::deque<MpegStreamCallbackEvent> packets;
++            bool inFlight = false;
++            // the demuxed bytes not reported consumed yet (the game offers them again at holdAddr)
++            bool holding = false;
++            uint32_t holdAddr = 0u, holdLen = 0u;
++        };
++        std::unordered_map<uint32_t, MpegAudioFifo> g_mpegAudioFifos; // under g_mpeg_stub_mutex
++        bool g_ringDemuxDispatch = false; // the callbacks being dispatched come from sceMpegDemuxPssRing (it holds bytes back)
++
++        bool mpegAudioFifoEnabled()
++        {
++            static const bool s_on = [] { const char *e = std::getenv("PS2X_MPEG_AUDIO_FIFO"); return !(e && *e == '0'); }();
++            return s_on;
++        }
++
++        void pumpMpegAudioFifo(uint8_t *rdram, const R5900Context &callerCtx, PS2Runtime *runtime, uint32_t mpegAddr)
++        {
++            MpegStreamCallbackEvent event{};
++            {
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                const auto it = g_mpegAudioFifos.find(mpegAddr);
++                if (it == g_mpegAudioFifos.end() || it->second.inFlight || it->second.packets.empty())
++                    return;
++                event = it->second.packets.front();
++                it->second.inFlight = true;
++            }
++            const MpegRegisteredCallback callback = event.callbacks.front();
++            const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
++            if (cbDataAddr == 0u || !writeMpegCallbackData(rdram, cbDataAddr, event))
++            {
++                if (cbDataAddr)
++                    runtime->guestFree(cbDataAddr);
++                std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                g_mpegAudioFifos[mpegAddr].inFlight = false; // tried again at the next demux
++                return;
++            }
++
++            R5900Context callbackCtx = callerCtx;
++            SET_GPR_U32(&callbackCtx, 4, event.mpegAddr);
++            SET_GPR_U32(&callbackCtx, 5, cbDataAddr);
++            SET_GPR_U32(&callbackCtx, 6, callback.data);
++            SET_GPR_U32(&callbackCtx, 7, 0u);
++            SET_GPR_U32(&callbackCtx, 29, 0u);
++            SET_GPR_U32(&callbackCtx, 31, 0u);
++            callbackCtx.pc = callback.func;
++
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::RpcCallback;
++            invocation.context = callbackCtx;
++            invocation.onComplete = [rdram, runtime, cbDataAddr, mpegAddr, callerCtx](const R5900Context &done, R5900Context &)
++            {
++                runtime->guestFree(cbDataAddr);
++                const bool accepted = getRegU32(const_cast<R5900Context *>(&done), 2) != 0u;
++                bool more = false;
++                {
++                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                    const auto it = g_mpegAudioFifos.find(mpegAddr);
++                    if (it == g_mpegAudioFifos.end())
++                        return; // the movie was deleted meanwhile
++                    it->second.inFlight = false;
++                    if (accepted && !it->second.packets.empty())
++                        it->second.packets.pop_front();
++                    more = accepted && !it->second.packets.empty();
++                }
++                if (more)
++                    pumpMpegAudioFifo(rdram, callerCtx, runtime, mpegAddr);
++            };
++            runtime->eeScheduler().queueInvocation(std::move(invocation));
++        }
++
+         void dispatchStreamCallbacks(uint8_t *rdram,
+                                      R5900Context *ctx,
+                                      PS2Runtime *runtime,
+@@ -1736,13 +1903,27 @@ namespace ps2_stubs
+                 return;
+             }
+ 
++            std::vector<uint32_t> audioMpegs;
+             for (const MpegStreamCallbackEvent &event : events)
+             {
++                if (mpegAudioFifoEnabled() && g_ringDemuxDispatch && (event.streamType == kMpegStrPCM || event.streamType == kMpegStrADPCM) &&
++                    event.callbacks.size() == 1u)
++                {
++                    {
++                        std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++                        g_mpegAudioFifos[event.mpegAddr].packets.push_back(event);
++                    }
++                    if (std::find(audioMpegs.begin(), audioMpegs.end(), event.mpegAddr) == audioMpegs.end())
++                        audioMpegs.push_back(event.mpegAddr);
++                    continue;
++                }
+                 for (const MpegRegisteredCallback &callback : event.callbacks)
+                 {
+                     dispatchGuestStreamCallback(rdram, ctx, runtime, event, callback);
+                 }
+             }
++            for (const uint32_t mpegAddr : audioMpegs)
++                pumpMpegAudioFifo(rdram, *ctx, runtime, mpegAddr);
+         }
+ 
+         void dispatchStreamCallbacksUnlocked(uint8_t *rdram,
+@@ -2004,14 +2185,22 @@ namespace ps2_stubs
+             }
+             constexpr auto kStarvationIsEnd = std::chrono::milliseconds(1500);
+             const auto now = std::chrono::steady_clock::now();
++            // [det] PS2X_DETERMINISTIC=1 (online): 1.5 s of emulated time, not of the host's clock. How many times the
++            // game fed its empty chunks within 1.5 s of wall time depended on the host's speed: NBA Street V3's two
++            // games of an online match ended the EA movie one picture apart (and parted at vblank ~1038).
++            static const bool s_det = [] { const char *e = std::getenv("PS2X_DETERMINISTIC"); return e && *e == '1'; }();
++            const uint64_t nowCycle = g_ps2EeCycleNow.load(std::memory_order_relaxed);
+             if (onlySequenceEnd && playback.sawInput)
+             {
+                 if (!playback.lastFeedStarved)
+                 {
+                     playback.lastFeedStarved = true;
+                     playback.starvedSince = now;
++                    playback.starvedSinceCycle = nowCycle;
+                 }
+-                if (now - playback.starvedSince < kStarvationIsEnd)
++                const bool stillShort = s_det ? nowCycle - playback.starvedSinceCycle < 1500ull * (EeScheduler::kEeClockHz / 1000u)
++                                              : now - playback.starvedSince < kStarvationIsEnd;
++                if (stillShort)
+                 {
+                     setReturnS32(ctx, static_cast<int32_t>(byteCount));
+                     return;
+@@ -2226,6 +2415,7 @@ namespace ps2_stubs
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
+             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
++            g_mpegAudioFifos.erase(mpegAddr);
+         }
+         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
+         setReturnU32(ctx, 0u);
+@@ -2320,6 +2510,28 @@ namespace ps2_stubs
+         const uint32_t ringBaseAddr = getRegU32(ctx, 7);
+         const uint32_t ringSize = readAbiArg4(rdram, ctx);
+ 
++        // [audiofifo] offer a refused packet again; the bytes held back are consumed once all their audio is taken
++        pumpMpegAudioFifo(rdram, *ctx, runtime, mpegAddr);
++        if (mpegAudioFifoEnabled())
++        {
++            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++            const auto it = g_mpegAudioFifos.find(mpegAddr);
++            if (it != g_mpegAudioFifos.end() && it->second.holding)
++            {
++                MpegAudioFifo &fifo = it->second;
++                if (!fifo.packets.empty() || fifo.inFlight)
++                {
++                    setReturnS32(ctx, 0);
++                    return;
++                }
++                fifo.holding = false;
++                if (fifo.holdAddr == dataAddr)
++                {
++                    setReturnS32(ctx, static_cast<int32_t>(fifo.holdLen));
++                    return;
++                }
++            }
++        }
+         std::vector<MpegStreamCallbackEvent> callbackEvents;
+         std::vector<uint32_t> completedMpegIds;
+         size_t consumed = 0u;
+@@ -2346,6 +2558,10 @@ namespace ps2_stubs
+                     callbackEvents);
+                 recordCdStreamBytesDemuxedUnlocked(consumed, completedMpegIds, eofChanged);
+             }
++            ++g_mpegActivity.demuxCalls;
++            g_mpegActivity.demuxBackpressured += backpressured ? 1u : 0u;
++            g_mpegActivity.demuxBytes += consumed;
++            reportMpegActivityUnlocked(mpegAddr, playback);
+             decodedCount = playback.decodedFrames.size();
+             traceIdx = g_mpeg_stub_state.demuxRingTraceCount++;
+         }
+@@ -2390,8 +2606,23 @@ namespace ps2_stubs
+             });
+         }
+ 
++        g_ringDemuxDispatch = true;
+         dispatchStreamCallbacksUnlocked(rdram, ctx, runtime, callbackEvents);
+-        setReturnS32(ctx, static_cast<int32_t>(consumed));
++        g_ringDemuxDispatch = false;
++        int32_t reported = static_cast<int32_t>(consumed);
++        if (mpegAudioFifoEnabled() && consumed != 0u)
++        {   // [audiofifo] audio of these bytes still to be taken: hold them (the game offers them again)
++            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
++            const auto it = g_mpegAudioFifos.find(mpegAddr);
++            if (it != g_mpegAudioFifos.end() && (!it->second.packets.empty() || it->second.inFlight))
++            {
++                it->second.holding = true;
++                it->second.holdAddr = dataAddr;
++                it->second.holdLen = static_cast<uint32_t>(consumed);
++                reported = 0;
++            }
++        }
++        setReturnS32(ctx, reported);
+     }
+ 
+     void sceMpegDispCenterOffX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+@@ -2449,12 +2680,15 @@ namespace ps2_stubs
+             MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+             const bool returnWithoutPicture = playback.returnWithoutPicture;
+             playback.returnWithoutPicture = false;
++            ++g_mpegActivity.pictures;
++            reportMpegActivityUnlocked(mpegAddr, playback);
+             if (playback.decodedFrames.empty() &&
+                 !returnWithoutPicture &&
+                 !g_mpeg_stub_state.currentCdStreamEofSeen &&
+                 !playback.streamEnded &&
+                 !playback.decoderFailed)
+             {
++                ++g_mpegActivity.pictureWaits;
+                 if (g_mpeg_stub_state.getPictureWaitTraceCount < 32u)
+                 {
+                     PS2_IF_AGRESSIVE_LOGS({
+@@ -2551,6 +2785,17 @@ namespace ps2_stubs
+         mpegGuestWrite32(rdram, mpegAddr + 0x00u, width);
+         mpegGuestWrite32(rdram, mpegAddr + 0x04u, height);
+         mpegGuestWrite32(rdram, mpegAddr + 0x08u, frameCount);
++        {
++            static uint32_t s_returnLogs = 0;
++            if (s_returnLogs < 6u)
++            {
++                ++s_returnLogs;
++                std::cerr << "[MPEG:GetPicture:return] mpeg=0x" << std::hex << mpegAddr << " image=0x" << imageAddr
++                          << " mb=0x" << getRegU32(ctx, 6) << std::dec << " " << width << "x" << height
++                          << " frameCount=" << frameCount << " haveFrame=" << haveFrame << " ra=0x" << std::hex
++                          << getRegU32(ctx, 31) << std::dec << std::endl;
++            }
++        }
+ 
+         // sceMpegIsEnd is not HLE'd in every game (in NBA Street V3 it is plain guest code
+         // reading the first word of mp->sys, the decoder's private state at mp+0x40), so
+@@ -2686,6 +2931,7 @@ namespace ps2_stubs
+             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+             MpegPlaybackState &playback = getPlaybackState(param_1);
+             MpegPlaybackState resetState = makeFreshPlaybackStatePreservingConfig(playback);
++            g_mpegAudioFifos.erase(param_1); // [audiofifo] the old stream's sound goes too
+             if (playback.streamEnded || playback.decoderFailed)
+             {
+                 resetState.sawInput = true;
+diff --git a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+index 76425e7..300f82a 100644
+--- a/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Stubs/Pad.cpp
+@@ -1,14 +1,19 @@
+ #include "Common.h"
+ #include "Pad.h"
+ #include "../../gs/gs_dump_writer.h"
++#include "../Net/NetPlay.h"
+ 
+ #include <cctype>
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
+ #include <string>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
++#include <atomic>
++
++extern std::atomic<uint64_t> g_ps2EeCycleNow; // [det] EeScheduler.cpp: the emulated EE cycle
+ 
+ namespace ps2_stubs
+ {
+@@ -79,6 +84,31 @@ namespace ps2_stubs
+         PadPortState g_padPorts[kPadPortCount]{};
+         int g_padReadLogCount = 0;
+ 
++        // PS2X_PAD_ANALOG=1: the pads are in analog mode from the start and stay there, as if the
++        // player had pressed the DualShock's ANALOG button (games such as Bloody Roar 4's analog
++        // stick mod never switch the pad to analog themselves).
++        bool padForcedAnalog()
++        {
++            static const bool s_forced = []
++            {
++                const char *value = std::getenv("PS2X_PAD_ANALOG");
++                return value && *value && *value != '0';
++            }();
++            return s_forced;
++        }
++
++        // PS2X_PAD_TRACE=1: libpad calls on the second port (and up), with their result -- which ports a game
++        // looks at, to see why it shows a player as missing. The first 64 per function.
++        void padTrace(const char *fn, int port, int slot, int result)
++        {
++            static const bool s_on = [] { const char *e = std::getenv("PS2X_PAD_TRACE"); return e && *e == '1'; }();
++            if (!s_on || (port == 0 && slot == 0))
++                return;
++            static std::unordered_map<std::string, int> s_counts;
++            if (s_counts[fn]++ < 64)
++                std::fprintf(stderr, "[padtrace] %s port=%d slot=%d -> %d\n", fn, port, slot, result);
++        }
++
+         uint8_t axisToByte(float axis)
+         {
+             axis = std::clamp(axis, -1.0f, 1.0f);
+@@ -165,7 +195,12 @@ namespace ps2_stubs
+                     return std::atof(value) / 1000.0;
+                 return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+             }();
+-            const double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count() - s_t0;
++            double now = std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count() - s_t0;
++            // [det] PS2X_DETERMINISTIC=1: the script's seconds are emulated seconds (EE cycles / 294.912 MHz), so a
++            // scripted press lands on the same frame in every run -- the input side of the determinism tests
++            static const bool s_det = [] { const char *e = std::getenv("PS2X_DETERMINISTIC"); return e && *e == '1'; }();
++            if (s_det)
++                now = static_cast<double>(g_ps2EeCycleNow.load(std::memory_order_relaxed)) / 294912000.0;
+             for (const Step &step : s_steps)
+                 if (now >= step.time && now < step.time + s_hold)
+                     state.buttons = static_cast<uint16_t>(state.buttons & ~step.buttons);
+@@ -313,7 +348,7 @@ namespace ps2_stubs
+         void initializePadPortLocked(PadPortState &portState, uint32_t dmaAddr)
+         {
+             portState.open = true;
+-            portState.analogMode = false;  // real pads open DIGITAL
++            portState.analogMode = padForcedAnalog();  // real pads open DIGITAL
+             portState.pressureEnabled = false;
+             portState.buttonMask = 0xFFFFu;
+             portState.dmaAddr = dmaAddr;
+@@ -365,39 +400,14 @@ namespace ps2_stubs
+             data[19] = pressureValue(state, portState, kPadBtnR2);
+         }
+ 
+-        bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
++        // The host side of a pad: the controller backend, raylib's gamepad/keyboard, the GS host window's keys (port 0)
++        // and PS2X_PAD_SCRIPT (port 0). Offline this is what the port reads; online it is the local player's sample.
++        PadInputState readHostPad(int port, int slot, PS2Runtime *runtime, const PadPortState &portState, bool &usedBackend)
+         {
+-            if (!outData)
+-            {
+-                return false;
+-            }
+-
+-            PadPortState portState;
+-            {
+-                std::lock_guard<std::mutex> lock(g_padStateMutex);
+-                const PadPortState *sharedPortState = lookupPadPortStateLocked(port, slot);
+-                if (!sharedPortState || !sharedPortState->open)
+-                {
+-                    return false;
+-                }
+-                portState = *sharedPortState;
+-            }
+-
+             PadInputState state;
+-            bool useOverride = false;
+-            {
+-                std::lock_guard<std::mutex> lock(g_padOverrideMutex);
+-                if (g_padOverrideEnabled)
+-                {
+-                    state = g_padOverrideState;
+-                    useOverride = true;
+-                }
+-            }
+-
+-            bool usedBackend = false;
+             // The GS host's options menu owns the controls while it is open.
+             const bool menuOpen = port == 0 && ps2_gsdump::hostMenuOpen();
+-            if (!useOverride && !menuOpen)
++            if (!menuOpen)
+             {
+                 uint8_t backendData[32]{};
+                 // PS2X_NO_GAMEPAD=1 also mutes the controller backend (automated tests).
+@@ -442,9 +452,55 @@ namespace ps2_stubs
+                     }
+                 }
+             }
+-
+             if (port == 0)
+                 applyPadScript(state);
++            return state;
++        }
++
++        bool readPadPortData(int port, int slot, PS2Runtime *runtime, uint8_t *outData, uint32_t dataAddr)
++        {
++            if (!outData)
++            {
++                return false;
++            }
++
++            PadPortState portState;
++            {
++                std::lock_guard<std::mutex> lock(g_padStateMutex);
++                const PadPortState *sharedPortState = lookupPadPortStateLocked(port, slot);
++                if (!sharedPortState || !sharedPortState->open)
++                {
++                    return false;
++                }
++                portState = *sharedPortState;
++            }
++
++            PadInputState state;
++            bool useOverride = false;
++            bool usedBackend = false;
++            ps2_net::PadSample net;
++            if (ps2_net::enabled() && ps2_net::padFor(port, net))
++            {
++                // [netplay] online, both ports play this frame's inputs (the local pad was sampled at the vblank)
++                state.buttons = net.buttons;
++                state.lx = net.lx;
++                state.ly = net.ly;
++                state.rx = net.rx;
++                state.ry = net.ry;
++            }
++            else
++            {
++                {
++                    std::lock_guard<std::mutex> lock(g_padOverrideMutex);
++                    if (g_padOverrideEnabled)
++                    {
++                        state = g_padOverrideState;
++                        useOverride = true;
++                    }
++                }
++                if (!useOverride)
++                    state = readHostPad(port, slot, runtime, portState, usedBackend);
++            }
+ 
+             fillPadStatus(outData, state, portState);
+ 
+@@ -606,6 +662,17 @@ namespace ps2_stubs
+         PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
+                                                            static_cast<int>(getRegU32(ctx, 5)));
+         int32_t state = kPadStateDisconnected;
++        // [netplay] online, the other player's pad is on port 2: it is there from the start. NBA Street V3 only opens a
++        // port once its state says something is plugged in (it polls port 2 unopened), so open it here.
++        if (portState && !portState->open && getRegU32(ctx, 4) == 1u && getRegU32(ctx, 5) == 0u && ps2_net::enabled())
++        {
++            portState->open = true;
++            portState->analogMode = padForcedAnalog();
++            portState->pressureEnabled = false;
++            portState->buttonMask = 0xFFFFu;
++            portState->reqState = 0u;
++            portState->transientState = 0u;
++        }
+         if (portState && portState->open)
+         {
+             if (portState->transientState != 0u)
+@@ -618,6 +685,7 @@ namespace ps2_stubs
+                 state = kPadStateStable;
+             }
+         }
++        padTrace("scePadGetState", static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5)), state);
+         setReturnS32(ctx, state);
+     }
+ 
+@@ -751,6 +819,8 @@ namespace ps2_stubs
+         std::lock_guard<std::mutex> lock(g_padStateMutex);
+         PadPortState *portState = lookupPadPortStateLocked(static_cast<int>(getRegU32(ctx, 4)),
+                                                            static_cast<int>(getRegU32(ctx, 5)));
++        padTrace("scePadPortOpen", static_cast<int>(getRegU32(ctx, 4)), static_cast<int>(getRegU32(ctx, 5)),
++                 (!portState || (dmaAddr != 0u && !dmaStr)) ? 0 : 1);
+         if (!portState || (dmaAddr != 0u && !dmaStr))
+         {
+             setReturnS32(ctx, 0);
+@@ -758,7 +828,7 @@ namespace ps2_stubs
+         }
+ 
+         portState->open = true;
+-        portState->analogMode = false;     // real pads open DIGITAL
++        portState->analogMode = padForcedAnalog(); // real pads open DIGITAL
+         portState->pressureEnabled = false;
+         portState->buttonMask = 0xFFFFu;
+         portState->dmaAddr = dmaAddr;
+@@ -783,13 +853,21 @@ namespace ps2_stubs
+             setReturnS32(ctx, 0);
+             return;
+         }
++        // [det] PS2X_DETERMINISTIC=1: a pad read costs what libpad's would on a PS2 (~2000 EE cycles), not the 32 of
++        // the loop around it. Bloody Roar 4 polls the pads in a loop (FUN_001062b0) until the next frame: without the
++        // host's clock pushing time forward, 32 cycles a read made a frame take seconds.
++        static const bool s_det = [] { const char *e = std::getenv("PS2X_DETERMINISTIC"); return e && *e == '1'; }();
++        if (s_det && runtime)
++            (void)runtime->eeCheckpointDue(2000u);
+ 
+         ps2TraceGuestRangeWrite(rdram, dataAddr, 32u, "scePadRead", ctx);
+         if (!readPadPortData(port, slot, runtime, data, dataAddr))
+         {
++            padTrace("scePadRead", port, slot, 0);
+             setReturnS32(ctx, 0);
+             return;
+         }
++        padTrace("scePadRead", port, slot, 1);
+ 
+         PS2_IF_AGRESSIVE_LOGS({
+             if (g_padReadLogCount < 48)
+@@ -876,7 +954,7 @@ namespace ps2_stubs
+             return;
+         }
+ 
+-        portState->analogMode = (getRegU32(ctx, 6) != 0u);
++        portState->analogMode = padForcedAnalog() || (getRegU32(ctx, 6) != 0u);
+         portState->reqState = 0u;
+         queueExecCmdStateLocked(*portState);
+         setReturnS32(ctx, 1);
+@@ -1009,3 +1087,23 @@ namespace ps2_stubs
+         g_padOverrideState = PadInputState{};
+     }
+ }
++
++namespace ps2_net
++{
++    // [netplay] The local player's pad, sampled at the vblank: always the host's port 1 controls (keyboard, first
++    // controller, the GS host window, PS2X_PAD_SCRIPT), whichever port the player plays on.
++    PadSample sampleLocalPad(PS2Runtime *runtime)
++    {
++        using namespace ps2_stubs;
++        PadPortState portState;
++        {
++            std::lock_guard<std::mutex> lock(g_padStateMutex);
++            portState = g_padPorts[0];
++        }
++        if (!portState.open)
++            portState.analogMode = padForcedAnalog();
++        bool usedBackend = false;
++        const PadInputState s = readHostPad(0, 0, runtime, portState, usedBackend);
++        return PadSample{s.buttons, s.lx, s.ly, s.rx, s.ry};
++    }
++}
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+index d6b7549..9e627c7 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/Helpers/State.h
+@@ -157,6 +157,7 @@ struct RpcServerState
+ {
+     uint32_t sid = 0;
+     uint32_t sd_ptr = 0; // PS2 address
++    uint32_t gp = 0;     // registering thread's $gp (IOP -> EE calls run the server function with it)
+ };
+ 
+ struct RpcClientState
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+index 6a24edd..a9cdd74 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.cpp
+@@ -856,7 +856,7 @@ namespace ps2_syscalls
+                 }
+             }
+ 
+-            g_rpc_servers[sid] = {sid, sdPtr};
++            g_rpc_servers[sid] = {sid, sdPtr, getRegU32(ctx, 28)};
+             for (auto &entry : g_rpc_clients)
+             {
+                 if (entry.second.sid == sid)
+@@ -885,6 +885,87 @@ namespace ps2_syscalls
+         setReturnS32(ctx, 0);
+     }
+ 
++    bool findEeRpcServer(uint8_t *rdram, uint32_t sid, ps2x::iop::EeRpcServerInfo &info)
++    {
++        info = {};
++        uint32_t sdPtr = 0u;
++        {
++            std::lock_guard<std::mutex> lock(g_rpc_mutex);
++            const auto it = g_rpc_servers.find(sid);
++            if (it == g_rpc_servers.end())
++                return false;
++            sdPtr = it->second.sd_ptr;
++        }
++
++        // SifBindRpc publishes func-less descriptors for IOP-side SIDs: only a registered
++        // EE server has a function.
++        const auto *sd = sdPtr != 0u ? reinterpret_cast<const t_SifRpcServerData *>(getConstMemPtr(rdram, sdPtr)) : nullptr;
++        if (!sd || sd->func == 0u)
++            return false;
++        info.serverData = sdPtr;
++        info.function = sd->func;
++        info.buffer = sd->buf;
++        info.clientBuffer = sd->cbuf;
++        return true;
++    }
++
++    bool callEeRpcServer(uint8_t *rdram,
++                         PS2Runtime *runtime,
++                         uint32_t sid,
++                         uint32_t function,
++                         const void *sendData,
++                         size_t sendSize,
++                         std::function<void(uint32_t)> onComplete)
++    {
++        ps2x::iop::EeRpcServerInfo server{};
++        if (!rdram || !runtime || !findEeRpcServer(rdram, sid, server))
++            return false;
++        uint32_t gp = 0u;
++        {
++            std::lock_guard<std::mutex> lock(g_rpc_mutex);
++            gp = g_rpc_servers[sid].gp;
++        }
++
++        if (sendData && sendSize != 0u && server.buffer != 0u)
++        {
++            uint8_t *const first = getMemPtr(rdram, server.buffer);
++            uint8_t *const last = getMemPtr(rdram, server.buffer + static_cast<uint32_t>(sendSize - 1u));
++            if (!first || !last || last < first || static_cast<size_t>(last - first) != sendSize - 1u)
++                return false;
++            ps2TraceGuestRangeWrite(rdram, server.buffer, static_cast<uint32_t>(sendSize), "IOP->EE RPC send", nullptr);
++            std::memcpy(first, sendData, sendSize);
++        }
++
++        try
++        {
++            // Queued like an IOP -> EE SIF command: the server's own thread (sceSifRpcLoop)
++            // does not exist here, so the function runs as an invocation on the EE.
++            GuestInvocation invocation{};
++            invocation.kind = GuestInvocationKind::SifCommand;
++            invocation.tag = sid;
++            invocation.context = runtime->cpu();
++            invocation.context.pc = server.function;
++            SET_GPR_U32(&invocation.context, 4, function);
++            SET_GPR_U32(&invocation.context, 5, server.buffer);
++            SET_GPR_U32(&invocation.context, 6, static_cast<uint32_t>(sendSize));
++            SET_GPR_U32(&invocation.context, 7, 0u);
++            SET_GPR_U32(&invocation.context, 28, gp);
++            SET_GPR_U32(&invocation.context, 29, 0u);
++            SET_GPR_U32(&invocation.context, 31, 0u);
++            invocation.onComplete = [onComplete = std::move(onComplete)](const R5900Context &completed, R5900Context &)
++            {
++                if (onComplete)
++                    onComplete(getRegU32(&completed, 2));
++            };
++            runtime->eeScheduler().queueInvocation(std::move(invocation));
++            return true;
++        }
++        catch (...)
++        {
++            return false;
++        }
++    }
++
+     void SifCheckStatRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+     {
+         uint32_t clientPtr = getRegU32(ctx, 4);
+diff --git a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
+index 1bc5771..1151dd2 100644
+--- a/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
++++ b/ps2xRuntime/src/lib/Kernel/Syscalls/RPC.h
+@@ -1,9 +1,24 @@
+ #pragma once
+ 
+ #include "ps2_syscalls.h"
++#include "ps2x/iop/iop_host.h"
++
++#include <functional>
+ 
+ namespace ps2_syscalls
+ {
++    // IOP -> EE RPC: a server the EE registered with sceSifRegisterRpc (an IRX binds and calls it).
++    bool findEeRpcServer(uint8_t *rdram, uint32_t sid, ps2x::iop::EeRpcServerInfo &info);
++    // Copies the send data into the server buffer and queues func(fno, buffer, sendSize) on the EE;
++    // onComplete receives its result pointer (v0) once it has returned.
++    bool callEeRpcServer(uint8_t *rdram,
++                         PS2Runtime *runtime,
++                         uint32_t sid,
++                         uint32_t function,
++                         const void *sendData,
++                         size_t sendSize,
++                         std::function<void(uint32_t)> onComplete);
++
+     void SifStopModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void SifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+     void SifSearchModuleByName(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.cpp b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+index 8d46e03..01c02f6 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.cpp
++++ b/ps2xRuntime/src/lib/ps2_iop_host.cpp
+@@ -6,6 +6,8 @@
+ #include "runtime/ps2_memory.h"
+ #include "Kernel/Stubs/MemoryCard.h"
+ #include "Kernel/Syscalls/Common.h"
++#include "Kernel/Syscalls/RPC.h"
++#include "Kernel/Stubs/CD.h"
+ 
+ #include <algorithm>
+ #include <cstring>
+@@ -477,6 +479,11 @@ int32_t PS2IopHostAdapter::memoryCard(const ps2x::iop::MemoryCardRequest &reques
+     return ps2_stubs::getMemoryCardDebugSnapshot().lastResult;
+ }
+ 
++bool PS2IopHostAdapter::readCdSectors(uint32_t lsn, uint32_t sectors, void *destination, size_t size)
++{
++    return ps2_stubs::readCdSectorsForIop(lsn, sectors, destination, size);
++}
++
+ bool PS2IopHostAdapter::hasGuestFunction(uint32_t address) const
+ {
+     return m_runtime.hasFunction(address);
+@@ -517,6 +524,32 @@ bool PS2IopHostAdapter::sendSifCommand(uint32_t commandId,
+                                          packetSize);
+ }
+ 
++bool PS2IopHostAdapter::findEeRpcServer(uint32_t sid, ps2x::iop::EeRpcServerInfo &info) const
++{
++    uint8_t *const rdram = m_activeRdram
++                               ? m_activeRdram
++                               : m_runtime.memory().getRDRAM();
++    return rdram && ps2_syscalls::findEeRpcServer(rdram, sid, info);
++}
++
++bool PS2IopHostAdapter::callEeRpcServer(uint32_t sid,
++                                        uint32_t function,
++                                        const void *sendData,
++                                        size_t sendSize,
++                                        std::function<void(uint32_t resultAddress)> onComplete)
++{
++    uint8_t *const rdram = m_activeRdram
++                               ? m_activeRdram
++                               : m_runtime.memory().getRDRAM();
++    return ps2_syscalls::callEeRpcServer(rdram,
++                                         &m_runtime,
++                                         sid,
++                                         function,
++                                         sendData,
++                                         sendSize,
++                                         std::move(onComplete));
++}
++
+ void PS2IopHostAdapter::log(ps2x::iop::LogLevel level, std::string_view message)
+ {
+     const char *prefix = "[ps2xIOP]";
+diff --git a/ps2xRuntime/src/lib/ps2_iop_host.h b/ps2xRuntime/src/lib/ps2_iop_host.h
+index 89d8576..bc69cbe 100644
+--- a/ps2xRuntime/src/lib/ps2_iop_host.h
++++ b/ps2xRuntime/src/lib/ps2_iop_host.h
+@@ -74,6 +74,7 @@ public:
+ 
+     int32_t memoryCard(const ps2x::iop::MemoryCardRequest &request) override;
+ 
++    bool readCdSectors(uint32_t lsn, uint32_t sectors, void *destination, size_t size) override;
+     bool hasGuestFunction(uint32_t address) const override;
+     bool invokeGuestFunction(uint64_t callToken,
+                              uint32_t address,
+@@ -83,6 +84,12 @@ public:
+                              uint32_t a3,
+                              uint32_t *resultAddress) override;
+     bool sendSifCommand(uint32_t commandId, const void *packet, size_t packetSize) override;
++    bool findEeRpcServer(uint32_t sid, ps2x::iop::EeRpcServerInfo &info) const override;
++    bool callEeRpcServer(uint32_t sid,
++                         uint32_t function,
++                         const void *sendData,
++                         size_t sendSize,
++                         std::function<void(uint32_t resultAddress)> onComplete) override;
+ 
+     void log(ps2x::iop::LogLevel level, std::string_view message) override;
+ 
+diff --git a/ps2xRuntime/src/lib/ps2_memory.cpp b/ps2xRuntime/src/lib/ps2_memory.cpp
+index aaae6a6..2b1914a 100644
+--- a/ps2xRuntime/src/lib/ps2_memory.cpp
++++ b/ps2xRuntime/src/lib/ps2_memory.cpp
+@@ -17,6 +17,50 @@
+ #include <string>
+ #include <vector>
+ 
++namespace
++{
++    // DMAC addresses (MADR, TADR, a DMAtag's ADDR): bit 31 (SPR) selects the scratchpad, the low
++    // bits are the offset in it. Masking the bit off read the packet from RDRAM's first 16 KB
++    // (Bloody Roar 4 builds texture/VIF packets in the scratchpad). PS2X_DMA_SPR_BIT=0: old behaviour.
++    uint32_t dmacAddress(uint32_t raw)
++    {
++        static const bool s_enabled = []
++        {
++            const char *env = std::getenv("PS2X_DMA_SPR_BIT");
++            return !(env && env[0] == '0');
++        }();
++        if ((raw & 0x80000000u) == 0u)
++            return raw;
++        if (!s_enabled)
++            return raw & 0x7FFFFFFFu;
++        static uint32_t s_logs = 0;
++        if (s_logs < 4u)
++        {
++            ++s_logs;
++            std::fprintf(stderr, "[dma] scratchpad address 0x%08X (SPR bit)\n", raw);
++        }
++        return PS2_SCRATCHPAD_BASE | (raw & (PS2_SCRATCHPAD_SIZE - 1u));
++    }
++}
++
++// PS2X_PATH3_TRACE=<s>: from s seconds after the first DMA, log GIF/VIF1 kicks, PATH3 pieces
++// (masked or sent) and MSKPATH3 changes, up to 20000 lines.
++bool ps2Path3TraceActive()
++{
++    static const double s_start = []
++    {
++        const char *env = std::getenv("PS2X_PATH3_TRACE");
++        return env && env[0] && env[0] != '0' ? std::atof(env) : -1.0;
++    }();
++    if (s_start < 0.0)
++        return false;
++    static const auto s_t0 = std::chrono::steady_clock::now();
++    static uint32_t s_lines = 0;
++    if (std::chrono::duration<double>(std::chrono::steady_clock::now() - s_t0).count() < s_start)
++        return false;
++    return s_lines++ < 20000u;
++}
++
+ extern uint64_t g_ps2StatChainTicks; // defined below; frame-budget report
+ extern uint64_t g_ps2StatChainTags;
+ extern uint64_t g_ps2StatChainCopyTicks;
+@@ -353,7 +397,7 @@ namespace
+         out.qwc = static_cast<uint16_t>(tag & 0xFFFFu);
+         out.id = static_cast<uint8_t>((tag >> 28u) & 0x7u);
+         out.irq = ((tag >> 31u) & 0x1ull) != 0ull;
+-        out.addr = static_cast<uint32_t>((tag >> 32u) & 0x7FFFFFFFu);
++        out.addr = dmacAddress(static_cast<uint32_t>(tag >> 32u));
+         out.upper = static_cast<uint32_t>((tag >> 16u) & 0xFFFFu);
+         return out;
+     }
+@@ -687,7 +731,19 @@ bool PS2Memory::isScratchpad(uint32_t address) const
+ 
+ uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit)
+ {
+-    return const_cast<uint8_t *>(static_cast<const PS2Memory *>(this)->mapVuMemory(physAddr, size, offset, limit));
++    uint8_t *mapped = const_cast<uint8_t *>(static_cast<const PS2Memory *>(this)->mapVuMemory(physAddr, size, offset, limit));
++    // Remote VU: the host's VU1 never sees EE stores to VU1 memory (only VIF1 transfers).
++    if (mapped && (mapped == m_vu1Data || mapped == m_vu1Code) && ps2_gsdump::remoteVu())
++    {
++        static uint32_t s_logs = 0;
++        if (s_logs < 8u)
++        {
++            ++s_logs;
++            std::fprintf(stderr, "[vu1mem] EE store to VU1 %s at 0x%08X (not seen by the remote VU1)\n",
++                         mapped == m_vu1Data ? "data" : "code", physAddr);
++        }
++    }
++    return mapped;
+ }
+ 
+ const uint8_t *PS2Memory::mapVuMemory(uint32_t physAddr, uint32_t size, uint32_t &offset, uint32_t &limit) const
+@@ -1506,7 +1562,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+             }
+ 
+             const uint32_t channelBase = address & 0xFFFFFF00;
+-            const uint32_t madr = m_ioRegisters[channelBase + 0x10];
++            const uint32_t madr = dmacAddress(m_ioRegisters[channelBase + 0x10]);
+             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
+             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+ 
+@@ -1533,6 +1589,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 }
+             }
+ 
++            {
++                if ((channelBase == 0x1000A000u || channelBase == 0x10009000u) && ps2Path3TraceActive())
++                    std::fprintf(stderr, "[path3] kick %s chcr=0x%x madr=0x%x qwc=0x%x tadr=0x%x masked=%d\n",
++                                 channelBase == 0x1000A000u ? "GIF" : "VIF1", value, madr, qwc,
++                                 m_ioRegisters[channelBase + 0x30], m_path3Masked ? 1 : 0);
++            }
++
+             if (tryProcessScratchpadDma(channelBase, value))
+             {
+                 return true;
+@@ -1566,7 +1629,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                 }
+                 else if (mode == 1)
+                 {
+-                    uint32_t tagAddr = m_ioRegisters[channelBase + 0x30];
++                    uint32_t tagAddr = dmacAddress(m_ioRegisters[channelBase + 0x30]);
+                     uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
+                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                     uint32_t asp = (chcr >> 4) & 0x3u;
+@@ -1683,13 +1746,30 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
+                         uint16_t tagQwc = static_cast<uint16_t>(tag & 0xFFFF);
+                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
+                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
+-                        uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
++                        uint32_t addr = dmacAddress(static_cast<uint32_t>(tag >> 32));
+                         lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
+                         ++tagsProcessed;
+ 
+                         uint32_t dataAddr = 0;
+                         bool hasPayload = (tagQwc > 0);
+                         bool endChain = false;
++                        if (channelBase == 0x1000A000u && ps2Path3TraceActive())
++                        {
++                            std::fprintf(stderr, "[path3]   GIF tag @0x%x id=%u qwc=0x%x addr=0x%x irq=%d\n", currentTagAddr, id,
++                                         tagQwc, addr, irq ? 1 : 0);
++                            // CNT/NEXT payload follows the tag: show its first qwords
++                            for (uint32_t q = 0; (id == 1u || id == 2u) && q < std::min<uint32_t>(tagQwc, 8u); ++q)
++                            {
++                                const uint32_t at = physTag + 16u + q * 16u;
++                                if (at + 16u > tagMax)
++                                    break;
++                                uint64_t lo = 0, hi = 0;
++                                std::memcpy(&lo, tagBase + at, 8);
++                                std::memcpy(&hi, tagBase + at + 8, 8);
++                                std::fprintf(stderr, "[path3]     %016llx %016llx\n", static_cast<unsigned long long>(hi),
++                                             static_cast<unsigned long long>(lo));
++                            }
++                        }
+ 
+                         switch (id)
+                         {
+@@ -2314,6 +2394,13 @@ std::vector<uint32_t> PS2Memory::consumeCompletedDmacCauses()
+     return causes;
+ }
+ 
++// Set by the VIF1 decoder around flushMaskedPath3Packets() at an MSKPATH3 0 inside a VIF1 list
++// (ps2_vif1_interpreter.cpp): see below.
++bool g_path3ReleaseOnePacket = false;
++// Set by the VIF1 decoder (remote VU, at a command boundary): released PATH3 goes into the
++// host's VIF1 stream as DIRECT data (see path3ViaVif1Direct in ps2_vif1_interpreter.cpp).
++bool g_path3ViaVif1Direct = false;
++
+ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+ {
+     if (m_path3Masked || m_path3MaskedFifo.empty())
+@@ -2321,12 +2408,109 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
+ 
+     auto emit = [&](const uint8_t *packetData, uint32_t packetSize)
+     {
++        if (g_path3ViaVif1Direct)
++        {
++            // DIRECT carries whole qwords, at most 65536 per VIFcode (IMMEDIATE 0); GIF packets
++            // may continue across DIRECTs (PATH2 keeps its tag state).
++            uint32_t offset = 0u;
++            const uint32_t totalQw = packetSize / 16u;
++            while (offset / 16u < totalQw)
++            {
++                const uint32_t chunkQw = std::min<uint32_t>(totalQw - offset / 16u, 0x8000u);
++                const uint32_t code = 0x50000000u | chunkQw;
++                const ps2_gsdump::Span spans[2] = {
++                    {reinterpret_cast<const uint8_t *>(&code), sizeof(code)},
++                    {packetData + offset, chunkQw * 16u},
++                };
++                ps2_gsdump::vif1(spans, 2u);
++                offset += chunkQw * 16u;
++            }
++            return;
++        }
+         if (m_gifArbiter)
+             m_gifArbiter->submit(GifPathId::Path3, packetData, packetSize, false);
+         else if (m_gifPacketCallback)
+             m_gifPacketCallback(packetData, packetSize);
+     };
+ 
++    // A short unmask window in a VIF1 list (MSKPATH3 0 ... MSKPATH3 1) lets PATH3 through until
++    // the GIF packet in transfer ends: one packet (up to its EOP tag). Bloody Roar 4 queues all of
++    // a frame's textures as one masked GIF chain and opens a window before each object that needs
++    // the next one; releasing the whole chain at the first window uploaded every texture into the
++    // shared VRAM slots before the draws, which then sampled the last one (colour noise).
++    // (PS2X_PATH3_ONE_PACKET=0: release everything at once, as before.)
++    static const bool s_onePacket = []
++    {
++        const char *env = std::getenv("PS2X_PATH3_ONE_PACKET");
++        return !(env && env[0] == '0');
++    }();
++    if (g_path3ReleaseOnePacket && s_onePacket)
++    {
++        // Find the end of the first GIF packet across the queued pieces.
++        size_t piece = 0, offset = 0, total = 0;
++        uint64_t qwLeft = 0;
++        bool eop = false, found = false;
++        while (piece < m_path3MaskedFifo.size())
++        {
++            const std::vector<uint8_t> &buf = m_path3MaskedFifo[piece];
++            if (offset + 16u > buf.size())
++            {
++                ++piece;
++                offset = 0;
++                continue;
++            }
++            if (qwLeft == 0)
++            {
++                if (eop)
++                {
++                    found = true;
++                    break;
++                }
++                uint64_t tagLo = 0;
++                std::memcpy(&tagLo, buf.data() + offset, sizeof(tagLo));
++                const uint64_t nloop = tagLo & 0x7FFFu;
++                const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 3u);
++                uint64_t nreg = (tagLo >> 60) & 0xFu;
++                if (nreg == 0)
++                    nreg = 16;
++                eop = ((tagLo >> 15) & 1u) != 0u;
++                qwLeft = flg == 0u ? nloop * nreg : (flg == 1u ? (nloop * nreg + 1u) / 2u : nloop);
++                offset += 16u;
++                total += 16u;
++                continue;
++            }
++            const uint64_t take = std::min<uint64_t>(qwLeft, (buf.size() - offset) / 16u);
++            offset += static_cast<size_t>(take * 16u);
++            total += static_cast<size_t>(take * 16u);
++            qwLeft -= take;
++        }
++        if (!found && eop && qwLeft == 0)
++            found = true;
++        if (found && total != 0u)
++        {
++            // Gather the packet, then drop its bytes from the front of the queue.
++            std::vector<uint8_t> packet;
++            packet.reserve(total);
++            size_t left = total;
++            while (left != 0u && !m_path3MaskedFifo.empty())
++            {
++                std::vector<uint8_t> &front = m_path3MaskedFifo.front();
++                const size_t take = std::min(left, front.size());
++                packet.insert(packet.end(), front.begin(), front.begin() + static_cast<std::ptrdiff_t>(take));
++                left -= take;
++                if (take == front.size())
++                    m_path3MaskedFifo.erase(m_path3MaskedFifo.begin());
++                else
++                    front.erase(front.begin(), front.begin() + static_cast<std::ptrdiff_t>(take));
++            }
++            emit(packet.data(), static_cast<uint32_t>(packet.size()));
++            if (m_gifArbiter && drainImmediately)
++                m_gifArbiter->drain();
++            return;
++        }
++        // No complete packet queued: everything goes, as below.
++    }
++
+     for (const auto &packet : m_path3MaskedFifo)
+     {
+         if (packet.size() >= 16u)
+@@ -2361,6 +2545,28 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t
+ 
+     if (pathId == GifPathId::Path3)
+     {
++        // PS2X_PATH3_TRACE=1: whether each PATH3 piece arrives masked (queued for the VIF1
++        // stream's next MSKPATH3 0) or goes straight out.
++        if (ps2Path3TraceActive())
++        {
++            // GIF packets (EOP tags) in this piece, and the image transfers they carry
++            uint32_t packets = 0, images = 0, pos = 0;
++            while (pos + 16u <= sizeBytes)
++            {
++                uint64_t tagLo = 0;
++                std::memcpy(&tagLo, data + pos, sizeof(tagLo));
++                const uint64_t nloop = tagLo & 0x7FFFu;
++                const uint32_t flg = static_cast<uint32_t>((tagLo >> 58) & 3u);
++                uint64_t nreg = (tagLo >> 60) & 0xFu;
++                if (nreg == 0)
++                    nreg = 16;
++                packets += ((tagLo >> 15) & 1u) != 0u ? 1u : 0u;
++                images += flg >= 2u ? 1u : 0u;
++                pos += 16u + static_cast<uint32_t>(16u * (flg == 0u ? nloop * nreg : (flg == 1u ? (nloop * nreg + 1u) / 2u : nloop)));
++            }
++            std::fprintf(stderr, "[path3] %u bytes %s (queued %zu): %u packets, %u image tags\n", sizeBytes,
++                         m_path3Masked ? "masked" : "sent", m_path3MaskedFifo.size(), packets, images);
++        }
+         if (m_path3Masked)
+         {
+             m_path3MaskedFifo.emplace_back(data, data + sizeBytes);
+diff --git a/ps2xRuntime/src/lib/ps2_runtime.cpp b/ps2xRuntime/src/lib/ps2_runtime.cpp
+index 7e83d49..60545d6 100644
+--- a/ps2xRuntime/src/lib/ps2_runtime.cpp
++++ b/ps2xRuntime/src/lib/ps2_runtime.cpp
+@@ -66,6 +66,54 @@ namespace
+         AudioStream stream{};
+         bool ready = false;
+         std::vector<int16_t> buffer;
++        // PS2X_WAVCAP=<file.wav>: also record what goes to the device (16-bit stereo 48 kHz), e.g. to mux with
++        // a screen recording. <file>.start holds the wall clock (Unix ms) of the first recorded sample.
++        FILE *wav = nullptr;
++        uint64_t wavBytes = 0;
++
++        static void writeWavHeader(FILE *f, uint64_t dataBytes)
++        {
++            const uint32_t data = static_cast<uint32_t>(std::min<uint64_t>(dataBytes, 0xFFFFFFF0ull));
++            const uint32_t riff = data + 36u, fmtSize = 16u, rate = 48000u, byteRate = rate * 4u;
++            const uint16_t pcm = 1u, channels = 2u, align = 4u, bits = 16u;
++            std::fseek(f, 0, SEEK_SET);
++            std::fwrite("RIFF", 1, 4, f); std::fwrite(&riff, 4, 1, f); std::fwrite("WAVEfmt ", 1, 8, f);
++            std::fwrite(&fmtSize, 4, 1, f); std::fwrite(&pcm, 2, 1, f); std::fwrite(&channels, 2, 1, f);
++            std::fwrite(&rate, 4, 1, f); std::fwrite(&byteRate, 4, 1, f); std::fwrite(&align, 2, 1, f);
++            std::fwrite(&bits, 2, 1, f); std::fwrite("data", 1, 4, f); std::fwrite(&data, 4, 1, f);
++            std::fseek(f, 0, SEEK_END);
++        }
++
++        void capture(const int16_t *samples, size_t frames)
++        {
++            static const char *s_path = std::getenv("PS2X_WAVCAP");
++            if (!s_path || !s_path[0])
++                return;
++            if (!wav)
++            {
++                wav = std::fopen(s_path, "wb");
++                if (!wav)
++                {
++                    s_path = nullptr;
++                    return;
++                }
++                writeWavHeader(wav, 0);
++                const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                                    std::chrono::system_clock::now().time_since_epoch()).count();
++                if (FILE *start = std::fopen((std::string(s_path) + ".start").c_str(), "w"))
++                {
++                    std::fprintf(start, "%lld\n", static_cast<long long>(ms));
++                    std::fclose(start);
++                }
++            }
++            std::fwrite(samples, sizeof(int16_t), frames * 2u, wav);
++            wavBytes += frames * 4u;
++            if (wavBytes % (48000u * 4u) < frames * 4u) // about once a second
++            {
++                writeWavHeader(wav, wavBytes);
++                std::fflush(wav);
++            }
++        }
+ 
+         void start()
+         {
+@@ -90,6 +138,7 @@ namespace
+             {
+                 std::vector<int16_t> discard((queued - kTrimTo) * 2u);
+                 (void)ps2x::iop::readAudioFrames(discard.data(), queued - kTrimTo);
++                stats.discarded += queued - kTrimTo;
+             }
+ #if defined(__EMSCRIPTEN__)
+             // Browser: the ring buffer takes any amount, so only real samples go out (no zero
+@@ -109,12 +158,47 @@ namespace
+             {
+                 const size_t got = ps2x::iop::readAudioFrames(buffer.data(), kFrames);
+                 std::fill(buffer.begin() + static_cast<std::ptrdiff_t>(got * 2u), buffer.end(), int16_t{0});
++                capture(buffer.data(), kFrames);
+                 UpdateAudioStream(stream, buffer.data(), static_cast<int>(kFrames));
++                stats.blocks++;
++                if (got < kFrames)
++                {
++                    stats.shortBlocks++;
++                    stats.padded += kFrames - got;
++                }
+             }
++            report(queued);
++        }
++
++        // [audiostats] every 5 s: blocks sent to the device, how many were short (the rest is silence: a crackle) and by
++        // how much, what was thrown away to keep latency down, and the SPU2 queue's range.
++        struct Stats
++        {
++            uint64_t blocks = 0, shortBlocks = 0, padded = 0, discarded = 0;
++            size_t queueMin = SIZE_MAX, queueMax = 0;
++            std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
++        } stats;
++        void report(size_t queued)
++        {
++            stats.queueMin = std::min(stats.queueMin, queued);
++            stats.queueMax = std::max(stats.queueMax, queued);
++            const auto now = std::chrono::steady_clock::now();
++            if (now - stats.t0 < std::chrono::seconds(5))
++                return;
++            std::fprintf(stderr, "[audio] 5 s: %llu blocks, %llu short (%.1f ms of silence added), %.1f ms discarded, queue %zu..%zu frames\n",
++                         static_cast<unsigned long long>(stats.blocks), static_cast<unsigned long long>(stats.shortBlocks),
++                         stats.padded / 48.0, stats.discarded / 48.0, stats.queueMin == SIZE_MAX ? 0 : stats.queueMin, stats.queueMax);
++            stats = Stats{};
+         }
+ 
+         void stop()
+         {
++            if (wav)
++            {
++                writeWavHeader(wav, wavBytes);
++                std::fclose(wav);
++                wav = nullptr;
++            }
+             if (!ready)
+                 return;
+             StopAudioStream(stream);
+@@ -1767,8 +1851,17 @@ const char *ps2DispatchHistoryText()
+     return text.c_str();
+ }
+ 
++extern std::atomic<uint64_t> g_ps2EeCycleNow; // EeScheduler.cpp
++
+ void ps2UpdateCop0Count(R5900Context *ctx)
+ {
++    // [det] PS2X_DETERMINISTIC=1: Count is the emulated EE cycle, the same on every machine and every run
++    static const bool s_det = [] { const char *e = std::getenv("PS2X_DETERMINISTIC"); return e && *e == '1'; }();
++    if (s_det)
++    {
++        ctx->cop0_count = static_cast<uint32_t>(g_ps2EeCycleNow.load(std::memory_order_relaxed));
++        return;
++    }
+     // The TSC is read on every guest dispatch, so it is converted to EE cycles with a ratio
+     // calibrated once against the steady clock instead of calling the clock each time.
+     struct CountClock
+@@ -3362,11 +3455,10 @@ void PS2Runtime::run()
+         spu2Output.pump();
+         uint32_t presentWidth = FB_WIDTH;
+         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
+-#if defined(__EMSCRIPTEN__)
+-        // Browser: the page's GS host draws the picture; this headless window shows nothing.
++        // With the PCSX2 GS host drawing the game (and in the browser, the page's) this window is hidden: building and
++        // uploading a 640x512 picture from the runtime's VRAM every frame was most of this thread's time for nothing.
+         if (!ps2_gsdump::liveActive())
+-#endif
+-        UploadFrame(frameTex, this, presentWidth, presentHeight);
++            UploadFrame(frameTex, this, presentWidth, presentHeight);
+ 
+         BeginDrawing();
+         ClearBackground(BLACK);
+diff --git a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+index 31aac30..429c70d 100644
+--- a/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
++++ b/ps2xRuntime/src/lib/ps2_vif1_interpreter.cpp
+@@ -362,6 +362,9 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
+ }
+ 
+ extern uint64_t g_ps2StatVif1Ticks; // ps2_runtime.cpp, frame-budget report
++bool ps2Path3TraceActive();         // ps2_memory.cpp, PS2X_PATH3_TRACE
++extern bool g_path3ReleaseOnePacket; // ps2_memory.cpp, flushMaskedPath3Packets
++extern bool g_path3ViaVif1Direct;    // ps2_memory.cpp, flushMaskedPath3Packets
+ 
+ namespace
+ {
+@@ -377,6 +380,22 @@ namespace
+         src.spans(begin, end, [](const ps2_gsdump::Span &span) { spans.push_back(span); });
+         ps2_gsdump::vif1(spans.data(), spans.size());
+     }
++
++    // Remote VU: PATH3 released by the VIF1 list goes to the host inside its VIF1 stream, as
++    // DIRECT data at this command boundary, instead of as a GS transfer of its own. The host runs
++    // VU1 on its MTVU thread, whose PATH1 output reaches the GS only when the program has run, so
++    // a separate PATH3 transfer overtook the draws queued before it (textures replaced too early:
++    // wrong stage/HUD textures in fights); its GIF unit orders DIRECT behind that output.
++    // (PS2X_PATH3_VIA_DIRECT=0 sends PATH3 transfers.)
++    bool path3ViaVif1Direct()
++    {
++        static const bool s_enabled = []
++        {
++            const char *env = std::getenv("PS2X_PATH3_VIA_DIRECT");
++            return !(env && env[0] == '0');
++        }();
++        return s_enabled && ps2_gsdump::remoteVu();
++    }
+ }
+ 
+ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
+@@ -469,6 +488,9 @@ void PS2Memory::processVIF1Source(const Source &src)
+         uint16_t imm = cmd & 0xFFFF;
+         uint8_t num = (cmd >> 16) & 0xFF;
+         const bool irq = (cmd & 0x80000000u) != 0u;
++        // PS2X_PATH3_TRACE: the VIFcodes inside a PATH3 window (MSKPATH3 0 ... 1)
++        if (!m_path3Masked && opcode != VIF_MSKPATH3 && ps2Path3TraceActive())
++            std::fprintf(stderr, "[path3]   vif %02x num=%u imm=0x%x\n", opcode, num, imm);
+ 
+         // Track most-recent command for VIFn_CODE emulation.
+         vif1_regs.code = cmd;
+@@ -521,10 +543,18 @@ void PS2Memory::processVIF1Source(const Source &src)
+             // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.
+             const bool wasMasked = m_path3Masked;
+             m_path3Masked = (imm & 0x8000u) != 0u;
++            if (wasMasked != m_path3Masked && ps2Path3TraceActive())
++                std::fprintf(stderr, "[path3] MSKPATH3 %d at vif1 +0x%x of 0x%x\n", m_path3Masked ? 1 : 0, pos, sizeBytes);
+             if (wasMasked && !m_path3Masked)
+             {
++                // Inside the list the window passes one GIF packet (flushMaskedPath3Packets);
++                // what is still queued when the list ends unmasked goes at its end (below).
+                 forwardUpTo(pos);
++                g_path3ReleaseOnePacket = true;
++                g_path3ViaVif1Direct = path3ViaVif1Direct();
+                 flushMaskedPath3Packets();
++                g_path3ReleaseOnePacket = false;
++                g_path3ViaVif1Direct = false;
+             }
+             continue;
+         }
+@@ -926,6 +956,15 @@ void PS2Memory::processVIF1Source(const Source &src)
+     // Everything handed to this VIF is consumed (commands split across DMA packets continue
+     // in the host's VIF1, which keeps that state).
+     forwardUpTo(sizeBytes);
++    // The list ends with PATH3 unmasked: the rest of the queued PATH3 flows after it.
++    if (!m_path3Masked && !m_path3MaskedFifo.empty())
++    {
++        // DIRECT only at a command boundary of the host's VIF1 (a command may continue in the
++        // next DMA packet)
++        g_path3ViaVif1Direct = pos == sizeBytes && m_vif1PendingPath2ImageQwc == 0u && path3ViaVif1Direct();
++        flushMaskedPath3Packets();
++        g_path3ViaVif1Direct = false;
++    }
+ }
+ 
+ template void PS2Memory::processVIF1Source(const ps2_vif1_source::Contiguous &);

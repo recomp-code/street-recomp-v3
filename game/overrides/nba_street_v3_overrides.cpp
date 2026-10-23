@@ -509,17 +509,24 @@ namespace
             runtime.replaceFunction(0x003E1910u, untimedVif1Wait);
             runtime.replaceFunction(0x003E1530u, untimedGifWait);
         }
-#if defined(__EMSCRIPTEN__)
-        // 0x003E3920 waits for the next frame: "while (count < target) { callback; 256 NOPs }"
-        // (the vsync interrupt moves count), then polls GS CSR.VSINT. In the browser both loops
-        // sleep until the next vsync instead of keeping a CPU core at 100%.
-        ps2xAddEeIdleLoop(0x003E3948u, 0x003E3D88u);
-        ps2xAddEeIdleLoop(0x003E3DA8u, 0x003E3DD0u);
-        // 0x003E36F0 (videos, menus): "while (flag) { callback; 32 NOPs }". Spinning there made
-        // emulated time move in jumps (warps) and the sound driver repeated blocks; asleep, time
-        // flows in 1 ms steps (EeScheduler::checkpointDue).
-        ps2xAddEeIdleLoop(0x003E3720u, 0x003E37BCu);
+        // In the browser, and in the deterministic (online lockstep) mode, where emulated time goes on to the next
+        // event there in 1 ms steps instead of spinning through the dispatcher (PS2X_DETERMINISTIC=1).
+        static const bool s_detIdle = envFlagSet("PS2X_DETERMINISTIC");
+#if !defined(__EMSCRIPTEN__)
+        if (s_detIdle)
 #endif
+        {
+            // 0x003E3920 waits for the next frame: "while (count < target) { callback; 256 NOPs }"
+            // (the vsync interrupt moves count), then polls GS CSR.VSINT. In the browser both loops
+            // sleep until the next vsync instead of keeping a CPU core at 100%.
+            ps2xAddEeIdleLoop(0x003E3948u, 0x003E3D88u);
+            ps2xAddEeIdleLoop(0x003E3DA8u, 0x003E3DD0u);
+            // 0x003E36F0 (videos, menus): "while (flag) { callback; 32 NOPs }". Spinning there made
+            // emulated time move in jumps (warps) and the sound driver repeated blocks; asleep, time
+            // flows in 1 ms steps (EeScheduler::checkpointDue).
+            ps2xAddEeIdleLoop(0x003E3720u, 0x003E37BCu);
+        }
+        (void)s_detIdle;
         if (envFlagSet("PS2X_NBA_FRAME_LOG"))
         {
             g_originalVsyncWait = runtime.lookupFunction(0x003E3920u);
